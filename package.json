@@ -1,5 +1,5 @@
 {
-  "name": "cli",
+  "name": "@starthub/cli",
   "version": "0.0.1",
   "main": "index.js",
   "bin": { "starthub": "dist/launch.js" },
@@ -14,5 +14,9 @@
   "description": "",
   "dependencies": {
     "tar": "^7.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   }
 }

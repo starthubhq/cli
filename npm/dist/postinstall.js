@@ -6,8 +6,8 @@ const https = require("https");
 const { createGunzip } = require("zlib");
 const tar = require("tar");
 
-const version = require("../package.json").version; // keep in sync with Cargo.toml
-const repo = process.env.STARTHUB_CLI_REPO || "starthub-so/starthub-cli";
+const version = require("../../package.json").version; // keep in sync with Cargo.toml
+const repo = process.env.STARTHUB_CLI_REPO || "starthubhq/cli";
 const destDir = path.join(__dirname, "bin");
 const exe = process.platform === "win32" ? "starthub.exe" : "starthub";
 
