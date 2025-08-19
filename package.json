@@ -1,6 +1,6 @@
 {
   "name": "@starthub/cli",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "main": "index.js",
   "bin": { "starthub": "dist/launch.js" },
   "scripts": {
