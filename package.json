@@ -10,7 +10,7 @@
   },
   "author": "",
   "license": "ISC",
-  "files": ["dist/**"],
+  "files": ["npm/dist/**"],
   "description": "",
   "dependencies": {
     "tar": "^7.0.0"

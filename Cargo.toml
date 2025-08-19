@@ -4,7 +4,7 @@ version = "0.0.1"
 edition = "2021"
 
 [[bin]]
-name = "starthub"       # <— ensures target/release/starthub
+name = "starthub"
 path = "src/main.rs"
 
 [dependencies]
