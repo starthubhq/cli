@@ -2,7 +2,7 @@
   "name": "@starthub/cli",
   "version": "0.0.2",
   "main": "index.js",
-  "bin": { "starthub": "dist/launch.js" },
+  "bin": { "starthub": "npm/dist/launch.js" },
   "scripts": {
     "postinstall": "node npm/dist/postinstall.js",
     "pack:dry": "npm pack",

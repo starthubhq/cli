@@ -4,7 +4,8 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write   # <-- needed for softprops/action-gh-release to create/upload
+  contents: write
+  id-token: write
 
 jobs:
   build:
@@ -66,11 +67,14 @@ jobs:
   publish-npm:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22.4
           registry-url: https://registry.npmjs.org
       - name: Publish
         run: npm publish --access public
