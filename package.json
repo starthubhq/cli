@@ -1,6 +1,6 @@
 {
   "name": "@starthub/cli",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "main": "index.js",
   "bin": { "starthub": "npm/dist/launch.js" },
   
@@ -18,7 +18,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/startuhbhq/cli"
+    "url": "https://github.com/starthubhq/cli"
   },
   "publishConfig": {
     "access": "public",

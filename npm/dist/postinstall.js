@@ -22,19 +22,32 @@ function rustTarget() {
   throw new Error(`Unsupported platform: ${p} ${a}`);
 }
 
-function download(url, destPath) {
+function download(url, destPath, redirectsLeft = 5) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(destPath);
-    https.get(url, (res) => {
+    const req = https.get(url, { headers: { "User-Agent": "starthub-cli-installer" } }, (res) => {
+      // follow redirects
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+        if (!res.headers.location || redirectsLeft <= 0) {
+          return reject(new Error(`Too many redirects or missing Location for ${url}`));
+        }
+        file.close(() => fs.unlink(destPath, () => {})); // cleanup partial
+        const next = new URL(res.headers.location, url).toString();
+        return download(next, destPath, redirectsLeft - 1).then(resolve, reject);
+      }
+
       if (res.statusCode !== 200) {
         return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
       }
+
       res.pipe(file);
       file.on("finish", () => file.close(() => resolve()));
-    }).on("error", reject);
+    });
+    req.on("error", (err) => {
+      file.close(() => fs.unlink(destPath, () => reject(err)));
+    });
   });
 }
-
 (async () => {
   try {
     fs.mkdirSync(destDir, { recursive: true });
