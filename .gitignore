@@ -1,0 +1,32 @@
+# ---- Rust ----
+/target
+**/*.rs.bk
+Cargo.lock         # optional: ignore if you publish a lib; keep if binary only
+
+# ---- Node / npm wrapper ----
+node_modules
+npm/dist/bin
+npm/dist/*.tgz
+npm/debug.log
+npm/npm-debug.log*
+npm/yarn-error.log
+npm/pnpm-debug.log*
+npm/.pnpm-debug.log*
+
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---- Logs / Temp ----
+*.log
+*.tmp
+*.bak
+
+# ---- Release artifacts ----
+dist/
+*.tar.gz
+*.zip
