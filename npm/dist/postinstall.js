@@ -14,13 +14,19 @@ const exe = process.platform === "win32" ? "starthub.exe" : "starthub";
 function rustTarget() {
   const p = process.platform;
   const a = process.arch;
-  if (p === "darwin" && a === "x64") return "x86_64-apple-darwin";
+
+  if (p === "darwin" && a === "x64")   return "x86_64-apple-darwin";
   if (p === "darwin" && a === "arm64") return "aarch64-apple-darwin";
-  if (p === "linux" && a === "x64") return "x86_64-unknown-linux-gnu";
-  if (p === "linux" && a === "arm64") return "aarch64-unknown-linux-gnu";
-  if (p === "win32" && a === "x64") return "x86_64-pc-windows-msvc";
+
+  if (p === "linux" && a === "x64")    return "x86_64-unknown-linux-gnu";
+  // optionally support musl if you want:
+  // if (p === "linux" && a === "x64" && process.env.MUSL) return "x86_64-unknown-linux-musl";
+
+  if (p === "win32" && a === "x64")    return "x86_64-pc-windows-msvc";
+
   throw new Error(`Unsupported platform: ${p} ${a}`);
 }
+
 
 function download(url, destPath, redirectsLeft = 5) {
   const tmpPath = destPath + ".part";
