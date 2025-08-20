@@ -1,10 +1,9 @@
 {
   "name": "@starthub/cli",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "bin": { "starthub": "npm/dist/launch.js" },
   
   "scripts": {
-    "postinstall": "node npm/dist/postinstall.js",
     "pack:dry": "npm pack",
     "prepublishOnly": "node -e \"console.log('Publishing @starthub/cli', require('./package.json').version)\""
   },
@@ -12,7 +11,7 @@
   "license": "ISC",
   "files": [
     "npm/dist/launch.js",
-    "npm/dist/postinstall.js"
+    "npm/dist/shared-download.js"
   ],
   "description": "",
   "dependencies": {
