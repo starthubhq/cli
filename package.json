@@ -1,7 +1,6 @@
 {
   "name": "@starthub/cli",
   "version": "0.0.3",
-  "main": "index.js",
   "bin": { "starthub": "npm/dist/launch.js" },
   
   "scripts": {
@@ -11,7 +10,10 @@
   },
   "author": "",
   "license": "ISC",
-  "files": ["npm/dist/**"],
+  "files": [
+    "npm/dist/launch.js",
+    "npm/dist/postinstall.js"
+  ],
   "description": "",
   "dependencies": {
     "tar": "^7.0.0"

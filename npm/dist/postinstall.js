@@ -23,31 +23,60 @@ function rustTarget() {
 }
 
 function download(url, destPath, redirectsLeft = 5) {
+  const tmpPath = destPath + ".part";
+
   return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    const req = https.get(url, { headers: { "User-Agent": "starthub-cli-installer" } }, (res) => {
-      // follow redirects
-      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
-        if (!res.headers.location || redirectsLeft <= 0) {
-          return reject(new Error(`Too many redirects or missing Location for ${url}`));
+    const doReq = (u, redirects) => {
+      const req = https.get(
+        u,
+        { headers: { "User-Agent": "starthub-cli-installer" } },
+        (res) => {
+          // Handle redirects
+          if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+            if (!res.headers.location || redirects <= 0) {
+              return reject(
+                new Error(`Too many redirects or missing Location for ${u}`)
+              );
+            }
+            const next = new URL(res.headers.location, u).toString();
+            // restart request (ensure we don't keep a stale file)
+            try { fs.unlinkSync(tmpPath); } catch {}
+            return doReq(next, redirects - 1);
+          }
+
+          if (res.statusCode !== 200) {
+            return reject(new Error(`HTTP ${res.statusCode} for ${u}`));
+          }
+
+          const file = fs.createWriteStream(tmpPath);
+          res.pipe(file);
+          file.on("finish", () => {
+            file.close(() => {
+              try {
+                fs.renameSync(tmpPath, destPath); // atomic
+                resolve();
+              } catch (err) {
+                reject(err);
+              }
+            });
+          });
+          file.on("error", (err) => {
+            try { fs.unlinkSync(tmpPath); } catch {}
+            reject(err);
+          });
         }
-        file.close(() => fs.unlink(destPath, () => {})); // cleanup partial
-        const next = new URL(res.headers.location, url).toString();
-        return download(next, destPath, redirectsLeft - 1).then(resolve, reject);
-      }
+      );
 
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-      }
+      req.on("error", (err) => {
+        try { fs.unlinkSync(tmpPath); } catch {}
+        reject(err);
+      });
+    };
 
-      res.pipe(file);
-      file.on("finish", () => file.close(() => resolve()));
-    });
-    req.on("error", (err) => {
-      file.close(() => fs.unlink(destPath, () => reject(err)));
-    });
+    doReq(url, redirectsLeft);
   });
 }
+
 (async () => {
   try {
     fs.mkdirSync(destDir, { recursive: true });
@@ -58,6 +87,10 @@ function download(url, destPath, redirectsLeft = 5) {
 
     console.log(`[starthub] downloading ${assetName} …`);
     await download(url, tgz);
+
+    if (!fs.existsSync(tgz)) {
+      throw new Error(`Downloaded file missing at ${tgz}`);
+    }
 
     await tar.x({
       file: tgz,
