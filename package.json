@@ -1,6 +1,6 @@
 {
   "name": "@starthub/cli",
-  "version": "0.0.17",
+  "version": "0.0.18",
   "bin": {
     "starthub": "npm/dist/launch.js"
   },
