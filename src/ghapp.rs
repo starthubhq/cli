@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Write, path::PathBuf, time::{Duration, Instant}};
+use serde_json::{json, Value};
+use std::{fs, path::PathBuf, time::{Duration, Instant}};
 use tokio::time::sleep;
 
 const UA: &str = "starthub-cli";
@@ -174,18 +175,57 @@ pub async fn wait_for_installation(access_token: &str, app_id: i64, timeout: Dur
     }
 }
 
-// ---------- simple file storage (no extra deps) ----------
+fn creds_path(provider: &str) -> Result<PathBuf> {
+    let base = std::env::var("STARTHUB_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|_| {
+            let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"))?;
+            Ok::<_, anyhow::Error>(PathBuf::from(home).join(".starthub"))
+        })?;
+    Ok(base.join("creds").join(format!("{provider}.json")))
+}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StoredCredentials {
     pub access_token: String,
     pub token_type: String,
-    pub expires_at_epoch: Option<u64>,       // now + expires_in (secs)
+    pub expires_at_epoch: Option<u64>,                // now + expires_in (secs)
     pub refresh_token: Option<String>,
-    pub refresh_token_expires_at_epoch: Option<u64>,
+    pub refresh_token_expires_at_epoch: Option<u64>,  // now + refresh_expires_in
 }
 
-pub fn save_token(token: &TokenResp) -> Result<()> {
+// ADD THIS impl (below the struct)
+impl StoredCredentials {
+    /// Treat token as expired if it has no expiry or will expire within 2 minutes.
+    pub fn is_expired(&self) -> bool {
+        match self.expires_at_epoch {
+            None => false, // some GitHub tokens won't include expires_in – treat as non-expiring
+            Some(t) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                now + 120 >= t
+            }
+        }
+    }
+
+    /// Optional: check refresh token expiry if you plan to refresh
+    pub fn refresh_is_expired(&self) -> bool {
+        match self.refresh_token_expires_at_epoch {
+            None => false,
+            Some(t) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                now + 120 >= t
+            }
+        }
+    }
+}
+
+pub fn save_token_for(provider: &str, token: &TokenResp) -> Result<()> {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
     let creds = StoredCredentials {
         access_token: token.access_token.clone(),
@@ -194,27 +234,165 @@ pub fn save_token(token: &TokenResp) -> Result<()> {
         refresh_token: token.refresh_token.clone(),
         refresh_token_expires_at_epoch: token.refresh_token_expires_in.map(|e| now + e),
     };
-    let path = creds_path()?;
+    let path = creds_path(provider)?;
     if let Some(dir) = path.parent() { fs::create_dir_all(dir)?; }
-    let json = serde_json::to_vec_pretty(&creds)?;
-    let mut f = fs::File::create(&path)?;
-    f.write_all(&json)?;
+    fs::write(&path, serde_json::to_vec_pretty(&creds)?)?;
     Ok(())
 }
 
-pub fn load_token() -> Result<StoredCredentials> {
-    let path = creds_path()?;
+pub fn load_token_for(provider: &str) -> Result<StoredCredentials> {
+    let path = creds_path(provider)?;
     let data = fs::read(&path).with_context(|| format!("no credentials at {}", path.display()))?;
     Ok(serde_json::from_slice(&data)?)
 }
 
-fn creds_path() -> Result<PathBuf> {
-    // Very small cross-platform shim; good enough to start.
-    if let Ok(dir) = std::env::var("STARTHUB_CONFIG_DIR") {
-        return Ok(PathBuf::from(dir).join("credentials.json"));
+// Returned subset from GitHub
+#[derive(Deserialize, Debug)]
+pub struct RepoInfo {
+    pub name: String,
+    pub full_name: String,     // e.g. "octocat/chirpstack-starthub"
+    pub html_url: String,
+    pub owner: RepoOwner,
+}
+#[derive(Deserialize, Debug)]
+pub struct RepoOwner { pub login: String }
+
+/// Create a personal repo for the authenticated user from a template repository.
+/// Docs: POST /repos/{template_owner}/{template_repo}/generate
+pub async fn create_repo_from_template_personal(
+    user_token: &str,
+    template_owner: &str,
+    template_repo: &str,
+    new_name: &str,
+    private_: bool,
+    description: Option<&str>,
+    include_all_branches: bool,
+    owner_login: Option<&str>,      // pass Some(login) explicitly (safe for personal)
+) -> Result<RepoInfo> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://api.github.com/repos/{}/{}/generate",
+        template_owner, template_repo
+    );
+
+    // Build body selectively
+    let mut map = serde_json::Map::new();
+    map.insert("name".into(), json!(new_name));
+    map.insert("private".into(), json!(private_));
+    map.insert("include_all_branches".into(), json!(include_all_branches));
+    if let Some(desc) = description { map.insert("description".into(), json!(desc)); }
+    if let Some(owner) = owner_login { map.insert("owner".into(), json!(owner)); }
+    let body = Value::Object(map);
+
+    let resp = client.post(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {user_token}"))
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&body)
+        .send().await?;
+
+    if resp.status().is_success() || resp.status().as_u16() == 201 {
+        let repo: RepoInfo = resp.json().await?;
+        return Ok(repo);
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE")) // Windows
-        .context("HOME/USERPROFILE not set")?;
-    Ok(PathBuf::from(home).join(".starthub").join("credentials.json"))
+
+    // Helpful error surface
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if status.as_u16() == 422 && text.contains("must be a template repository") {
+        bail!("Template repo is not marked as a template. Enable 'Template repository' on {}/{}.", template_owner, template_repo);
+    }
+    if status.as_u16() == 422 && text.contains("name already exists") {
+        bail!("A repository named '{new_name}' already exists under your account.");
+    }
+    bail!("Template generate failed: {status} — {text}");
+}
+
+pub async fn create_user_repo(
+    user_token: &str,
+    name: &str,
+    private_: bool,
+    description: Option<&str>,
+) -> Result<RepoInfo> {
+    let client = reqwest::Client::new();
+    let mut body = serde_json::Map::new();
+    body.insert("name".into(), json!(name));
+    body.insert("private".into(), json!(private_));
+    if let Some(d) = description { body.insert("description".into(), json!(d)); }
+
+    let resp = client.post("https://api.github.com/user/repos")
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {user_token}"))
+        .json(&body)
+        .send().await?;
+
+    if resp.status().is_success() {
+        Ok(resp.json().await?)
+    } else {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        bail!("create repo failed: {s} — {t}");
+    }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct RepoPublicKey {
+    pub key_id: String,
+    pub key: String, // base64-encoded sodium public key
+}
+
+pub async fn get_repo_public_key(
+    token: &str, owner: &str, repo: &str
+) -> Result<RepoPublicKey> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+    );
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send().await?;
+    if resp.status().is_success() {
+        Ok(resp.json().await?)
+    } else {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        bail!("get public key failed: {s} — {t}");
+    }
+}
+
+pub async fn put_repo_secret(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    key_id: &str,
+    encrypted_value_b64: &str,
+) -> Result<()> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/actions/secrets/{name}"
+    );
+    let body = serde_json::json!({
+        "encrypted_value": encrypted_value_b64,
+        "key_id": key_id,
+    });
+
+    let resp = reqwest::Client::new()
+        .put(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .json(&body)
+        .send().await?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        bail!("put secret {name} failed: {s} — {t}");
+    }
 }
