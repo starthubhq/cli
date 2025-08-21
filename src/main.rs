@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
+use tokio::time::{sleep, Duration};
 
 mod ghapp;
 mod config; // 👈 add
@@ -100,6 +101,14 @@ fn parse_secret_pairs(items: &[String]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
+fn open_actions_page(owner: &str, repo: &str) {
+    let url = format!("https://github.com/{owner}/{repo}/actions");
+    match webbrowser::open(&url) {
+        Ok(_) => println!("↗ Opened GitHub Actions: {url}"),
+        Err(e) => println!("→ GitHub Actions: {url} (couldn't auto-open: {e})"),
+    }
+}
+
 async fn cmd_deploy(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
     let parsed_secrets = parse_secret_pairs(&secrets)?;
     let mut ctx = runners::DeployCtx {
@@ -120,7 +129,14 @@ async fn cmd_deploy(action: String, secrets: Vec<String>, env: Option<String>, r
     r.set_secrets(&ctx).await?;       // <— will create repo secrets
     r.dispatch(&ctx).await?;
 
+    if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
+        sleep(Duration::from_secs(5)).await;
+        open_actions_page(owner, repo);
+    }
+
     println!("✓ Dispatch complete for {}", r.name());
+
+    
     Ok(())
 }
 
