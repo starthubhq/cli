@@ -11,6 +11,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use sodiumoxide::init as sodium_init;
 use sodiumoxide::crypto::{sealedbox, box_}; // <-- note: both modules imported
+use chrono::Local;
+
 
 fn sanitize_secret_name(s: &str) -> String {
     // GitHub requires [A-Z0-9_]; normalize user-provided keys
@@ -67,7 +69,10 @@ impl Runner for GithubRunner {
             "chirpstack" => ("starthubhq", "chirpstack", "refs/heads/main"),
             other => { anyhow::bail!("unknown package '{other}'"); }
         };
-        let repo_name = format!("{}-starthub", ctx.action);
+        let now = Local::now();
+        let timestamp = now.format("%Y%m%d%H%M%S").to_string();
+
+        let repo_name: String = format!("{}-starthub-{}", ctx.action, timestamp);
 
         let creds = ghapp::load_token_for("github")?;
         let me = ghapp::get_user(&creds.access_token).await?;
