@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
+use tokio::time::{sleep, Duration};
 
 mod ghapp;
 mod config; // 👈 add
@@ -129,6 +130,7 @@ async fn cmd_deploy(action: String, secrets: Vec<String>, env: Option<String>, r
     r.dispatch(&ctx).await?;
 
     if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
+        sleep(Duration::from_secs(5)).await;
         open_actions_page(owner, repo);
     }
 
