@@ -4,6 +4,12 @@
   "bin": { "starthub": "npm/dist/launch.js" },
   
   "scripts": {
+    "preversion": "git diff --quiet && git diff --cached --quiet || (echo '❌ Working tree not clean. Commit or stash first.' && exit 1)",
+    "release:patch": "npm version patch -m \"v%s\"",
+    "release:minor": "npm version minor -m \"v%s\"",
+    "release:major": "npm version major -m \"v%s\"",
+    "version": "node ./scripts/sync-cargo-version.js",
+    "postversion": "git push && git push --tags",
     "pack:dry": "npm pack",
     "prepublishOnly": "node -e \"console.log('Publishing @starthub/cli', require('./package.json').version)\""
   },
