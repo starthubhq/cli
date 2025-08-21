@@ -1,6 +1,7 @@
 name: release
 on:
   push:
+    branches: ["main"]  # for npm publish
     tags: ["v*"]
 
 permissions:
