@@ -34,6 +34,9 @@ enum Commands {
     Deploy {
         /// Package slug/name, e.g. "chirpstack"
         action: String,       
+        /// Repeatable env secret: -e KEY=VALUE (will become a repo secret)
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        secrets: Vec<String>,                    // <— collect multiple -e
         /// Choose where to run the deployment
         #[arg(long, value_enum, default_value_t = RunnerKind::Github)]
         runner: RunnerKind,
@@ -62,7 +65,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { path } => cmd_init(path).await?,
-        Commands::Deploy { action, env, runner } => cmd_deploy(action, env, runner).await?,
+        Commands::Deploy { action, secrets, env, runner } => cmd_deploy(action, secrets, env, runner).await?,
         Commands::Status { id } => cmd_status(id).await?,
     }
     Ok(())
@@ -82,12 +85,29 @@ async fn cmd_login(runner: RunnerKind) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn cmd_deploy(action: String, env: Option<String>, runner: RunnerKind) -> Result<()> {
-     let mut ctx = runners::DeployCtx {
+// Parse KEY=VALUE items into Vec<(String,String)>, with friendly errors.
+fn parse_secret_pairs(items: &[String]) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for raw in items {
+        let (k, v) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!(format!("invalid -e value '{raw}', expected KEY=VALUE")))?;
+        if k.trim().is_empty() {
+            anyhow::bail!("secret name empty in '{raw}'");
+        }
+        out.push((k.trim().to_string(), v.to_string()));
+    }
+    Ok(out)
+}
+
+async fn cmd_deploy(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
+    let parsed_secrets = parse_secret_pairs(&secrets)?;
+    let mut ctx = runners::DeployCtx {
         action,
         env,
         owner: None,
         repo: None,
+        secrets: parsed_secrets,       // <— pass to runner
     };
     let r = make_runner(runner);
 
@@ -97,7 +117,7 @@ async fn cmd_deploy(action: String, env: Option<String>, runner: RunnerKind) -> 
     // 2) do the runner-specific steps
     r.prepare(&mut ctx).await?;
     r.put_files(&ctx).await?;
-    r.set_secrets(&ctx).await?;
+    r.set_secrets(&ctx).await?;       // <— will create repo secrets
     r.dispatch(&ctx).await?;
 
     println!("✓ Dispatch complete for {}", r.name());

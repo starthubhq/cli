@@ -336,3 +336,63 @@ pub async fn create_user_repo(
         bail!("create repo failed: {s} — {t}");
     }
 }
+
+#[derive(Deserialize, Debug)]
+pub struct RepoPublicKey {
+    pub key_id: String,
+    pub key: String, // base64-encoded sodium public key
+}
+
+pub async fn get_repo_public_key(
+    token: &str, owner: &str, repo: &str
+) -> Result<RepoPublicKey> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
+    );
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send().await?;
+    if resp.status().is_success() {
+        Ok(resp.json().await?)
+    } else {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        bail!("get public key failed: {s} — {t}");
+    }
+}
+
+pub async fn put_repo_secret(
+    token: &str,
+    owner: &str,
+    repo: &str,
+    name: &str,
+    key_id: &str,
+    encrypted_value_b64: &str,
+) -> Result<()> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/actions/secrets/{name}"
+    );
+    let body = serde_json::json!({
+        "encrypted_value": encrypted_value_b64,
+        "key_id": key_id,
+    });
+
+    let resp = reqwest::Client::new()
+        .put(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .json(&body)
+        .send().await?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        bail!("put secret {name} failed: {s} — {t}");
+    }
+}

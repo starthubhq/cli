@@ -10,6 +10,7 @@ pub struct DeployCtx {
     // filled by prepare()
     pub owner: Option<String>,
     pub repo: Option<String>,
+    pub secrets: Vec<(String, String)>,
 }
 
 
