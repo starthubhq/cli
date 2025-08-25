@@ -1,28 +1,62 @@
 {
-  "name": "create-and-tag-do-project",
-  "version": "0.0.1",
-  "description": "Create a DigitalOcean project, then tag/label it.",
+  "name": "create-do-project-and-droplet",
+  "version": "0.1.1",
+  "description": "Create a DigitalOcean project, then create a droplet inside that project.",
   "inputs": [
-    { "name": "do_access_token", "type": "string", "description": "access token to DigitalOcean" },
-    { "name": "do_project_name", "type": "string", "description": "project name" },
-    { "name": "do_tag_name",     "type": "string", "description": "tag/label to add" }
+    { "name": "do_access_token", "type": "string" },
+    { "name": "do_project_name", "type": "string" },
+    { "name": "droplet_name", "type": "string" },
+
+    { "name": "region", "type": "string", "default": "fra1" },
+    { "name": "size",   "type": "string", "default": "s-1vcpu-1gb" },
+    { "name": "image",  "type": "string", "default": "ubuntu-22-04-x64" },
+
+    { "name": "ssh_keys",   "type": "array", "items": { "type": "string" }, "default": [] },
+    { "name": "tags",       "type": "array", "items": { "type": "string" }, "default": ["starthub"] },
+    { "name": "backups",    "type": "boolean", "default": false },
+    { "name": "ipv6",       "type": "boolean", "default": true },
+    { "name": "monitoring", "type": "boolean", "default": true },
+    { "name": "vpc_uuid",   "type": "string", "optional": true },
+    { "name": "user_data",  "type": "string", "optional": true }
   ],
   "outputs": [
-    { "name": "project_id", "type": "string", "description": "id of the created project" }
+    { "name": "project_id",   "type": "string", "description": "ID of the created project" },
+    { "name": "droplet_id",   "type": "string", "description": "ID of the created droplet" },
+    { "name": "droplet_name", "type": "string", "description": "Name of the created droplet" },
+    { "name": "region",       "type": "string", "description": "Region of the created droplet" },
+    { "name": "size",         "type": "string", "description": "Size slug of the created droplet" },
+    { "name": "image",        "type": "string", "description": "Image slug/ID used" }
   ],
   "steps": [
-    { "id": "create", "uses": "ghcr.io/starthubhq/create-do-project-docker:0.0.3", "with": {} },
-    { "id": "tag",    "uses": "ghcr.io/starthubhq/tag-do-project-docker:0.0.3",    "with": {} }
+    {
+      "id": "create_project",
+      "uses": "ghcr.io/starthubhq/create-do-project-docker:0.0.3",
+      "with": {}
+    },
+    {
+      "id": "create_droplet",
+      "uses": "ghcr.io/starthubhq/create-do-droplet-docker:0.0.3",
+      "with": {}
+    }
   ],
   "wires": [
-    { "from": { "source": "inputs", "key": "do_access_token" }, "to": { "step": "create", "input": "do_access_token" } },
-    { "from": { "source": "inputs", "key": "do_project_name"  }, "to": { "step": "create", "input": "do_project_name"  } },
+    { "from": { "source": "inputs", "key": "do_access_token" }, "to": { "step": "create_project", "input": "do_access_token" } },
+    { "from": { "source": "inputs", "key": "do_project_name"  }, "to": { "step": "create_project", "input": "do_project_name"  } },
 
-    { "from": { "source": "inputs", "key": "do_access_token" }, "to": { "step": "tag",    "input": "do_access_token" } },
-    { "from": { "step": "create", "output": "project_id"     }, "to": { "step": "tag",    "input": "do_project_id"   } },
-    { "from": { "source": "inputs", "key": "do_tag_name"      }, "to": { "step": "tag",    "input": "do_tag_name"     } }
+    { "from": { "source": "inputs", "key": "do_access_token" }, "to": { "step": "create_droplet", "input": "do_access_token" } },
+    { "from": { "step": "create_project", "output": "project_id" }, "to": { "step": "create_droplet", "input": "project_id" } },
+
+    { "from": { "source": "inputs", "key": "droplet_name" }, "to": { "step": "create_droplet", "input": "droplet_name" } },
+    { "from": { "source": "inputs", "key": "region"       }, "to": { "step": "create_droplet", "input": "region" } },
+    { "from": { "source": "inputs", "key": "size"         }, "to": { "step": "create_droplet", "input": "size" } },
+    { "from": { "source": "inputs", "key": "image"        }, "to": { "step": "create_droplet", "input": "image" } }
   ],
   "export": {
-    "project_id": { "from": { "step": "create", "output": "project_id" } }
+    "project_id":   { "from": { "step": "create_project", "output": "project_id" } },
+    "droplet_id":   { "from": { "step": "create_droplet", "output": "droplet_id" } },
+    "droplet_name": { "from": { "step": "create_droplet", "output": "droplet_name" } },
+    "region":       { "from": { "step": "create_droplet", "output": "region" } },
+    "size":         { "from": { "step": "create_droplet", "output": "size" } },
+    "image":        { "from": { "step": "create_droplet", "output": "image" } }
   }
 }
