@@ -1,0 +1,28 @@
+{
+  "name": "create-and-tag-do-project",
+  "version": "0.0.1",
+  "description": "Create a DigitalOcean project, then tag/label it.",
+  "inputs": [
+    { "name": "do_access_token", "type": "string", "description": "access token to DigitalOcean" },
+    { "name": "do_project_name", "type": "string", "description": "project name" },
+    { "name": "do_tag_name",     "type": "string", "description": "tag/label to add" }
+  ],
+  "outputs": [
+    { "name": "project_id", "type": "string", "description": "id of the created project" }
+  ],
+  "steps": [
+    { "id": "create", "uses": "ghcr.io/starthubhq/create-do-project-docker:0.0.3", "with": {} },
+    { "id": "tag",    "uses": "ghcr.io/starthubhq/tag-do-project-docker:0.0.3",    "with": {} }
+  ],
+  "wires": [
+    { "from": { "source": "inputs", "key": "do_access_token" }, "to": { "step": "create", "input": "do_access_token" } },
+    { "from": { "source": "inputs", "key": "do_project_name"  }, "to": { "step": "create", "input": "do_project_name"  } },
+
+    { "from": { "source": "inputs", "key": "do_access_token" }, "to": { "step": "tag",    "input": "do_access_token" } },
+    { "from": { "step": "create", "output": "project_id"     }, "to": { "step": "tag",    "input": "do_project_id"   } },
+    { "from": { "source": "inputs", "key": "do_tag_name"      }, "to": { "step": "tag",    "input": "do_tag_name"     } }
+  ],
+  "export": {
+    "project_id": { "from": { "step": "create", "output": "project_id" } }
+  }
+}
