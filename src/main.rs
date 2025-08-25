@@ -4,6 +4,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
 use tokio::time::{sleep, Duration};
 
+mod starthub_api;
 mod ghapp;
 mod config; // 👈 add
 mod runners;
@@ -32,7 +33,7 @@ enum Commands {
         path: String,
     },
     /// Deploy with the given config
-    Deploy {
+    Run {
         /// Package slug/name, e.g. "chirpstack"
         action: String,       
         /// Repeatable env secret: -e KEY=VALUE (will become a repo secret)
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { path } => cmd_init(path).await?,
-        Commands::Deploy { action, secrets, env, runner } => cmd_deploy(action, secrets, env, runner).await?,
+        Commands::Run { action, secrets, env, runner } => cmd_run(action, secrets, env, runner).await?,
         Commands::Status { id } => cmd_status(id).await?,
     }
     Ok(())
@@ -109,7 +110,7 @@ fn open_actions_page(owner: &str, repo: &str) {
     }
 }
 
-async fn cmd_deploy(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
+async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
     let parsed_secrets = parse_secret_pairs(&secrets)?;
     let mut ctx = runners::DeployCtx {
         action,

@@ -1,3 +1,4 @@
+pub mod models;
 pub mod github;
 pub mod local;
 
