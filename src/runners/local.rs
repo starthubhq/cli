@@ -1,8 +1,11 @@
 // src/runners/local.rs
 use anyhow::{Result, bail, Context};
-use tokio::{io::{AsyncBufReadExt, BufReader}, process::Command};
+use serde_json::{json, Value, Map};
+use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command};
 use std::{path::{Path, PathBuf}};
 use which::which;
+const ST_MARKER: &str = "::starthub:state::";
+use tokio::sync::mpsc;
 
 use super::{Runner, DeployCtx};
 use crate::starthub_api::Client as HubClient;
@@ -13,6 +16,16 @@ use std::collections::HashMap;
 // helper: detect an OCI image ref (digest or tag)
 fn looks_like_oci_image(s: &str) -> bool {
     s.contains("@sha256:") || (s.contains('/') && s.contains(':'))
+}
+
+// Deep-merge: b overrides a
+fn deep_merge(a: &mut Value, b: Value) {
+    match (a, b) {
+        (Value::Object(ao), Value::Object(bo)) => {
+            for (k, v) in bo { deep_merge(ao.entry(k).or_insert(Value::Null), v); }
+        }
+        (a_slot, b_val) => { *a_slot = b_val; }
+    }
 }
 
 // helper: create a single-step plan from an image ref
@@ -76,19 +89,31 @@ impl Runner for LocalRunner {
         prefetch_all(&client, &plan, &cache_dir).await?;
 
         // Execute (merge CLI -e into each step)
+        let mut state = serde_json::json!({}); // accumulated state
+
         for s in &plan.steps {
             let mut step = s.clone();
+
+            // merge CLI -e into the step env (as you already do)
             for (k,v) in &ctx.secrets {
                 step.env.entry(k.clone()).or_insert(v.clone());
             }
-            match step.kind.as_str() {
-                "docker" => run_docker_step(&step, plan.workdir.as_deref()).await?,
-                "wasm"   => run_wasm_step(&client, &step, plan.workdir.as_deref(), &cache_dir).await?,
+
+            // run and collect optional patch
+            let patch = match step.kind.as_str() {
+                "docker" => run_docker_step_collect_state(&step, plan.workdir.as_deref()).await?,
+                "wasm"   => run_wasm_step(&client, &step, plan.workdir.as_deref(), &cache_dir).await.map(|_| Value::Null)?,
                 other    => bail!("unknown step.kind '{}'", other),
+            };
+
+            // merge if we got a patch
+            if !patch.is_null() {
+                deep_merge(&mut state, patch);
             }
         }
 
-        println!("✓ Local execution complete");
+        // (optional) show final state
+        println!("=== final state ===\n{}", serde_json::to_string_pretty(&state)?);
         Ok(())
     }
 }
@@ -114,16 +139,16 @@ async fn docker_pull(image: &str) -> Result<()> {
     Ok(())
 }
 
-// ---- Execute docker ----
-async fn run_docker_step(step: &StepSpec, pipeline_workdir: Option<&str>) -> Result<()> {
-    if which("docker").is_err() {
-        bail!("docker not found on PATH");
-    }
+async fn run_docker_step_collect_state(step: &StepSpec, pipeline_workdir: Option<&str>) -> Result<Value> {
+    if which("docker").is_err() { bail!("docker not found on PATH"); }
+
+    use serde_json::{json, Map};
+    use tokio::io::AsyncWriteExt;
 
     let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm");
+    cmd.arg("run").arg("--rm").arg("-i");
 
-    // network: default none
+    // network
     match step.network.as_deref() {
         Some("bridge") => {},
         _ => { cmd.args(["--network","none"]); }
@@ -147,11 +172,8 @@ async fn run_docker_step(step: &StepSpec, pipeline_workdir: Option<&str>) -> Res
 
     // workdir
     if let Some(wd) = step.workdir.as_deref().or(pipeline_workdir) {
-        if wd.starts_with('/') {
-            cmd.args(["-w", wd]);
-        } else {
-            tracing::warn!("ignoring non-absolute workdir '{}'", wd);
-        }
+        if wd.starts_with('/') { cmd.args(["-w", wd]); }
+        else { tracing::warn!("ignoring non-absolute workdir '{}'", wd); }
     }
 
     // entrypoint
@@ -163,34 +185,64 @@ async fn run_docker_step(step: &StepSpec, pipeline_workdir: Option<&str>) -> Res
     cmd.arg(&step.ref_);
     for a in &step.args { cmd.arg(a); }
 
-    // spawn + stream
     let mut child = cmd
-        .stdin(std::process::Stdio::inherit())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("spawning docker for step {}", step.id))?;
+
+    // ---- feed stdin JSON (params from env for now) ----
+    let mut params = Map::new();
+    for (k,v) in &step.env { params.insert(k.clone(), Value::String(v.clone())); }
+    let input = json!({ "state": {}, "params": Value::Object(params) }).to_string();
+    if let Some(stdin) = child.stdin.as_mut() { stdin.write_all(input.as_bytes()).await?; }
+    drop(child.stdin.take());
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let mut out_reader = BufReader::new(stdout).lines();
     let mut err_reader = BufReader::new(stderr).lines();
 
-    // OWN the tags so the futures are 'static (don't borrow `step`)
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+
     let tag_out = format!("[{}][stdout] ", step.id);
     let tag_err = format!("[{}][stderr] ", step.id);
 
+    // clone per task to avoid move-after-move
+    let tag_out_for_out = tag_out.clone();
+    let tag_err_for_out = tag_err.clone();
+    // let quiet_logs = std::env::var("STARTHUB_QUIET_LOGS").is_ok();
+    let quiet_logs = true;
+
     let pump_out = tokio::spawn(async move {
         while let Ok(Some(line)) = out_reader.next_line().await {
-            println!("{}{}", tag_out, line);
-        }
-    });
-    let pump_err = tokio::spawn(async move {
-        while let Ok(Some(line)) = err_reader.next_line().await {
-            eprintln!("{}{}", tag_err, line);
+            if let Some(idx) = line.find(ST_MARKER) {
+                let json_part = &line[idx + ST_MARKER.len()..];
+                if let Ok(v) = serde_json::from_str::<Value>(json_part) {
+                    let _ = tx.send(v);
+                } else if !quiet_logs {
+                    eprintln!("{}[marker-parse-error] {}", tag_err_for_out, line);
+                }
+                // optionally avoid echoing marker line in quiet mode
+                if !quiet_logs {
+                    println!("{}{}", tag_out_for_out, line);
+                }
+            } else if !quiet_logs {
+                println!("{}{}", tag_out_for_out, line);
+            }
         }
     });
 
+    // move the original tag_err into the stderr task
+    let tag_err_for_err = tag_err;
+    let pump_err = tokio::spawn(async move {
+        while let Ok(Some(line)) = err_reader.next_line().await {
+            if !quiet_logs {
+                eprintln!("{}{}", tag_err_for_err, line);
+            }
+        }
+    });
     let status = child.wait().await?;
     let _ = pump_out.await;
     let _ = pump_err.await;
@@ -198,8 +250,15 @@ async fn run_docker_step(step: &StepSpec, pipeline_workdir: Option<&str>) -> Res
     if !status.success() {
         bail!("step '{}' failed with {}", step.id, status);
     }
-    Ok(())
+
+    // Merge all patches emitted by the action (could be multiple)
+    let mut patch = serde_json::json!({});
+    while let Ok(v) = rx.try_recv() {
+        deep_merge(&mut patch, v);
+    }
+    Ok(patch)
 }
+
 
 // ---- Execute wasm ----
 async fn run_wasm_step(client: &HubClient, step: &StepSpec, pipeline_workdir: Option<&str>, cache_dir: &Path) -> Result<()> {
