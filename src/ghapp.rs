@@ -396,3 +396,32 @@ pub async fn put_repo_secret(
         bail!("put secret {name} failed: {s} — {t}");
     }
 }
+
+#[derive(Deserialize, Debug)]
+pub struct RepoMeta {
+    pub name: String,
+    pub full_name: String,
+    pub private: bool,
+    pub owner: RepoOwner,
+    pub default_branch: Option<String>, // GitHub normally returns this
+}
+
+/// GET /repos/{owner}/{repo}
+pub async fn get_repo(token: &str, owner: &str, repo: &str) -> Result<RepoMeta> {
+    let url = format!("https://api.github.com/repos/{owner}/{repo}");
+    let resp = reqwest::Client::new()
+        .get(url)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, UA)
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .send()
+        .await?;
+
+    if resp.status().is_success() {
+        Ok(resp.json().await?)
+    } else {
+        let s = resp.status();
+        let t = resp.text().await.unwrap_or_default();
+        bail!("get repo failed: {s} — {t}");
+    }
+}

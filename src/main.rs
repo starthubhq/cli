@@ -4,6 +4,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
 use tokio::time::{sleep, Duration};
 
+mod starthub_api;
 mod ghapp;
 mod config; // 👈 add
 mod runners;

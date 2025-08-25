@@ -2,16 +2,14 @@ use anyhow::{bail, Result};
 use super::{Runner, DeployCtx};
 use crate::{ghapp, config};
 use tokio::process::Command;
-use tempfile::tempdir;
 use flate2::read::GzDecoder;
 use tar::Archive;
-use std::{fs, io, path::{Path, PathBuf}, time::Duration};
+use std::{fs, io, path::{Path, PathBuf}, process::exit, time::Duration};
 // + encryption crates
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use sodiumoxide::init as sodium_init;
 use sodiumoxide::crypto::{sealedbox, box_}; // <-- note: both modules imported
-use chrono::Local;
 
 
 fn sanitize_secret_name(s: &str) -> String {
@@ -64,74 +62,71 @@ impl Runner for GithubRunner {
     }
 
     async fn prepare(&self, ctx: &mut DeployCtx) -> Result<()> {
-        // Map package → template repo
-        let (tpl_owner, tpl_repo, refspec) = match ctx.action.as_str() {
-            "chirpstack" => ("starthubhq", "chirpstack", "refs/heads/main"),
-            other => { anyhow::bail!("unknown package '{other}'"); }
-        };
-        let now = Local::now();
+        // 1) Resolve the package via your Edge Function
+        let pkg = crate::starthub_api::get_package_by_name(&ctx.action).await
+            .map_err(|e| anyhow::anyhow!("failed to resolve package '{}': {e}", ctx.action))?;
+
+        exit(0);
+        // 2) Extract source repo (owner/repo[@ref])
+        let (tpl_owner, tpl_repo, ref_inline) = parse_owner_repo_ref(&pkg.repository)?;
+
+        // 3) Human-friendly target repo name
+        let now = chrono::Local::now();
         let timestamp = now.format("%Y%m%d%H%M%S").to_string();
+        let src_slug = slugify_for_repo_name(&pkg.name);
+        let repo_name: String = format!("{}-starthub-{}", src_slug, timestamp);
 
-        let repo_name: String = format!("{}-starthub-{}", ctx.action, timestamp);
-
+        // 4) Auth + user
         let creds = ghapp::load_token_for("github")?;
         let me = ghapp::get_user(&creds.access_token).await?;
-        println!("→ Creating personal repo '{}/{}' from {}/{} template…",
-                me.login, repo_name, tpl_owner, tpl_repo);
+        println!("→ Creating personal repo '{}/{}' from {}/{} …",
+                 me.login, repo_name, tpl_owner, tpl_repo);
 
-        // 1) try native "generate from template"
-        if let Ok(created) = ghapp::create_repo_from_template_personal(
-            &creds.access_token,
-            tpl_owner, tpl_repo,
-            &repo_name,
-            true, Some("Provisioned by Starthub"),
-            false, Some(&me.login),
-        ).await {
-            println!("✓ Created via template: {} ({})", created.full_name, created.html_url);
-            ctx.owner = Some(created.owner.login);
-            ctx.repo = Some(created.name);
-            return Ok(());
-        } else {
-            println!("↪︎ Falling back to clone+push (template not accessible by App)");
-        }
-
-        // 2) fallback: create empty repo
+        // 6) Fallback: empty repo → download tarball of source → push
         let created = ghapp::create_user_repo(
-            &creds.access_token,
-            &repo_name,
-            true,
-            Some("Provisioned by Starthub"),
+            &creds.access_token, &repo_name, true, Some("Provisioned by Starthub"),
         ).await?;
         println!("✓ Created empty repo: {} ({})", created.full_name, created.html_url);
 
-        // 3) download template tarball (public) and push
-        let work = tempdir()?;
+        // Decide ref: inline @ref from repository if present, else default branch
+        let ref_for_tar = if let Some(r) = ref_inline {
+            r
+        } else {
+            let src = ghapp::get_repo(&creds.access_token, &tpl_owner, &tpl_repo).await?;
+            src.default_branch.unwrap_or_else(|| "main".into())
+        };
+
+        let work = tempfile::tempdir()?;
         let extract_root = work.path().join("src");
         let checkout = work.path().join("repo");
-        fs::create_dir_all(&extract_root)?;
-        fs::create_dir_all(&checkout)?;
+        std::fs::create_dir_all(&extract_root)?;
+        std::fs::create_dir_all(&checkout)?;
 
         let tar_url = format!("https://codeload.github.com/{}/{}/tar.gz/{}",
-                              tpl_owner, tpl_repo, refspec);
+                              tpl_owner, tpl_repo, ref_for_tar);
         let unpacked = download_tarball(&tar_url, &extract_root).await?;
-
-        // copy all files into target checkout (strip top-level dir)
         copy_dir_all(&unpacked, &checkout)?;
 
-        // init git and push (uses token in URL; OK for now, but keep it short-lived)
         let remote = format!(
             "https://x-access-token:{}@github.com/{}/{}.git",
             creds.access_token, created.owner.login, created.name
         );
-
         run_git(&checkout, &["init"]).await?;
         run_git(&checkout, &["checkout", "-b", "main"]).await?;
         run_git(&checkout, &["add", "."]).await?;
-        run_git(&checkout, &["-c","user.name=Starthub","-c","user.email=bot@starthub.so","commit","-m","chore: bootstrap from template"]).await?;
+        let msg = format!("chore: bootstrap from {}", pkg.name);
+        run_git(
+            &checkout,
+            &[
+                "-c","user.name=Starthub",
+                "-c","user.email=bot@starthub.so",
+                "commit","-m", &msg
+            ]
+        ).await?;
         run_git(&checkout, &["remote", "add", "origin", &remote]).await?;
         run_git(&checkout, &["push", "-u", "origin", "main"]).await?;
 
-        println!("✓ Pushed template contents to {}", created.full_name);
+        println!("✓ Pushed source contents to {}", created.full_name);
         ctx.owner = Some(created.owner.login);
         ctx.repo = Some(created.name);
         Ok(())
@@ -208,4 +203,21 @@ async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
         bail!("git {:?} failed with status {:?}", args, status);
     }
     Ok(())
+}
+
+fn parse_owner_repo_ref(spec: &str) -> anyhow::Result<(String, String, Option<String>)> {
+    let (path, inline_ref) = spec.split_once('@').map_or((spec, None), |(p, r)| (p, Some(r.to_string())));
+    let (owner, repo) = path
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("invalid repository '{}', expected owner/repo", spec))?;
+    Ok((owner.to_string(), repo.to_string(), inline_ref))
+}
+
+fn slugify_for_repo_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() { out.push(ch.to_ascii_lowercase()); }
+        else { out.push('-'); }
+    }
+    out.trim_matches('-').to_string()
 }
