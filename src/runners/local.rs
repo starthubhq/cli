@@ -24,7 +24,13 @@ struct CompositeInput { name: String, #[serde(default)] r#type: String, #[serde(
 struct CompositeOutput { name: String, #[serde(default)] r#type: String, #[serde(default)] description: String }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompStep { id: String, uses: String, #[serde(default)] with: HashMap<String, String> }
+struct CompStep {
+    id: String,
+    #[serde(default)] kind: String,            // "docker" (default) or "wasm"
+    uses: String,
+    #[serde(default)]
+    with: HashMap<String, String>
+}
 
 #[derive(Deserialize, Debug, Clone)]
 struct WireFrom {
@@ -89,7 +95,7 @@ async fn run_action_plan(client: &HubClient, plan: &ActionPlan, ctx: &DeployCtx)
         // run (pass current state into stdin)
         let patch = match step.kind.as_str() {
             "docker" => run_docker_step_collect_state(&step, plan.workdir.as_deref(), &state).await?,
-            "wasm"   => run_wasm_step(client, &step, plan.workdir.as_deref(), &cache_dir).await.map(|_| Value::Null)?,
+            "wasm"   => run_wasm_step(&client, &step, plan.workdir.as_deref(), &cache_dir, &state).await?,
             other    => bail!("unknown step.kind '{}'", other),
         };
         if !patch.is_null() { deep_merge(&mut state, patch); }
@@ -319,14 +325,13 @@ impl Runner for LocalRunner {
 
 }
 
-// ---- Prefetch ----
 async fn prefetch_all(client: &HubClient, plan: &ActionPlan, cache_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(cache_dir)?;
     for s in &plan.steps {
         match s.kind.as_str() {
             "docker" => { let _ = docker_pull(&s.ref_).await; }
-            "wasm" => { let _path = client.download_wasm(&s.ref_, cache_dir).await?; }
-            _ => {},
+            "wasm"   => { let _ = client.download_wasm(&s.ref_, cache_dir).await?; }
+            _ => {}
         }
     }
     Ok(())
@@ -352,9 +357,13 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
         }
     }
 
-    // 2) Prefetch images
+    // 2) Prefetch (do both docker & wasm)
     for s in &comp.steps {
-        let _ = docker_pull(&s.uses).await; // ignore errors; docker will fail on run anyway
+        match s.kind.as_str() {
+            "docker" => { let _ = docker_pull(&s.uses).await; }
+            "wasm"   => { let _ = client.download_wasm(&s.uses, &std::env::temp_dir().join("starthub/oci")).await?; }
+            _ => {}
+        }
     }
 
     // 3) Run in topo order
@@ -364,6 +373,7 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
 
     for sid in order {
         let s = step_map.get(&sid).unwrap();
+        let step_kind = if s.kind.is_empty() { "docker" } else { &s.kind };
 
         // 3a) Resolve env for this step from wires + with
         let env = build_env_for_step(&sid, &s.with, &comp.wires, &inputs_map, &step_outputs)?;
@@ -371,7 +381,7 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
         // 3b) Build a transient StepSpec to reuse docker executor
         let mut step_spec = StepSpec {
             id: sid.clone(),
-            kind: "docker".into(),
+            kind: step_kind.to_string(),   // was hardcoded to "docker"
             ref_: s.uses.clone(),
             entry: None,
             args: vec![],
@@ -387,8 +397,12 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
             step_spec.env.entry(k.clone()).or_insert(v.clone());
         }
 
-        // 3c) Run it (passing the current state)
-        let patch = run_docker_step_collect_state(&step_spec, None, &state).await?;
+        // 3c) Run it (pass current state)
+        let patch = match step_kind {
+            "docker" => run_docker_step_collect_state(&step_spec, None, &state).await?,
+            "wasm"   => run_wasm_step(client, &step_spec, None, &std::env::temp_dir().join("starthub/oci"), &state).await?,
+            other    => bail!("unknown step.kind '{}'", other),
+        };
 
         // 3d) Merge state
         if !patch.is_null() { deep_merge(&mut state, patch); }
@@ -555,63 +569,136 @@ async fn run_docker_step_collect_state(
     Ok(patch)
 }
 
+fn wasmtime_major() -> Option<u32> {
+    use std::process::Command;
+    let out = Command::new("wasmtime").arg("--version").output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    // e.g. "wasmtime 36.0.0\n"
+    let tok = s.split_whitespace().nth(1)?;
+    tok.split('.').next()?.parse().ok()
+}
 
-// ---- Execute wasm ----
-async fn run_wasm_step(client: &HubClient, step: &StepSpec, pipeline_workdir: Option<&str>, cache_dir: &Path) -> Result<()> {
-    #[cfg(not(feature="wasm"))]
-    { bail!("wasm support not compiled (enable feature `wasm`)"); }
-
-    #[cfg(feature="wasm")] {
-        use wasmtime::{Engine, Module, Store, Linker};
-        use wasmtime_wasi::preview2::{WasiCtxBuilder, Table, WasiView, WasiCtx, DirPerms, FilePerms};
-        use wasmtime_wasi::sync::Dir;
-
-        // Resolve to local module path (cache/local)
-        let module_path = if step.ref_.starts_with("oci://") {
-            // TODO: add OCI pull; for now error or map to https via registry gateway
-            bail!("OCI-WASM not implemented yet in local runner");
-        } else {
-            client.download_wasm(&step.ref_, cache_dir).await?
-        };
-
-        let engine = Engine::default();
-        let module = Module::from_file(&engine, &module_path)?;
-
-        // WASI ctx
-        let mut table = Table::new();
-        let mut wasi_builder = WasiCtxBuilder::new();
-
-        // args & env
-        let mut args = vec![step.entry.clone().unwrap_or_else(|| "module".into())];
-        args.extend(step.args.clone());
-        let env_pairs: Vec<(&str,&str)> = step.env.iter().map(|(k,v)| (k.as_str(), v.as_str())).collect();
-        wasi_builder = wasi_builder.args(&args)?.envs(&env_pairs)?;
-
-        // mounts
-        for m in &step.mounts {
-            if m.typ != "bind" { continue; }
-            let host = absolutize(&m.source, pipeline_workdir)?;
-            let dir = Dir::open_ambient_dir(&host, wasmtime_wasi::sync::ambient_authority())?;
-            let (dp, fp) = if m.rw { (DirPerms::all(), FilePerms::all()) } else { (DirPerms::READ, FilePerms::READ) };
-            wasi_builder = wasi_builder.preopened_dir_with_permissions(dir, &m.target, dp, fp);
-        }
-
-        if let Some(wd) = step.workdir.as_ref().or(pipeline_workdir) {
-            wasi_builder = wasi_builder.working_dir(wd);
-        }
-
-        let wasi = wasi_builder.inherit_stdin().inherit_stdout().inherit_stderr().build();
-        struct Ctx { table: Table, wasi: WasiCtx }
-        impl WasiView for Ctx { fn table(&mut self)->&mut Table{&mut self.table} fn ctx(&mut self)->&mut WasiCtx{&mut self.wasi} }
-        let mut store = Store::new(&engine, Ctx{ table, wasi });
-        let mut linker = Linker::new(&engine);
-        wasmtime_wasi::preview2::command::add_to_linker(&mut linker)?;
-
-        let command = wasmtime_wasi::preview2::command::Command::instantiate(&mut store, &module, &linker)?;
-        let (code, _res) = command.call(&mut store)?;
-        if let Some(c) = code { if c != 0 { bail!("step '{}' exited with code {}", step.id, c); } }
-        Ok(())
+async fn run_wasm_step(
+    client: &HubClient,
+    step: &crate::runners::models::StepSpec,
+    pipeline_workdir: Option<&str>,
+    cache_dir: &std::path::Path,
+    state_in: &Value,
+) -> Result<Value> {
+    if which::which("wasmtime").is_err() {
+        bail!("`wasmtime` not found on PATH.");
     }
+
+    // ensure we have the .wasm component locally
+    let module_path = client.download_wasm(&step.ref_, cache_dir).await?;
+
+    // build stdin payload
+    let mut params = serde_json::Map::new();
+    for (k, v) in &step.env { params.insert(k.clone(), Value::String(v.clone())); }
+    let input_json = serde_json::json!({ "state": state_in, "params": Value::Object(params) }).to_string();
+
+    // pick flags based on wasmtime version
+    // let major = wasmtime_major().unwrap_or(0);
+
+    // Construct command
+    let mut cmd = Command::new("wasmtime");
+
+    // if major >= 36 {
+        // Preview2 HTTP shim — simplest form (no subcommand)
+        // wasmtime -S http [--allow-http=...] <module.wasm>
+    cmd.arg("-S").arg("http");
+        // Optional outbound allowlist(s):
+        // cmd.arg("--allow-http=api.digitalocean.com");
+        // Finally the module path
+    cmd.arg(&module_path);
+    // } else if (14..=18).contains(&major) {
+    //     // Legacy preview1 shim
+    //     // wasmtime run --wasi-modules=experimental-wasi-http <module.wasm>
+    //     cmd.arg("run")
+    //     // .arg("--wasi-modules=experimental-wasi-http")
+    //     .arg(&module_path);
+    // } else {
+    //     bail!(
+    //         "Unsupported wasmtime major version {}. Use ≥36 (-S http) or 14–18 (legacy shim).",
+    //         major
+    //     );
+    // }
+
+    // optional: pass extra args defined in step.args
+    for a in &step.args { cmd.arg(a); }
+
+    // pass env (tokens, etc.)
+    for (k, v) in &step.env { cmd.env(k, v); }
+
+    // working dir if absolute
+    if let Some(wd) = step.workdir.as_deref().or(pipeline_workdir) {
+        if wd.starts_with('/') { cmd.current_dir(wd); }
+    }
+
+    // spawn with piped stdio
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning wasmtime for step {}", step.id))?;
+
+    // feed stdin JSON (stdin/out protocol)
+    if let Some(stdin) = child.stdin.as_mut() {
+        use tokio::io::AsyncWriteExt;
+        stdin.write_all(input_json.as_bytes()).await?;
+    }
+    drop(child.stdin.take());
+
+    // pump stdout/stderr and collect patches (unchanged from your version)
+    use tokio::io::AsyncBufReadExt;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut out_reader = BufReader::new(stdout).lines();
+    let mut err_reader = BufReader::new(stderr).lines();
+
+    let tag_out = format!("[{}][stdout] ", step.id);
+    let tag_err = format!("[{}][stderr] ", step.id);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    let quiet_logs = false;
+
+    let tag_err_for_out = tag_err.clone();
+    let tag_out_for_out = tag_out.clone();
+    let pump_out = tokio::spawn(async move {
+        while let Ok(Some(line)) = out_reader.next_line().await {
+            if let Some(idx) = line.find(ST_MARKER) {
+                let json_part = &line[idx + ST_MARKER.len()..];
+                if let Ok(v) = serde_json::from_str::<Value>(json_part) {
+                    let _ = tx.send(v);
+                } else if !quiet_logs {
+                    eprintln!("{}[marker-parse-error] {}", tag_err_for_out, line);
+                }
+                if !quiet_logs { println!("{}{}", tag_out_for_out, line); }
+            } else if !quiet_logs {
+                println!("{}{}", tag_out_for_out, line);
+            }
+        }
+    });
+
+    let tag_err_for_err = tag_err;
+    let pump_err = tokio::spawn(async move {
+        while let Ok(Some(line)) = err_reader.next_line().await {
+            if !quiet_logs { eprintln!("{}{}", tag_err_for_err, line); }
+        }
+    });
+
+    let status = child.wait().await?;
+    let _ = pump_out.await;
+    let _ = pump_err.await;
+
+    if !status.success() {
+        bail!("step '{}' failed with {}", step.id, status);
+    }
+
+    // merge all patches
+    let mut patch = serde_json::json!({});
+    while let Ok(v) = rx.try_recv() { deep_merge(&mut patch, v); }
+    Ok(patch)
 }
 
 fn absolutize(p: &str, base: Option<&str>) -> Result<String> {
