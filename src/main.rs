@@ -366,11 +366,21 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { path } => cmd_init(path).await?,
-        Commands::Publish { no_build } => cmd_publish_docker(no_build).await?,
+        Commands::Publish { no_build } => cmd_publish(no_build).await?,   // 👈
         Commands::Run { action, secrets, env, runner } => cmd_run(action, secrets, env, runner).await?,
         Commands::Status { id } => cmd_status(id).await?,
     }
     Ok(())
+}
+
+async fn cmd_publish(no_build: bool) -> anyhow::Result<()> {
+    let manifest_str = fs::read_to_string("starthub.json")?;
+    let m: ShManifest = serde_json::from_str(&manifest_str)?;
+
+    match m.kind {
+        ShKind::Docker => cmd_publish_docker_inner(&m, no_build).await,
+        ShKind::Wasm   => cmd_publish_wasm_inner(&m, no_build).await,
+    }
 }
 
 // Parse any "digest: sha256:..." occurrence (push or inspect output)
@@ -453,23 +463,16 @@ fn oci_from_manifest(m: &ShManifest) -> anyhow::Result<String> {
     anyhow::bail!("For docker kind, please set `repository` to an OCI image base like `ghcr.io/<org>/<image>` or a GitHub repo URL so I can map it to GHCR.");
 }
 
-async fn cmd_publish_docker(no_build: bool) -> anyhow::Result<()> {
-    let manifest_str = fs::read_to_string("starthub.json")?;
-    let m: ShManifest = serde_json::from_str(&manifest_str)?;
-    anyhow::ensure!(matches!(m.kind, ShKind::Docker), "publish: kind must be 'docker'");
-
-    // derive OCI base (ghcr.io/org/repo or mapped from GitHub URL)
-    let image_base = oci_from_manifest(&m)?;
+async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
+    let image_base = oci_from_manifest(m)?;           // uses m.image or maps GitHub → ghcr
     let tag = format!("{}:{}", image_base, m.version);
 
     if !no_build {
-        run("docker", &["build", "-t", &tag, "."])?; // keep your existing run() if you like
+        run("docker", &["build", "-t", &tag, "."])?;
     }
 
-    // Push and extract digest from output
-    let digest = push_and_get_digest(&tag)?;
+    let digest = push_and_get_digest(&tag)?;         // parses digest from `docker push` output
 
-    // Write lockfile
     let primary = format!("oci://{}@{}", image_base, &digest);
     let lock = ShLock {
         name: m.name.clone(),
@@ -485,15 +488,219 @@ async fn cmd_publish_docker(no_build: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
-    let status = PCommand::new(cmd).args(args).status()?;
-    anyhow::ensure!(status.success(), "command failed: {} {:?}", cmd, args);
+fn push_wasm_and_get_digest(tag: &str, wasm_path: &str) -> anyhow::Result<String> {
+    // oras push ghcr.io/org/pkg:vX.Y.Z module.wasm:application/wasm
+    let push_out = run_capture(
+        "oras",
+        &["push", tag, &format!("{}:application/wasm", wasm_path)],
+    )?;
+
+    if let Some(d) = parse_digest_any(&push_out) {
+        return Ok(d);
+    }
+
+    // fallback to crane digest (works with artifact tags too)
+    if let Ok(crane_out) = run_capture("crane", &["digest", tag]) {
+        let d = crane_out.trim().to_string();
+        if d.starts_with("sha256:") && d.len() == "sha256:".len() + 64 {
+            return Ok(d);
+        }
+    }
+
+    anyhow::bail!(
+        "could not parse digest from `oras push` output; \
+         ensure `oras` (and optionally `crane`) are installed and the tag exists"
+    )
+}
+
+fn find_wasm_artifact(crate_name: &str) -> Option<String> {
+    use std::ffi::OsStr;
+
+    let name_dash = crate_name.to_string();
+    let name_underscore = crate_name.replace('-', "_");
+
+    let candidate_dirs = [
+        "target/wasm32-wasi/release",
+        "target/wasm32-wasi/release/deps",
+        "target/wasm32-wasip1/release",
+        "target/wasm32-wasip1/release/deps",
+    ];
+
+    // 1) Try exact filenames first (dash & underscore)
+    for dir in &candidate_dirs {
+        for fname in [
+            format!("{}/{}.wasm", dir, name_dash),
+            format!("{}/{}.wasm", dir, name_underscore),
+        ] {
+            if Path::new(&fname).exists() {
+                return Some(fname);
+            }
+        }
+    }
+
+    // 2) Fallback: pick the newest *.wasm in the candidate dirs
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for dir in &candidate_dirs {
+        if let Ok(rd) = fs::read_dir(dir) {
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.extension() == Some(OsStr::new("wasm")) {
+                    if let Ok(meta) = entry.metadata() {
+                        if let Ok(modified) = meta.modified() {
+                            let pstr = path.to_string_lossy().to_string();
+                            // Prefer files that contain the crate name (dash or underscore)
+                            let contains_name = pstr.contains(&name_dash) || pstr.contains(&name_underscore);
+                            let score_time = (modified, pstr.clone());
+                            match &mut newest {
+                                None => newest = Some(score_time),
+                                Some((t, _)) if modified > *t => newest = Some(score_time),
+                                _ => {}
+                            }
+                            // If it's clearly our crate, short-circuit
+                            if contains_name {
+                                return Some(pstr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    newest.map(|(_, p)| p)
+}
+
+// Map a GitHub repo URL/SSH to a GHCR image base
+fn github_to_ghcr_path(repo: &str) -> Option<String> {
+    let r = repo.trim().trim_end_matches(".git");
+
+    // ssh: git@github.com:owner/repo(.git)?
+    if r.starts_with("git@github.com:") {
+        let rest = r.trim_start_matches("git@github.com:");
+        let mut it = rest.split('/');
+        if let (Some(owner), Some(name)) = (it.next(), it.next()) {
+            return Some(format!("ghcr.io/{}/{}", owner.to_lowercase(), name.to_lowercase()));
+        }
+    }
+
+    // https://github.com/owner/repo or http://...
+    if r.contains("github.com/") {
+        let after = r.splitn(2, "github.com/").nth(1)?;
+        let mut it = after.split('/');
+        if let (Some(owner), Some(name)) = (it.next(), it.next()) {
+            return Some(format!("ghcr.io/{}/{}", owner.to_lowercase(), name.trim_end_matches(".git").to_lowercase()));
+        }
+    }
+
+    // bare github.com/owner/repo
+    if r.starts_with("github.com/") {
+        let mut it = r.trim_start_matches("github.com/").split('/');
+        if let (Some(owner), Some(name)) = (it.next(), it.next()) {
+            return Some(format!("ghcr.io/{}/{}", owner.to_lowercase(), name.to_lowercase()));
+        }
+    }
+
+    None
+}
+
+// Derive an OCI image base for both docker/wasm publish.
+// Priority: manifest.image -> manifest.repository (mapped if GitHub) -> git remote origin (mapped)
+fn derive_image_base(m: &ShManifest, cli_image: Option<String>) -> anyhow::Result<String> {
+    if let Some(i) = cli_image {
+        let i = i.trim();
+        if !i.is_empty() { return Ok(i.trim_end_matches('/').to_string()); }
+    }
+
+    let img = m.image.trim();
+    if !img.is_empty() && !img.starts_with("http") && img.split('/').count() >= 2 {
+        return Ok(img.trim_end_matches('/').to_string());
+    }
+
+    if let Some(mapped) = github_to_ghcr_path(&m.repository) {
+        return Ok(mapped);
+    }
+
+    // Try `git remote get-url origin`
+    if let Ok(out) = PCommand::new("git").args(["remote", "get-url", "origin"]).output() {
+        if out.status.success() {
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(mapped) = github_to_ghcr_path(&url) {
+                return Ok(mapped);
+            }
+        }
+    }
+
+    anyhow::bail!(
+        "Unable to determine OCI image path. Provide one with `--image ghcr.io/<org>/<name>` \
+         or set `image` in starthub.json, or set `repository` to a GitHub URL I can map."
+    )
+}
+
+// Write starthub.lock.json with the digest-pinned primary ref
+fn write_lock(m: &ShManifest, image_base: &str, digest: &str) -> anyhow::Result<()> {
+    let primary = format!("oci://{}@{}", image_base, digest);
+    let lock = ShLock {
+        name: m.name.clone(),
+        version: m.version.clone(),
+        kind: m.kind.clone(),
+        distribution: ShDistribution { primary, upstream: None },
+        digest: digest.to_string(),
+    };
+    fs::write("starthub.lock.json", serde_json::to_string_pretty(&lock)?)?;
     Ok(())
 }
+
+async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
+    let image_base = derive_image_base(m, None)?; // same resolver you use for docker/wasm
+    let tag = format!("{}:v{}", image_base, m.version);
+
+    if !no_build {
+        // Try cargo-component (component model) first; fall back to plain WASI target.
+        // Ignore rustup failure if target already installed.
+        let _ = run("rustup", &["target", "add", "wasm32-wasi"]);
+        // Prefer cargo-component if available
+        if run("cargo", &["+nightly", "component", "--version"]).is_ok() {
+            run("cargo", &["+nightly", "component", "build", "--release"])?;
+        } else {
+            run("cargo", &["build", "--release", "--target", "wasm32-wasi"])?;
+        }
+    }
+
+    // Find the .wasm produced by the build
+    let wasm_path = find_wasm_artifact(&m.name)
+        .ok_or_else(|| anyhow::anyhow!("WASM build artifact not found; looked in `target/**/release/**/*.wasm`"))?;
+
+    // Push to OCI registry as an artifact
+    let digest = push_wasm_and_get_digest(&tag, &wasm_path)?;
+
+    // Lockfile
+    write_lock(m, &image_base, &digest)?;
+    println!("✓ Pushed {tag}\n✓ Wrote starthub.lock.json");
+    Ok(())
+}
+fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
+    match PCommand::new(cmd).args(args).status() {
+        Ok(status) => {
+            anyhow::ensure!(status.success(), "command failed: {} {:?}", cmd, args);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("`{}` not found. Install it first (e.g., `brew install {}`)", cmd, cmd)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn run_capture(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
-    let out = PCommand::new(cmd).args(args).output()?;
-    anyhow::ensure!(out.status.success(), "command failed: {} {:?}", cmd, args);
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    match PCommand::new(cmd).args(args).output() {
+        Ok(out) => {
+            anyhow::ensure!(out.status.success(), "command failed: {} {:?}", cmd, args);
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("`{}` not found. Install it first (e.g., `brew install {}`)", cmd, cmd)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 fn parse_digest(s: &str) -> Option<String> {
     for line in s.lines() {
@@ -536,9 +743,31 @@ async fn cmd_init(path: String) -> anyhow::Result<()> {
         .with_default(repo_default)
         .prompt()?;
 
-    let image = Text::new("Image:")
-        .with_help_message("OCI image path without tag (e.g., ghcr.io/org/image)")
-        .with_default(repo_default)
+        // After `repository` is collected in cmd_init:
+    let default_image = if matches!(kind, ShKind::Docker) {
+        // already an OCI by default; user can edit
+        repo_default.to_string()
+    } else {
+        // WASM: map GitHub → GHCR by default for image
+        if repository.starts_with("https://github.com/") || repository.starts_with("github.com/") {
+            let trimmed = repository
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                .trim_start_matches("github.com/");
+            let mut parts = trimmed.split('/');
+            if let (Some(org), Some(name)) = (parts.next(), parts.next()) {
+                format!("ghcr.io/{}/{}", org, name.trim_end_matches(".git"))
+            } else {
+                "ghcr.io/owner/package".to_string()
+            }
+        } else {
+            "ghcr.io/owner/package".to_string()
+        }
+    };
+
+    let image = Text::new("Image (OCI path, no tag):")
+        .with_help_message("e.g., ghcr.io/org/package")
+        .with_default(&default_image)
         .prompt()?;
 
     // License
