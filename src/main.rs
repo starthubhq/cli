@@ -191,10 +191,6 @@ This action reads a JSON payload from **stdin** and prints state as:
 Inputs / Outputs
 
 Document your inputs and outputs in starthub.json.
-### Build & run (docker)
-```bash
-docker build -t {name}:dev .
-echo '{{"params":{{}}}}' | docker run -i --rm {name}:dev
 "#
 )
 }
@@ -793,7 +789,10 @@ async fn cmd_init(path: String) -> anyhow::Result<()> {
     write_file_guarded(&out_dir.join("starthub.json"), &json)?;
     // Always create .gitignore / .dockerignore / README.md
     write_file_guarded(&out_dir.join(".gitignore"), GITIGNORE_TPL)?;
-    write_file_guarded(&out_dir.join(".dockerignore"), DOCKERIGNORE_TPL)?;
+    // .dockerignore only for Docker projects
+    if matches!(kind, ShKind::Docker) {
+        write_file_guarded(&out_dir.join(".dockerignore"), DOCKERIGNORE_TPL)?;
+    }
     let readme = readme_tpl(&name, &kind, &repository, &license);
     write_file_guarded(&out_dir.join("README.md"), &readme)?;
 
