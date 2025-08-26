@@ -5,6 +5,9 @@ use clap::{ValueEnum};
 use tokio::time::{sleep, Duration};
 use std::{fs, path::Path};
 use serde::{Serialize, Deserialize};
+use inquire::{Text, Select, Confirm};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 mod starthub_api;
 mod ghapp;
@@ -23,7 +26,8 @@ struct ShManifest {
     name: String,
     version: String,
     kind: ShKind,                 // 👈 new
-    ref_field: String, // serialize as "ref"
+    repository: String,             // 👈 added
+    license: String,                // 👈 added
     inputs: Vec<ShPort>,
     outputs: Vec<ShPort>,
 }
@@ -50,6 +54,154 @@ enum ShType {
     Array,
     Number,
 }
+
+// ---------- Docker scaffolding templates ----------
+const DOCKERFILE_TPL: &str = r#"FROM alpine:3.20
+
+RUN apk add --no-cache curl jq
+
+WORKDIR /app
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]
+"#;
+
+const ENTRYPOINT_SH_TPL: &str = r#"#!/bin/sh
+set -euo pipefail
+
+# Read entire JSON payload from stdin:
+INPUT="$(cat || true)"
+
+# Secrets from env first; otherwise from stdin.params (avoid leaking in logs/state)
+do_access_token="${do_access_token:-}"
+if [ -z "${do_access_token}" ]; then
+  do_access_token="$(printf '%s' "$INPUT" | jq -r '(.params.do_access_token // .do_access_token // empty)')"
+fi
+
+# Non-secrets from env or stdin.params
+do_project_id="${do_project_id:-$(printf '%s' "$INPUT" | jq -r '(.params.do_project_id // .do_project_id // empty)')}"
+do_tag_name="${do_tag_name:-$(printf '%s' "$INPUT" | jq -r '(.params.do_tag_name // .do_tag_name // empty)')}"
+
+# Validate
+[ -n "${do_access_token:-}" ] || { echo "Error: do_access_token missing (env or stdin.params)" >&2; exit 1; }
+[ -n "${do_project_id:-}" ]  || { echo "Error: do_project_id missing (env or stdin.params)"  >&2; exit 1; }
+[ -n "${do_tag_name:-}" ]    || { echo "Error: do_tag_name missing (env or stdin.params)"    >&2; exit 1; }
+
+label="starthub-tag:${do_tag_name}"
+echo "📝 Updating project ${do_project_id} description to include '${label}'..." >&2
+
+# 1) Fetch current project
+get_resp="$(
+  curl -sS -f -X GET "https://api.digitalocean.com/v2/projects/${do_project_id}" \
+    -H "Authorization: Bearer ${do_access_token}" \
+    -H "Content-Type: application/json"
+)"
+
+current_desc="$(printf '%s' "$get_resp" | jq -r '.project.description // ""')"
+
+# 2) Build new description idempotently
+case "$current_desc" in
+  *"$label"*) new_desc="$current_desc" ;;
+  "")         new_desc="$label" ;;
+  *)          new_desc="$current_desc, $label" ;;
+esac
+
+# 3) PATCH only if needed
+if [ "$new_desc" = "$current_desc" ]; then
+  patch_resp="$get_resp"
+else
+  patch_resp="$(
+    curl -sS -f -X PATCH "https://api.digitalocean.com/v2/projects/${do_project_id}" \
+      -H "Authorization: Bearer ${do_access_token}" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -nc --arg d "$new_desc" '{description:$d}')"
+  )"
+fi
+
+# 4) Verify success
+project_id_parsed="$(printf '%s' "$patch_resp" | jq -r '.project.id // empty')"
+[ -n "$project_id_parsed" ] || { echo "❌ Failed to update project"; echo "$patch_resp" | jq . >&2; exit 1; }
+
+# 5) ✅ Emit output that matches the manifest exactly
+echo "::starthub:state::{\"do_tag_name\":\"${do_tag_name}\"}"
+
+# 6) Human-readable logs to STDERR
+{
+  echo "✅ Tag ensured in description. Project ID: ${project_id_parsed}"
+  echo "Final description:"
+  printf '%s\n' "$patch_resp" | jq -r '.project.description // ""'
+} >&2
+"#;
+
+const GITIGNORE_TPL: &str = r#"/target
+/dist
+/node_modules
+*.log
+*.tmp
+.DS_Store
+.env
+.env.*
+starthub.lock.json
+"#;
+
+const DOCKERIGNORE_TPL: &str = r#"*
+!entrypoint.sh
+!starthub.json
+!.dockerignore
+!.gitignore
+!README.md
+!Dockerfile
+"#;
+
+fn readme_tpl(name: &str, kind: &ShKind, repo: &str, license: &str) -> String {
+    let kind_str = match kind { ShKind::Docker => "docker", ShKind::Wasm => "wasm" };
+    format!(r#"# {name}
+
+A Starthub **{kind_str}** action.
+
+- Repository: `{repo}`
+- License: `{license}`
+
+## Usage
+
+This action reads a JSON payload from **stdin** and prints state as:
+
+::starthub:state::{{"key":"value"}}
+
+Inputs / Outputs
+
+Document your inputs and outputs in starthub.json.
+### Build & run (docker)
+```bash
+docker build -t {name}:dev .
+echo '{{"params":{{}}}}' | docker run -i --rm {name}:dev
+"#
+)
+}
+
+// safe write with overwrite prompt
+fn write_file_guarded(path: &Path, contents: &str) -> anyhow::Result<()> {
+if path.exists() {
+let overwrite = Confirm::new(&format!("{} exists. Overwrite?", path.display()))
+.with_default(false)
+.prompt()?;
+if !overwrite { return Ok(()); }
+}
+fs::write(path, contents)?;
+Ok(())
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> anyhow::Result<()> {
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
 #[derive(Parser, Debug)]
 #[command(name="starthub", version, about="Starthub CLI")]
@@ -109,13 +261,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn cmd_init(path: String) -> Result<()> {
-    use inquire::{Text, Select};
-
+// ------------------- cmd_init -------------------
+async fn cmd_init(path: String) -> anyhow::Result<()> {
     // Basic fields
     let name = Text::new("Package name:")
-        .with_default("http-get-wasm")
-        .prompt()?;
+    .with_default("http-get-wasm")
+    .prompt()?;
 
     let version = Text::new("Version:")
         .with_default("0.0.1")
@@ -129,33 +280,56 @@ async fn cmd_init(path: String) -> Result<()> {
         _ => unreachable!(),
     };
 
-    // A single reference works for both: wasm (module URL/OCI) or docker (image ref)
-    let ref_default = match kind {
-        ShKind::Wasm => "https://github.com/starthubhq/http-get-wasm/releases/download/v0.0.1/module.wasm",
-        ShKind::Docker => "ghcr.io/owner/image:tag",
+    // Repository
+    let repo_default = match kind {
+        ShKind::Wasm   => "github.com/starthubhq/http-get-wasm",
+        ShKind::Docker => "ghcr.io/starthubhq/http-get-wasm",
     };
-    let ref_field = Text::new("Module/Image reference (URL or OCI):")
-        .with_help_message("e.g. WASM URL or ghcr.io/org/image:tag")
-        .with_default(ref_default)
-        .prompt()?
-        .to_string();
+    let repository = Text::new("Repository:")
+        .with_help_message(match kind {
+            ShKind::Wasm => "Git repo URL or owner/repo (for source of truth)",
+            ShKind::Docker => "OCI image path without tag (e.g., ghcr.io/org/image)",
+        })
+        .with_default(repo_default)
+        .prompt()?;
 
-    // Empty vectors for now (you can add your inputs/outputs loop later)
+    // License
+    let license = Select::new("License:", vec![
+        "Apache-2.0", "MIT", "BSD-3-Clause", "GPL-3.0", "Unlicense", "Proprietary",
+    ]).prompt()?.to_string();
+
+    // Empty I/O (you can extend later)
     let inputs: Vec<ShPort> = Vec::new();
     let outputs: Vec<ShPort> = Vec::new();
 
-    // Build manifest and write file
-    let m = ShManifest { name, version, kind, ref_field, inputs, outputs };
-    let json = serde_json::to_string_pretty(&m)?;
+    // Manifest
+    let manifest = ShManifest { name: name.clone(), version: version.clone(), kind: kind.clone(), repository: repository.clone(), license: license.clone(), inputs, outputs };
+    let json = serde_json::to_string_pretty(&manifest)?;
 
-    let out_dir = std::path::Path::new(&path);
+    // Ensure dir
+    let out_dir = Path::new(&path);
     if !out_dir.exists() {
-        std::fs::create_dir_all(out_dir)?;
+        fs::create_dir_all(out_dir)?;
     }
-    let out_file = out_dir.join("starthub.json");
-    std::fs::write(&out_file, json)?;
 
-    println!("✓ Wrote {}", out_file.display());
+    // Write starthub.json
+    write_file_guarded(&out_dir.join("starthub.json"), &json)?;
+    // Always create .gitignore / .dockerignore / README.md
+    write_file_guarded(&out_dir.join(".gitignore"), GITIGNORE_TPL)?;
+    write_file_guarded(&out_dir.join(".dockerignore"), DOCKERIGNORE_TPL)?;
+    let readme = readme_tpl(&name, &kind, &repository, &license);
+    write_file_guarded(&out_dir.join("README.md"), &readme)?;
+
+    // If docker, scaffold Dockerfile + entrypoint.sh
+    if matches!(kind, ShKind::Docker) {
+        let dockerfile = out_dir.join("Dockerfile");
+        write_file_guarded(&dockerfile, DOCKERFILE_TPL)?;
+        let entrypoint = out_dir.join("entrypoint.sh");
+        write_file_guarded(&entrypoint, ENTRYPOINT_SH_TPL)?;
+        make_executable(&entrypoint)?;
+    }
+
+    println!("✓ Wrote {}", out_dir.join("starthub.json").display());
     Ok(())
 }
 
