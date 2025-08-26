@@ -37,3 +37,6 @@ Thumbs.db
 *.zip
 *.tgz
 *.xz
+
+# Extra
+starthub.json

@@ -3,6 +3,8 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
 use tokio::time::{sleep, Duration};
+use std::{fs, path::Path};
+use serde::{Serialize, Deserialize};
 
 mod starthub_api;
 mod ghapp;
@@ -13,6 +15,40 @@ mod runners;
 enum RunnerKind {
     Github,
     Local, // placeholder for future
+}
+
+// ---- Starthub manifest schema ----
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShManifest {
+    name: String,
+    version: String,
+    kind: ShKind,                 // 👈 new
+    ref_field: String, // serialize as "ref"
+    inputs: Vec<ShPort>,
+    outputs: Vec<ShPort>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ShKind { Wasm, Docker }      // 👈 new
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShPort {
+    name: String,
+    description: String,
+    #[serde(rename = "type")]
+    ty: ShType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ShType {
+    String,
+    Integer,
+    Boolean,
+    Object,
+    Array,
+    Number,
 }
 
 #[derive(Parser, Debug)]
@@ -74,10 +110,55 @@ async fn main() -> Result<()> {
 }
 
 async fn cmd_init(path: String) -> Result<()> {
-    println!("Init in {path}");
-    // TODO: write default config, detect repo, etc.
+    use inquire::{Text, Select};
+
+    // Basic fields
+    let name = Text::new("Package name:")
+        .with_default("http-get-wasm")
+        .prompt()?;
+
+    let version = Text::new("Version:")
+        .with_default("0.0.1")
+        .prompt()?;
+
+    // Kind
+    let kind_str = Select::new("Kind:", vec!["wasm", "docker"]).prompt()?;
+    let kind = match kind_str {
+        "wasm" => ShKind::Wasm,
+        "docker" => ShKind::Docker,
+        _ => unreachable!(),
+    };
+
+    // A single reference works for both: wasm (module URL/OCI) or docker (image ref)
+    let ref_default = match kind {
+        ShKind::Wasm => "https://github.com/starthubhq/http-get-wasm/releases/download/v0.0.1/module.wasm",
+        ShKind::Docker => "ghcr.io/owner/image:tag",
+    };
+    let ref_field = Text::new("Module/Image reference (URL or OCI):")
+        .with_help_message("e.g. WASM URL or ghcr.io/org/image:tag")
+        .with_default(ref_default)
+        .prompt()?
+        .to_string();
+
+    // Empty vectors for now (you can add your inputs/outputs loop later)
+    let inputs: Vec<ShPort> = Vec::new();
+    let outputs: Vec<ShPort> = Vec::new();
+
+    // Build manifest and write file
+    let m = ShManifest { name, version, kind, ref_field, inputs, outputs };
+    let json = serde_json::to_string_pretty(&m)?;
+
+    let out_dir = std::path::Path::new(&path);
+    if !out_dir.exists() {
+        std::fs::create_dir_all(out_dir)?;
+    }
+    let out_file = out_dir.join("starthub.json");
+    std::fs::write(&out_file, json)?;
+
+    println!("✓ Wrote {}", out_file.display());
     Ok(())
 }
+
 
 async fn cmd_login(runner: RunnerKind) -> anyhow::Result<()> {
     let r = make_runner(runner);
