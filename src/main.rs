@@ -4,8 +4,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
 use tokio::time::{sleep, Duration};
 use std::{fs, path::Path};
+use std::process::Command as PCommand;
 use serde::{Serialize, Deserialize};
 use inquire::{Text, Select, Confirm};
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -27,6 +29,7 @@ struct ShManifest {
     version: String,
     kind: ShKind,                 // 👈 new
     repository: String,             // 👈 added
+    image: String,
     license: String,                // 👈 added
     inputs: Vec<ShPort>,
     outputs: Vec<ShPort>,
@@ -42,6 +45,22 @@ struct ShPort {
     description: String,
     #[serde(rename = "type")]
     ty: ShType,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShLock {
+    name: String,
+    version: String,
+    kind: ShKind,
+    distribution: ShDistribution,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShDistribution {
+    primary: String,                // oci://ghcr.io/org/image@sha256:...
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream: Option<String>,       // keep for future mirrors; None for now
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +326,11 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: String,
     },
+    Publish {
+        /// Do not build, only push/tag (assumes image exists locally)
+        #[arg(long)]
+        no_build: bool,
+    },
     /// Deploy with the given config
     Run {
         /// Package slug/name, e.g. "chirpstack"
@@ -342,10 +366,142 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Init { path } => cmd_init(path).await?,
+        Commands::Publish { no_build } => cmd_publish_docker(no_build).await?,
         Commands::Run { action, secrets, env, runner } => cmd_run(action, secrets, env, runner).await?,
         Commands::Status { id } => cmd_status(id).await?,
     }
     Ok(())
+}
+
+// Parse any "digest: sha256:..." occurrence (push or inspect output)
+fn parse_digest_any(s: &str) -> Option<String> {
+    for line in s.lines() {
+        // be forgiving on casing
+        let lower = line.to_ascii_lowercase();
+        if let Some(pos) = lower.find("digest:") {
+            // slice the original line at the same offset to avoid lossy lowercasing of the digest itself
+            let rest = line[(pos + "digest:".len())..].trim();
+
+            // find the sha256 token in the remainder
+            if let Some(idx) = rest.find("sha256:") {
+                let token = &rest[idx..];
+                // token may be followed by spaces/text (e.g., " size: 1361")
+                let digest = token.split_whitespace().next().unwrap_or("");
+                if digest.starts_with("sha256:") && digest.len() == "sha256:".len() + 64 {
+                    return Some(digest.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn push_and_get_digest(tag: &str) -> anyhow::Result<String> {
+    // 1) docker push (capture output; push often prints the digest line)
+    let push_out = run_capture("docker", &["push", tag])?;
+    if let Some(d) = parse_digest_any(&push_out) {
+        return Ok(d);
+    }
+
+    // 2) fallback: docker buildx imagetools inspect
+    if let Ok(inspect_out) = run_capture("docker", &["buildx", "imagetools", "inspect", tag]) {
+        if let Some(d) = parse_digest_any(&inspect_out) {
+            return Ok(d);
+        }
+    }
+
+    // 3) optional: crane digest (if installed)
+    if let Ok(crane_out) = run_capture("crane", &["digest", tag]) {
+        let d = crane_out.trim().to_string();
+        if d.starts_with("sha256:") && d.len() == "sha256:".len() + 64 {
+            return Ok(d);
+        }
+    }
+
+    anyhow::bail!("could not parse image digest from `docker push`/`imagetools` output; ensure `docker buildx` is available or install `crane`.")
+}
+
+fn oci_from_manifest(m: &ShManifest) -> anyhow::Result<String> {
+    // 1) If you still carry `ref` in your JSON, prefer it when it's an OCI path without scheme
+    // (Optional: add it to ShManifest as Option<String>)
+    // try to parse a repo-like value from m.repository
+    let repo = m.repository.trim();
+
+    // If user gave a proper OCI path already (ghcr.io/..., docker.io/..., etc.)
+    if repo.starts_with("ghcr.io/")
+        || repo.starts_with("docker.io/")
+        || repo.starts_with("registry-1.docker.io/")
+        || repo.split('/').count() >= 2 && !repo.starts_with("http")
+    {
+        return Ok(repo.trim_end_matches('/').to_string());
+    }
+
+    // GitHub URL → map to GHCR
+    if repo.starts_with("https://github.com/") || repo.starts_with("github.com/") {
+        let parts: Vec<&str> = repo.trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("github.com/")
+            .split('/')
+            .collect();
+        if parts.len() >= 2 {
+            let org = parts[0];
+            let name = parts[1].trim_end_matches(".git");
+            return Ok(format!("ghcr.io/{}/{}", org, name));
+        }
+    }
+
+    anyhow::bail!("For docker kind, please set `repository` to an OCI image base like `ghcr.io/<org>/<image>` or a GitHub repo URL so I can map it to GHCR.");
+}
+
+async fn cmd_publish_docker(no_build: bool) -> anyhow::Result<()> {
+    let manifest_str = fs::read_to_string("starthub.json")?;
+    let m: ShManifest = serde_json::from_str(&manifest_str)?;
+    anyhow::ensure!(matches!(m.kind, ShKind::Docker), "publish: kind must be 'docker'");
+
+    // derive OCI base (ghcr.io/org/repo or mapped from GitHub URL)
+    let image_base = oci_from_manifest(&m)?;
+    let tag = format!("{}:{}", image_base, m.version);
+
+    if !no_build {
+        run("docker", &["build", "-t", &tag, "."])?; // keep your existing run() if you like
+    }
+
+    // Push and extract digest from output
+    let digest = push_and_get_digest(&tag)?;
+
+    // Write lockfile
+    let primary = format!("oci://{}@{}", image_base, &digest);
+    let lock = ShLock {
+        name: m.name.clone(),
+        version: m.version.clone(),
+        kind: m.kind.clone(),
+        distribution: ShDistribution { primary, upstream: None },
+        digest,
+    };
+    fs::write("starthub.lock.json", serde_json::to_string_pretty(&lock)?)?;
+
+    println!("✓ Pushed {tag}");
+    println!("✓ Wrote starthub.lock.json");
+    Ok(())
+}
+
+fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
+    let status = PCommand::new(cmd).args(args).status()?;
+    anyhow::ensure!(status.success(), "command failed: {} {:?}", cmd, args);
+    Ok(())
+}
+fn run_capture(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
+    let out = PCommand::new(cmd).args(args).output()?;
+    anyhow::ensure!(out.status.success(), "command failed: {} {:?}", cmd, args);
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+fn parse_digest(s: &str) -> Option<String> {
+    for line in s.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Digest: ") {
+            if rest.starts_with("sha256:") { return Some(rest.to_string()); }
+        }
+    }
+    None
 }
 
 // ------------------- cmd_init -------------------
@@ -374,9 +530,14 @@ async fn cmd_init(path: String) -> anyhow::Result<()> {
     };
     let repository = Text::new("Repository:")
         .with_help_message(match kind {
-            ShKind::Wasm => "Git repo URL or owner/repo (for source of truth)",
-            ShKind::Docker => "OCI image path without tag (e.g., ghcr.io/org/image)",
+            ShKind::Wasm => "Git repo URL",
+            ShKind::Docker => "Git repo URL",
         })
+        .with_default(repo_default)
+        .prompt()?;
+
+    let image = Text::new("Image:")
+        .with_help_message("OCI image path without tag (e.g., ghcr.io/org/image)")
         .with_default(repo_default)
         .prompt()?;
 
@@ -390,7 +551,7 @@ async fn cmd_init(path: String) -> anyhow::Result<()> {
     let outputs: Vec<ShPort> = Vec::new();
 
     // Manifest
-    let manifest = ShManifest { name: name.clone(), version: version.clone(), kind: kind.clone(), repository: repository.clone(), license: license.clone(), inputs, outputs };
+    let manifest = ShManifest { name: name.clone(), version: version.clone(), kind: kind.clone(), repository: repository.clone(), image: image.clone(), license: license.clone(), inputs, outputs };
     let json = serde_json::to_string_pretty(&manifest)?;
 
     // Ensure dir
