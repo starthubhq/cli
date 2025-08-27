@@ -10,6 +10,14 @@ use inquire::{Text, Select, Confirm};
 use axum::{routing::get, Router};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use axum::{
+    body::Body,
+    http::{header::CONTENT_TYPE, StatusCode, Uri},
+    response::Response,
+};
+use rust_embed::RustEmbed;
+use mime_guess::from_path;
+
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -857,20 +865,63 @@ fn open_actions_page(owner: &str, repo: &str) {
     }
 }
 
+#[derive(RustEmbed)]
+#[folder = "ui/dist/"]     // embedded at compile time
+struct Assets;
+
+async fn embedded_assets(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    // Try requested path, else serve index.html (SPA fallback)
+    let candidate = if path.is_empty() { "index.html" } else { path };
+    let data = Assets::get(candidate).or_else(|| Assets::get("index.html"));
+
+    match data {
+        Some(content) => {
+            let body = Body::from(content.data.into_owned()); // <- Body::from
+            let mime = from_path(candidate).first_or_octet_stream();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, mime.as_ref())          // <- CONTENT_TYPE const
+                .body(body.into())
+                .unwrap()
+        }
+        None => Response::builder().status(StatusCode::NOT_FOUND).body(axum::body::Body::empty()).unwrap(),
+    }
+}
+
+// ---------- API router ----------
+fn api_router() -> Router {
+    Router::new().route("/health", get(|| async { "ok" }))
+}
+
+
 async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
      // --------------------------------------------------
     // Start web server (blocking until Ctrl-C)
     // --------------------------------------------------
-    let app = Router::new().route("/", get(|| async { "Hello from Starthub CLI!" }));
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8888));
+    // let app = Router::new().route("/", get(|| async { "Hello from Starthub CLI!" }));
+    println!("Opening browser at http://localhost:8888");
 
-    println!("🌐 Web server available at http://{}", addr);
+    let app = Router::new()
+        .nest("/api", api_router())
+        .fallback(embedded_assets);
 
-    // Foreground: this call will block until server exits
+    let addr: SocketAddr = ([127, 0, 0, 1], 8888).into();
     let listener = TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app.into_make_service())
-        .await
-        .unwrap();
+
+    println!("UI at http://{}", addr);
+
+    // Spawn a task that waits a moment and then opens the browser
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if webbrowser::open("http://localhost:8888").is_err() {
+            eprintln!("⚠️  Failed to open browser automatically.");
+        }
+    });
+
+    // Run server (blocking until Ctrl-C)
+    axum::serve(listener, app.into_make_service()).await.unwrap();
 
     // This is actually what's going to process the command
     // TODO: split later
