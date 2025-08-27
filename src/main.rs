@@ -7,6 +7,9 @@ use std::{fs, path::Path};
 use std::process::Command as PCommand;
 use serde::{Serialize, Deserialize};
 use inquire::{Text, Select, Confirm};
+use axum::{routing::get, Router};
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -855,31 +858,48 @@ fn open_actions_page(owner: &str, repo: &str) {
 }
 
 async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
-    let parsed_secrets = parse_secret_pairs(&secrets)?;
-    let mut ctx = runners::DeployCtx {
-        action,
-        env,
-        owner: None,
-        repo: None,
-        secrets: parsed_secrets,       // <— pass to runner
-    };
-    let r = make_runner(runner);
+     // --------------------------------------------------
+    // Start web server (blocking until Ctrl-C)
+    // --------------------------------------------------
+    let app = Router::new().route("/", get(|| async { "Hello from Starthub CLI!" }));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8888));
 
-    // 1) ensure auth for selected runner; guide if missing
-    r.ensure_auth().await?;
+    println!("🌐 Web server available at http://{}", addr);
 
-    // 2) do the runner-specific steps
-    r.prepare(&mut ctx).await?;
-    r.put_files(&ctx).await?;
-    r.set_secrets(&ctx).await?;       // <— will create repo secrets
-    r.dispatch(&ctx).await?;
+    // Foreground: this call will block until server exits
+    let listener = TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app.into_make_service())
+        .await
+        .unwrap();
 
-    if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
-        sleep(Duration::from_secs(5)).await;
-        open_actions_page(owner, repo);
-    }
+    // This is actually what's going to process the command
+    // TODO: split later
 
-    println!("✓ Dispatch complete for {}", r.name());
+    // let parsed_secrets = parse_secret_pairs(&secrets)?;
+    // let mut ctx = runners::DeployCtx {
+    //     action,
+    //     env,
+    //     owner: None,
+    //     repo: None,
+    //     secrets: parsed_secrets,       // <— pass to runner
+    // };
+    // let r = make_runner(runner);
+
+    // // 1) ensure auth for selected runner; guide if missing
+    // r.ensure_auth().await?;
+
+    // // 2) do the runner-specific steps
+    // r.prepare(&mut ctx).await?;
+    // r.put_files(&ctx).await?;
+    // r.set_secrets(&ctx).await?;       // <— will create repo secrets
+    // r.dispatch(&ctx).await?;
+
+    // if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
+    //     sleep(Duration::from_secs(5)).await;
+    //     open_actions_page(owner, repo);
+    // }
+
+    // println!("✓ Dispatch complete for {}", r.name());
 
     
     Ok(())
