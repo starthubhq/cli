@@ -1,7 +1,6 @@
 // src/starthub_api.rs
 use anyhow::{Result, Context};
-use reqwest::header::{AUTHORIZATION, ACCEPT, CONTENT_TYPE};
-use serde::Deserialize;
+use reqwest::header::{AUTHORIZATION, ACCEPT};
 
 use crate::runners::models::ActionPlan;
 
@@ -29,7 +28,6 @@ impl Client {
 
     /// Fetch the resolved action plan (already expanded into atomic steps).
     pub async fn fetch_action_plan(&self, action: &str, env: Option<&str>) -> Result<ActionPlan> {
-        // e.g. GET {base}/v1/actions/{action}/plan?env=…
         let url = format!("{}/v1/actions/{}/plan", self.base.trim_end_matches('/'), action);
         let mut req = self.http.get(&url).header(ACCEPT, "application/json");
         if let Some(e) = env { req = req.query(&[("env", e)]); }

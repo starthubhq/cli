@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +41,7 @@ struct TokenPoll {
 
 #[derive(Deserialize)]
 pub struct GhUser {
+    #[allow(dead_code)]
     pub id: i64,
     pub login: String,
 }
@@ -127,6 +128,7 @@ pub async fn get_user(access_token: &str) -> Result<GhUser> {
 
 #[derive(Deserialize)]
 struct InstallationsPage {
+    #[allow(dead_code)]
     total_count: u32,
     installations: Vec<Installation>,
 }
@@ -140,6 +142,7 @@ pub struct Installation {
 
 #[derive(Deserialize, Clone)]
 pub struct Account {
+    #[allow(dead_code)]
     pub id: i64,
     pub login: String,
     #[serde(rename = "type")]
@@ -211,6 +214,7 @@ impl StoredCredentials {
     }
 
     /// Optional: check refresh token expiry if you plan to refresh
+    #[allow(dead_code)]
     pub fn refresh_is_expired(&self) -> bool {
         match self.refresh_token_expires_at_epoch {
             None => false,

@@ -4,8 +4,10 @@ use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 pub struct ActionPlan {
+    #[allow(dead_code)]
     pub id: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub version: String,
     #[serde(default)]
     pub workdir: Option<String>,
@@ -27,6 +29,7 @@ pub struct StepSpec {
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub network: Option<String>, // docker only: "none"|"bridge"

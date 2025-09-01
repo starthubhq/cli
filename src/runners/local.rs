@@ -4,7 +4,7 @@ use serde::{Deserialize};
 use serde_json::{json, Value, Map};
 use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command};
 use tokio::sync::mpsc;
-use std::{path::{Path, PathBuf}};
+use std::path::Path;
 use std::fs;
 use std::collections::{HashSet, HashMap, VecDeque};
 use which::which;
@@ -25,19 +25,25 @@ const ST_MARKER: &str = "::starthub:state::";
 
 #[derive(Deserialize, Debug, Clone)]
 struct CompositeInput { 
+    #[allow(dead_code)]
     name: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     r#type: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     description: String 
 }
 
 #[derive(Deserialize, Debug, Clone)]
 struct CompositeOutput { 
+    #[allow(dead_code)]
     name: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     r#type: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     description: String 
 }
 
@@ -79,11 +85,15 @@ struct Wire {
 
 #[derive(Deserialize, Debug, Clone)]
 struct CompositeSpec {
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     version: String,
     #[serde(default)] 
+    #[allow(dead_code)]
     description: String,
     inputs: Vec<CompositeInput>,
+    #[allow(dead_code)]
     outputs: Vec<CompositeOutput>,
     steps: Vec<CompStep>,
     #[serde(default)] 
