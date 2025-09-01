@@ -64,6 +64,23 @@ fn looks_like_local_composite(s: &str) -> bool {
     t.starts_with('{') || t.ends_with(".json") || t.starts_with("file://") || Path::new(t).exists()
 }
 
+fn looks_like_composition_id(s: &str) -> bool {
+    let t = s.trim();
+    // Composition IDs are typically UUIDs or short identifiers
+    // They don't contain special characters that would indicate other formats
+    !t.contains('{') && !t.contains('}') && !t.contains('/') && !t.contains(':') && 
+    !t.ends_with(".json") && !t.starts_with("file://") && !Path::new(t).exists() &&
+    !t.contains('@') && t.len() > 0
+}
+
+async fn try_load_composite_spec_from_id(client: &HubClient, composition_id: &str) -> Result<CompositeSpec> {
+    let json_content = client.fetch_starthub_json(composition_id).await
+        .with_context(|| format!("fetching starthub.json for composition '{}'", composition_id))?;
+    
+    serde_json::from_str::<CompositeSpec>(&json_content)
+        .with_context(|| format!("parsing starthub.json for composition '{}'", composition_id))
+}
+
 fn try_load_composite_spec(action: &str) -> Result<CompositeSpec> {
     let mut s = action.trim();
     if let Some(rest) = s.strip_prefix("file://") { s = rest; }
@@ -299,13 +316,27 @@ impl Runner for LocalRunner {
             return Ok(());
         }
 
+        // 0.5) Composition ID? fetch from Supabase storage and run it.
+        if looks_like_composition_id(&ctx.action) {
+            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
+            let token = std::env::var("STARTHUB_TOKEN").ok();
+            let client = HubClient::new(base, token);
+            
+            let comp = try_load_composite_spec_from_id(&client, &ctx.action).await?;
+            run_composite(&client, &comp, ctx).await?;
+            println!("✓ Composition execution complete");
+            return Ok(());
+        }
+
         // 1) Otherwise, try server-provided ActionPlan
         let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
         let token = std::env::var("STARTHUB_TOKEN").ok();
         let client = HubClient::new(base, token);
 
-        match client.fetch_action_plan(&ctx.action, ctx.env.as_deref()).await {
-            Ok(plan) => {
+        match client.fetch_action_metadata(&ctx.action).await {
+            Ok(plan_value) => {
+                let plan: ActionPlan = serde_json::from_value(plan_value)
+                    .context("deserializing action plan")?;
                 run_action_plan(&client, &plan, ctx).await?;
             }
             Err(e_plan) => {

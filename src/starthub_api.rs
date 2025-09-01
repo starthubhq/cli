@@ -27,18 +27,32 @@ impl Client {
         } else { req }
     }
 
-    /// Fetch the resolved action plan (already expanded into atomic steps).
-    pub async fn fetch_action_plan(&self, action: &str, env: Option<&str>) -> Result<ActionPlan> {
-        // e.g. GET {base}/v1/actions/{action}/plan?env=…
-        let url = format!("{}/v1/actions/{}/plan", self.base.trim_end_matches('/'), action);
-        let mut req = self.http.get(&url).header(ACCEPT, "application/json");
-        if let Some(e) = env { req = req.query(&[("env", e)]); }
-        let req = self.auth_header(req);
-
-        let res = req.send().await?.error_for_status()?;
-        let plan: ActionPlan = res.json().await.context("decoding action plan json")?;
-        Ok(plan)
+    /// Fetch a starthub.json file from Supabase storage bucket
+    pub async fn fetch_starthub_json(&self, composition_id: &str) -> Result<String> {
+        let url = format!("{}/storage/v1/object/public/compositions/{}/starthub.json", self.base, composition_id);
+        
+        let mut req = self.http.get(&url);
+        req = self.auth_header(req);
+        
+        let resp = req.send().await?.error_for_status()?;
+        let content = resp.text().await?;
+        Ok(content)
     }
+
+    /// Fetch the resolved action plan (already expanded into atomic steps).
+    pub async fn fetch_action_metadata(&self, r#ref: &str) -> anyhow::Result<serde_json::Value> {
+        let url = format!("{}/functions/v1/actions", self.base);
+        let client = reqwest::Client::new();
+
+        let mut req = client.get(&url).query(&[("ref", r#ref)]);
+        if let Some(t) = &self.token {
+            req = req.bearer_auth(t);
+        }
+
+        let resp = req.send().await?.error_for_status()?;
+        Ok(resp.json::<serde_json::Value>().await?)
+    }
+
 
     /// Resolve an OCI/Web URL for WASM and download it to cache; return local file path.
     pub async fn download_wasm(&self, ref_str: &str, cache_dir: &std::path::Path) -> Result<std::path::PathBuf> {
