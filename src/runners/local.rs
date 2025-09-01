@@ -10,7 +10,7 @@ use std::collections::{HashSet, HashMap, VecDeque};
 use which::which;
 
 use super::{Runner, DeployCtx};
-use crate::starthub_api::Client as HubClient;
+use crate::starthub_api::{Client as HubClient, ActionMetadata};
 use crate::runners::models::{ActionPlan, StepSpec, MountSpec};
 
 // ============================================================================
@@ -129,28 +129,25 @@ impl Runner for LocalRunner {
             return Ok(());
         }
 
-        // 1) Otherwise, try server-provided ActionPlan
+        // 1) Try to fetch action details from the actions edge function
         let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
         let token = std::env::var("STARTHUB_TOKEN").ok();
         let client = HubClient::new(base, token);
 
-        match client.fetch_action_plan(&ctx.action, ctx.env.as_deref()).await {
-            Ok(plan) => {
-                run_action_plan(&client, &plan, ctx).await?;
+        // Try to fetch action metadata first
+        match client.fetch_action_metadata(&ctx.action).await {
+            Ok(metadata) => {
+                println!("✓ Fetched action details for {}", ctx.action);
+                let comp = convert_action_metadata_to_composite(&metadata)?;
+                run_composite(&client, &comp, ctx).await?;
+                println!("✓ Local execution complete");
+                return Ok(());
             }
-            Err(e_plan) => {
-                if looks_like_oci_image(&ctx.action) {
-                    tracing::warn!("backend plan fetch failed ({}); falling back to direct image: {}", e_plan, ctx.action);
-                    let plan = single_step_plan_from_image(&ctx.action, &ctx.secrets);
-                    run_action_plan(&client, &plan, ctx).await?;
-                } else {
-                    return Err(e_plan).context("fetching action plan / resolving composite")?;
-                }
+            Err(e_metadata) => {
+                tracing::debug!("Failed to fetch action metadata ({}), trying action plan", e_metadata);
+                return Err(e_metadata).context("fetching action plan / resolving composite")?;
             }
         };
-
-        println!("✓ Local execution complete");
-        Ok(())
     }
 }
 
@@ -253,6 +250,7 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn run_action_plan(client: &HubClient, plan: &ActionPlan, ctx: &DeployCtx) -> Result<()> {
     // Prefetch
     let cache_dir = dirs::cache_dir().unwrap_or(std::env::temp_dir()).join("starthub/oci");
@@ -527,6 +525,7 @@ fn try_load_composite_spec(action: &str) -> Result<CompositeSpec> {
     Err(anyhow!("not a composite spec reference: {}", action))
 }
 
+#[allow(dead_code)]
 fn looks_like_oci_image(s: &str) -> bool {
     s.contains("@sha256:") || s.contains(':')
 }
@@ -697,6 +696,7 @@ fn deep_merge(a: &mut Value, b: Value) {
 // ============================================================================
 
 // helper: create a single-step plan from an image ref
+#[allow(dead_code)]
 fn single_step_plan_from_image(image: &str, secrets: &[(String,String)]) -> ActionPlan {
     let mut env: HashMap<String,String> = HashMap::new();
     for (k,v) in secrets { env.insert(k.clone(), v.clone()); }
@@ -729,6 +729,7 @@ fn single_step_plan_from_image(image: &str, secrets: &[(String,String)]) -> Acti
 // PREFETCHING
 // ============================================================================
 
+#[allow(dead_code)]
 async fn prefetch_all(client: &HubClient, plan: &ActionPlan, cache_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(cache_dir)?;
     for s in &plan.steps {
@@ -741,12 +742,78 @@ async fn prefetch_all(client: &HubClient, plan: &ActionPlan, cache_dir: &Path) -
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn docker_pull(image: &str) -> Result<()> {
     if which("docker").is_err() {
         bail!("docker not found on PATH (required for docker steps)");
     }
     let _ = Command::new("docker").arg("pull").arg(image).status().await?;
     Ok(())
+}
+
+// ============================================================================
+// ACTION METADATA CONVERSION
+// ============================================================================
+
+/// Convert ActionMetadata from the API to a CompositeSpec for local execution
+fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<CompositeSpec> {
+    let steps = metadata.steps.as_ref()
+        .ok_or_else(|| anyhow!("Action metadata missing steps"))?;
+    
+    let mut comp_steps = Vec::new();
+    for step in steps {
+        comp_steps.push(CompStep {
+            id: step.id.clone(),
+            kind: step.kind.clone().unwrap_or_else(|| "docker".to_string()),
+            uses: step.uses.clone(),
+            with: step.with.as_ref()
+                .map(|w| w.iter().map(|(k, v)| (k.clone(), v.to_string())).collect())
+                .unwrap_or_default(),
+        });
+    }
+
+    let inputs = metadata.inputs.as_ref()
+        .map(|inputs| inputs.iter().map(|input| CompositeInput {
+            name: input.name.clone(),
+            r#type: input.input_type.clone(),
+            description: input.description.clone().unwrap_or_default(),
+        }).collect())
+        .unwrap_or_default();
+
+    let outputs = metadata.outputs.as_ref()
+        .map(|outputs| outputs.iter().map(|output| CompositeOutput {
+            name: output.name.clone(),
+            r#type: output.output_type.clone(),
+            description: output.description.clone().unwrap_or_default(),
+        }).collect())
+        .unwrap_or_default();
+
+    let wires = metadata.wires.as_ref()
+        .map(|wires| wires.iter().map(|wire| Wire {
+            from: WireFrom {
+                source: wire.from.source.clone(),
+                step: wire.from.step.clone(),
+                output: wire.from.output.clone(),
+                key: wire.from.key.clone(),
+                value: wire.from.value.clone(),
+            },
+            to: WireTo {
+                step: wire.to.step.clone(),
+                input: wire.to.input.clone(),
+            },
+        }).collect())
+        .unwrap_or_default();
+
+    Ok(CompositeSpec {
+        name: metadata.name.clone().unwrap_or_else(|| format!("{}/{}", metadata.namespace, metadata.slug)),
+        version: metadata.version.clone(),
+        description: metadata.description.clone().unwrap_or_default(),
+        inputs,
+        outputs,
+        steps: comp_steps,
+        wires,
+        export: metadata.export.clone().unwrap_or_default(),
+    })
 }
 
 #[cfg(test)]
@@ -843,9 +910,9 @@ mod tests {
         let abs_path = absolutize("/tmp", None).unwrap();
         assert!(abs_path.starts_with('/'));
         
-        // Test relative path with base (use a path that actually exists)
-        let rel_path = absolutize("local.rs", Some("src/runners")).unwrap();
-        assert!(rel_path.contains("local.rs"));
+        // Test relative path with base (use a known absolute path)
+        let rel_path = absolutize("tmp", Some("/")).unwrap();
+        assert!(rel_path.contains("tmp"));
     }
 
     // ============================================================================

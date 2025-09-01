@@ -10,6 +10,7 @@ pub struct ActionPlan {
     #[allow(dead_code)]
     pub version: String,
     #[serde(default)]
+    #[allow(dead_code)]
     pub workdir: Option<String>,
     pub steps: Vec<StepSpec>,
 }
@@ -17,6 +18,7 @@ pub struct ActionPlan {
 #[derive(Debug, Deserialize, Clone)]
 pub struct StepSpec {
     pub id: String,
+    #[allow(dead_code)]
     pub kind: String,       // "docker" | "wasm"
     #[serde(rename="ref")]
     pub ref_: String,
