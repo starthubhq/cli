@@ -32,9 +32,9 @@ mod runners;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-enum RunnerKind {
-    #[default] // <- this one is the default
+enum RunnerKind {    
     Github,
+    #[default] // <- this one is the default
     Local, // placeholder for future
 }
 
@@ -1009,12 +1009,6 @@ async fn cmd_run(action: String, runner: RunnerKind) -> Result<()> {
         }
     });
 
-    // Open browser shortly after boot
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let _ = webbrowser::open("http://localhost:8888");
-    });
-
     // Run the server in the background
     let server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service()).await.unwrap();
@@ -1055,6 +1049,23 @@ async fn cmd_run(action: String, runner: RunnerKind) -> Result<()> {
     }
 
     println!("✓ Dispatch complete for {}", r.name());
+
+    // let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // let server = tokio::spawn(async move {
+    //     axum::serve(listener, app.into_make_service())
+    //         .with_graceful_shutdown(async {
+    //             let _ = shutdown_rx.await; // wait for signal
+    //         })
+    //         .await
+    //         .unwrap();
+    // });
+
+    // After dispatch completes, stop the server:
+    // let _ = shutdown_tx.send(());
+
+    // If you want to wait for clean shutdown:
+    // let _ = server.await;
 
     // Optionally: stop the server by exiting the process here,
     // or keep it running by awaiting it (will block):
