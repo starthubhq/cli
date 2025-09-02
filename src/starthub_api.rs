@@ -28,7 +28,7 @@ pub struct ActionMetadata {
     pub version_created_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ActionInput {
     pub id: String,
     pub name: String,
@@ -39,7 +39,7 @@ pub struct ActionInput {
     pub action_port_direction: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ActionOutput {
     pub id: String,
     pub name: String,
@@ -50,21 +50,22 @@ pub struct ActionOutput {
     pub action_port_direction: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ActionStep {
     pub id: String,
     pub kind: Option<String>,
     pub uses: String,
-    pub with: Option<std::collections::HashMap<String, serde_json::Value>>,
+    #[serde(default)]
+    pub with: std::collections::HashMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ActionWire {
     pub from: ActionWireFrom,
     pub to: ActionWireTo,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ActionWireFrom {
     pub source: Option<String>,
     pub step: Option<String>,
@@ -73,10 +74,39 @@ pub struct ActionWireFrom {
     pub value: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ActionWireTo {
     pub step: String,
     pub input: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ActionManifest {
+    pub name: String,
+    pub version: String,
+    #[serde(default)] 
+    pub description: String,
+    pub inputs: Vec<ManifestInput>,
+    pub outputs: Vec<ManifestOutput>,
+    pub steps: Vec<ActionStep>,
+    #[serde(default)] 
+    pub wires: Vec<ActionWire>,
+    #[serde(default)] 
+    pub export: serde_json::Value, // optional; often { "project_id": { "from": {...} } }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ManifestInput {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub input_type: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ManifestOutput {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub output_type: String,
 }
 
 impl Client {
@@ -126,6 +156,17 @@ impl Client {
         let p = std::path::Path::new(ref_str);
         if p.exists() { return Ok(p.canonicalize()?); }
         anyhow::bail!("unsupported wasm ref (add OCI support): {}", ref_str);
+    }
+
+    /// Download and parse the starthub.json file from S3 storage
+    pub async fn download_starthub_json(&self, storage_url: &str) -> Result<ActionManifest> {
+        let res = self.http.get(storage_url)
+            .send()
+            .await?
+            .error_for_status()?;
+        
+        let manifest: ActionManifest = res.json().await.context("decoding starthub.json")?;
+        Ok(manifest)
     }
 }
 

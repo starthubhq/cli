@@ -49,39 +49,39 @@ struct ActionOutput {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct ActionStep {
-    id: String,
+pub struct ActionStep {
+    pub id: String,
     #[serde(default)] 
-    kind: String,            // "docker" (default) or "wasm"
-    uses: String,
+    pub kind: String,            // "docker" (default) or "wasm"
+    pub uses: String,
     #[serde(default)]
-    with: HashMap<String, String>
+    pub with: HashMap<String, String>
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct WireFrom {
+pub struct WireFrom {
     #[serde(default)] 
-    source: Option<String>, // "inputs"
+    pub source: Option<String>, // "inputs"
     #[serde(default)] 
-    step: Option<String>,
+    pub step: Option<String>,
     #[serde(default)] 
-    output: Option<String>,
+    pub output: Option<String>,
     #[serde(default)] 
-    key: Option<String>,
+    pub key: Option<String>,
     #[serde(default)] 
-    value: Option<Value>,   // literal
+    pub value: Option<Value>,   // literal
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct WireTo { 
-    step: String, 
-    input: String 
+pub struct WireTo { 
+    pub step: String, 
+    pub input: String 
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct Wire { 
-    from: WireFrom, 
-    to: WireTo 
+pub struct Wire { 
+    pub from: WireFrom, 
+    pub to: WireTo 
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -120,15 +120,15 @@ impl Runner for LocalRunner {
 
     async fn dispatch(&self, ctx: &DeployCtx) -> Result<()> {
         // 0) Local composite? run it and return.
-        if looks_like_local_composite(&ctx.action) {
-            let comp = try_load_composite_spec(&ctx.action)?;
-            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
-            let token = std::env::var("STARTHUB_TOKEN").ok();
-            let client = HubClient::new(base, token);
-            execute(&client, &comp, ctx).await?;
-            println!("✓ Local execution complete");
-            return Ok(());
-        }
+        // if looks_like_local_composite(&ctx.action) {
+        //     let comp = try_load_composite_spec(&ctx.action)?;
+        //     let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
+        //     let token = std::env::var("STARTHUB_TOKEN").ok();
+        //     let client = HubClient::new(base, token);
+        //     execute(&client, &comp, ctx).await?;
+        //     println!("✓ Local execution complete");
+        //     return Ok(());
+        // }
 
         // 1) Try to fetch action details from the actions edge function
         let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
@@ -158,9 +158,49 @@ impl Runner for LocalRunner {
                     }
                 }
                 
-                println!("\nNote: This action cannot be executed locally as it requires the full implementation.");
-                println!("Use --runner github to deploy and run this action remotely.");
-                return Ok(());
+                // Try to download the starthub.json file and recursively fetch all action manifests
+                println!("\nAttempting to download composite action definition...");
+                let mut visited = HashSet::new();
+                match fetch_all_action_manifests(&client, &ctx.action, &mut visited).await {
+                    Ok(manifests) => {
+                        if manifests.is_empty() {
+                            println!("No composite action definition found.");
+                            println!("Note: This action cannot be executed locally as it requires the full implementation.");
+                            println!("Use --runner github to deploy and run this action remotely.");
+                            return Ok(());
+                        }
+                        
+                        println!("✓ Successfully downloaded {} action manifest(s)", manifests.len());
+                        
+                        // Get the main manifest (first one)
+                        let main_manifest = &manifests[0];
+                        println!("Main action: {} (version: {})", main_manifest.name, main_manifest.version);
+                        println!("Steps: {}", main_manifest.steps.len());
+                        
+                        // Convert to local types for topo_order
+                        let local_steps: Vec<ActionStep> = main_manifest.steps.iter()
+                            .map(convert_action_step)
+                            .collect();
+                        let local_wires: Vec<Wire> = main_manifest.wires.iter()
+                            .map(convert_action_wire)
+                            .collect();
+                        
+                        // Use topo_order to determine execution order
+                        let order = topo_order(&local_steps, &local_wires)?;
+                        println!("Execution order: {:?}", order);
+                        
+                        // For now, just show the plan. In the future, this could execute the composite action
+                        println!("\nNote: Composite action execution is not yet implemented locally.");
+                        println!("Use --runner github to deploy and run this action remotely.");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        println!("Failed to download composite action definition: {}", e);
+                        println!("Note: This action cannot be executed locally as it requires the full implementation.");
+                        println!("Use --runner github to deploy and run this action remotely.");
+                        return Ok(());
+                    }
+                }
             }
             Err(e_metadata) => {
                 tracing::debug!("Failed to fetch action metadata ({}), trying action plan", e_metadata);
@@ -173,6 +213,7 @@ impl Runner for LocalRunner {
 // ============================================================================
 // EXECUTION
 // ============================================================================
+#[allow(dead_code)]
 async fn execute(client: &HubClient, comp: &ActionManifest, _ctx: &DeployCtx) -> Result<()> {
     // 0) Build fast lookup tables
     let step_map: HashMap<_,_> = comp.steps.iter().map(|s| (s.id.clone(), s)).collect();
@@ -551,7 +592,7 @@ fn absolutize(p: &str, base: Option<&str>) -> Result<String> {
 // GRAPH ALGORITHMS
 // ============================================================================
 
-fn topo_order(steps: &[ActionStep], wires: &[Wire]) -> Result<Vec<String>> {
+pub fn topo_order(steps: &[ActionStep], wires: &[Wire]) -> Result<Vec<String>> {
     let ids: HashSet<_> = steps.iter().map(|s| s.id.clone()).collect();
     let mut indeg: HashMap<String, usize> = steps.iter().map(|s| (s.id.clone(), 0)).collect();
     let mut adj: HashMap<String, Vec<String>> = steps.iter().map(|s| (s.id.clone(), vec![])).collect();
@@ -796,6 +837,79 @@ fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<Act
         wires: vec![], // No wires defined in current API
         export: serde_json::json!({}), // No export defined in current API
     })
+}
+
+// ============================================================================
+// RECURSIVE ACTION FETCHING
+// ============================================================================
+
+/// Convert starthub_api::ActionStep to local::ActionStep
+fn convert_action_step(step: &crate::starthub_api::ActionStep) -> ActionStep {
+    ActionStep {
+        id: step.id.clone(),
+        kind: step.kind.as_deref().unwrap_or("docker").to_string(),
+        uses: step.uses.clone(),
+        with: step.with.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
+    }
+}
+
+/// Convert starthub_api::ActionWire to local::Wire
+fn convert_action_wire(wire: &crate::starthub_api::ActionWire) -> Wire {
+    Wire {
+        from: WireFrom {
+            source: wire.from.source.clone(),
+            step: wire.from.step.clone(),
+            output: wire.from.output.clone(),
+            key: wire.from.key.clone(),
+            value: wire.from.value.clone(),
+        },
+        to: WireTo {
+            step: wire.to.step.clone(),
+            input: wire.to.input.clone(),
+        },
+    }
+}
+
+/// Recursively fetch all action manifests for a composite action
+async fn fetch_all_action_manifests(
+    client: &HubClient, 
+    action_ref: &str,
+    visited: &mut HashSet<String>
+) -> Result<Vec<crate::starthub_api::ActionManifest>> {
+    if visited.contains(action_ref) {
+        return Ok(vec![]); // Already fetched this action
+    }
+    visited.insert(action_ref.to_string());
+    
+    // First, try to get the action metadata to find the storage URL
+    let metadata = match client.fetch_action_metadata(action_ref).await {
+        Ok(m) => m,
+        Err(_) => {
+            // If we can't get metadata, this might not be a composite action
+            return Ok(vec![]);
+        }
+    };
+    
+    // Construct the storage URL for the starthub.json file
+    let storage_url = format!(
+        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
+        action_ref.split('@').next().unwrap_or(""),
+        metadata.commit_sha
+    );
+    
+    // Download and parse the starthub.json file
+    let manifest = client.download_starthub_json(&storage_url).await?;
+    
+    let mut all_manifests = vec![manifest.clone()];
+    
+    // Recursively fetch manifests for all steps
+    for step in &manifest.steps {
+        if let Ok(step_manifests) = Box::pin(fetch_all_action_manifests(client, &step.uses, visited)).await {
+            all_manifests.extend(step_manifests);
+        }
+    }
+    
+    Ok(all_manifests)
 }
 
 #[cfg(test)]

@@ -25,9 +25,98 @@ use tower_http::services::ServeDir;
 use tower_http::cors::CorsLayer;
 use serde_json::{Value, json};
 use futures_util::{StreamExt, SinkExt};
+use tokio::sync::broadcast;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+// Shared state for WebSocket connections
+#[derive(Clone)]
+struct AppState {
+    ws_sender: broadcast::Sender<String>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        let (ws_sender, _) = broadcast::channel(100);
+        Self { ws_sender }
+    }
+}
+
+// ============================================================================
+// HELPER FUNCTIONS FOR ACTION RESOLUTION
+// ============================================================================
+
+/// Convert starthub_api::ActionStep to local::ActionStep
+fn convert_action_step(step: &crate::starthub_api::ActionStep) -> crate::runners::local::ActionStep {
+    crate::runners::local::ActionStep {
+        id: step.id.clone(),
+        kind: step.kind.as_deref().unwrap_or("docker").to_string(),
+        uses: step.uses.clone(),
+        with: step.with.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
+    }
+}
+
+/// Convert starthub_api::ActionWire to local::Wire
+fn convert_action_wire(wire: &crate::starthub_api::ActionWire) -> crate::runners::local::Wire {
+    crate::runners::local::Wire {
+        from: crate::runners::local::WireFrom {
+            source: wire.from.source.clone(),
+            step: wire.from.step.clone(),
+            output: wire.from.output.clone(),
+            key: wire.from.key.clone(),
+            value: wire.from.value.clone(),
+        },
+        to: crate::runners::local::WireTo {
+            step: wire.to.step.clone(),
+            input: wire.to.input.clone(),
+        },
+    }
+}
+
+/// Recursively fetch all action manifests for a composite action
+async fn fetch_all_action_manifests(
+    client: &crate::starthub_api::Client, 
+    action_ref: &str,
+    visited: &mut std::collections::HashSet<String>
+) -> Result<Vec<crate::starthub_api::ActionManifest>> {
+    if visited.contains(action_ref) {
+        return Ok(vec![]); // Already fetched this action
+    }
+    visited.insert(action_ref.to_string());
+    
+    // First, try to get the action metadata to find the storage URL
+    let metadata = match client.fetch_action_metadata(action_ref).await {
+        Ok(m) => m,
+        Err(_) => {
+            // If we can't get metadata, this might not be a composite action
+            return Ok(vec![]);
+        }
+    };
+    
+    // Construct the storage URL for the starthub.json file
+    let storage_url = format!(
+        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
+        action_ref.split('@').next().unwrap_or(""),
+        metadata.commit_sha
+    );
+    
+    println!("🔗 Constructed storage URL: {}", storage_url);
+    
+    // Download and parse the starthub.json file
+    let manifest = client.download_starthub_json(&storage_url).await?;
+    
+    let mut all_manifests = vec![manifest.clone()];
+    
+    // Recursively fetch manifests for all steps
+    for step in &manifest.steps {
+        if let Ok(step_manifests) = Box::pin(fetch_all_action_manifests(client, &step.uses, visited)).await {
+            all_manifests.extend(step_manifests);
+        }
+    }
+    
+    Ok(all_manifests)
+}
 
 // safe write with overwrite prompt
 pub fn write_file_guarded(path: &Path, contents: &str) -> anyhow::Result<()> {
@@ -591,17 +680,21 @@ fn parse_action_arg(action: &str) -> (String, String, String) {
 }
 
 async fn start_server() -> Result<()> {
+    // Create shared state
+    let state = AppState::new();
+    
     // Create router with UI routes and API endpoints
     let app = Router::new()
-        .route("/", get(serve_index))
         .route("/api/status", get(get_status))
         .route("/api/action", post(handle_action))
         .route("/api/run", post(handle_run))
         .route("/ws", get(ws_handler)) // WebSocket endpoint
         .nest_service("/assets", ServeDir::new("ui/dist/assets"))
         .nest_service("/favicon.ico", ServeDir::new("ui/dist"))
+        .route("/", get(serve_index))
         .fallback(serve_spa) // SPA fallback for Vue Router
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+        .with_state(state);
 
     // Start server
     let listener = TcpListener::bind(LOCAL_SERVER_HOST).await?;
@@ -643,7 +736,10 @@ async fn handle_action(Json(payload): Json<Value>) -> Json<Value> {
     }))
 }
 
-async fn handle_run(Json(payload): Json<Value>) -> Json<Value> {
+async fn handle_run(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(payload): Json<Value>
+) -> Json<Value> {
     // Handle the /api/run endpoint that InputsComponent expects
     println!("🚀 Received run request: {:?}", payload);
     
@@ -655,25 +751,150 @@ async fn handle_run(Json(payload): Json<Value>) -> Json<Value> {
     println!("📋 Action: {}", action);
     println!("📥 Inputs: {:?}", inputs);
     
-    // TODO: Actually execute the action here
-    // For now, just return success
-    let response = json!({
-        "success": true,
-        "message": "Action dispatched successfully",
-        "action": action,
-        "inputs": inputs,
-        "execution_id": format!("exec_{}", chrono::Utc::now().timestamp())
-    });
+    // Try to fetch action metadata and download starthub.json
+    let base = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
+    let client = crate::starthub_api::Client::new(base, Some(crate::config::STARTHUB_API_KEY.to_string()));
     
-    Json(response)
+    match client.fetch_action_metadata(&action).await {
+        Ok(metadata) => {
+            println!("✓ Fetched action metadata for {}", action);
+            
+            // Try to download the starthub.json file and recursively fetch all action manifests
+            println!("📥 Attempting to download composite action definition...");
+            let mut visited = std::collections::HashSet::new();
+            
+            match fetch_all_action_manifests(&client, &action, &mut visited).await {
+                Ok(manifests) => {
+                    if manifests.is_empty() {
+                        println!("❌ No composite action definition found");
+                        return Json(json!({
+                            "success": false,
+                            "message": "No composite action definition found",
+                            "action": action,
+                            "error": "This action cannot be executed locally as it requires the full implementation"
+                        }));
+                    }
+                    
+                    println!("✅ Successfully downloaded {} action manifest(s)", manifests.len());
+                    
+                    // Get the main manifest (first one)
+                    let main_manifest = &manifests[0];
+                    println!("📋 Main action: {} (version: {})", main_manifest.name, main_manifest.version);
+                    println!("🔗 Steps: {}", main_manifest.steps.len());
+                    
+                    // Convert to local types for topo_order
+                    let local_steps: Vec<crate::runners::local::ActionStep> = main_manifest.steps.iter()
+                        .map(convert_action_step)
+                        .collect();
+                    let local_wires: Vec<crate::runners::local::Wire> = main_manifest.wires.iter()
+                        .map(convert_action_wire)
+                        .collect();
+                    
+                    // Use topo_order to determine execution order
+                    match crate::runners::local::topo_order(&local_steps, &local_wires) {
+                            Ok(order) => {
+                                println!("📊 Execution order: {:?}", order);
+                                
+                                // Send execution plan to WebSocket clients
+                                let ws_message = json!({
+                                    "type": "execution_plan",
+                                    "action": action,
+                                    "manifest": {
+                                        "name": main_manifest.name,
+                                        "version": main_manifest.version,
+                                        "steps": main_manifest.steps.len(),
+                                        "execution_order": order
+                                    },
+                                    "steps": main_manifest.steps.iter().map(|step| {
+                                        json!({
+                                            "id": step.id,
+                                            "uses": step.uses,
+                                            "kind": step.kind.as_deref().unwrap_or("docker")
+                                        })
+                                    }).collect::<Vec<_>>(),
+                                    "wires": main_manifest.wires.iter().map(|wire| {
+                                        json!({
+                                            "from": {
+                                                "step": wire.from.step,
+                                                "output": wire.from.output,
+                                                "source": wire.from.source,
+                                                "key": wire.from.key
+                                            },
+                                            "to": {
+                                                "step": wire.to.step,
+                                                "input": wire.to.input
+                                            }
+                                        })
+                                    }).collect::<Vec<_>>()
+                                });
+                                
+                                // Broadcast to all WebSocket clients
+                                if let Ok(msg_str) = serde_json::to_string(&ws_message) {
+                                    let _ = state.ws_sender.send(msg_str);
+                                    println!("📡 Sent WebSocket message to all clients");
+                                }
+                                
+                                let response = json!({
+                                    "success": true,
+                                    "message": "Composite action resolved successfully",
+                                    "action": action,
+                                    "inputs": inputs,
+                                    "execution_id": format!("exec_{}", chrono::Utc::now().timestamp()),
+                                    "manifest": {
+                                        "name": main_manifest.name,
+                                        "version": main_manifest.version,
+                                        "steps": main_manifest.steps.len(),
+                                        "execution_order": order
+                                    }
+                                });
+                                
+                                Json(response)
+                            }
+                        Err(e) => {
+                            println!("❌ Failed to determine execution order: {}", e);
+                            Json(json!({
+                                "success": false,
+                                "message": "Failed to determine execution order",
+                                "action": action,
+                                "error": e.to_string()
+                            }))
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Failed to download composite action definition: {}", e);
+                    Json(json!({
+                        "success": false,
+                        "message": "Failed to download composite action definition",
+                        "action": action,
+                        "error": e.to_string()
+                    }))
+                }
+            }
+        }
+        Err(e) => {
+            println!("❌ Failed to fetch action metadata: {}", e);
+            Json(json!({
+                "success": false,
+                "message": "Failed to fetch action metadata",
+                "error": e.to_string()
+            }))
+        }
+    }
 }
 
-async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(handle_ws)
+async fn ws_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    ws: WebSocketUpgrade
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_ws(socket, state))
 }
 
-async fn handle_ws(ws: WebSocket) {
+async fn handle_ws(ws: WebSocket, state: AppState) {
     let (mut sender, mut receiver) = ws.split();
+
+    // Subscribe to the broadcast channel to receive execution plan messages
+    let mut ws_receiver = state.ws_sender.subscribe();
 
     // Send a welcome message
     let welcome_msg = json!({
@@ -686,7 +907,19 @@ async fn handle_ws(ws: WebSocket) {
         let _ = sender.send(axum::extract::ws::Message::Text(msg)).await;
     }
 
-    // Handle incoming messages and echo them back
+    // Spawn a task to forward broadcast messages to this WebSocket client
+    let sender_arc = std::sync::Arc::new(tokio::sync::Mutex::new(sender));
+    let sender_clone = sender_arc.clone();
+    let forward_task = tokio::spawn(async move {
+        while let Ok(msg) = ws_receiver.recv().await {
+            let mut sender_guard = sender_clone.lock().await;
+            if let Err(_) = sender_guard.send(axum::extract::ws::Message::Text(msg)).await {
+                break; // WebSocket closed
+            }
+        }
+    });
+
+    // Handle incoming messages from the client
     while let Some(msg) = receiver.next().await {
         if let Ok(msg) = msg {
             match msg {
@@ -699,7 +932,8 @@ async fn handle_ws(ws: WebSocket) {
                     });
                     
                     if let Ok(msg_str) = serde_json::to_string(&echo_msg) {
-                        let _ = sender.send(axum::extract::ws::Message::Text(msg_str)).await;
+                        let mut sender_guard = sender_arc.lock().await;
+                        let _ = sender_guard.send(axum::extract::ws::Message::Text(msg_str)).await;
                     }
                 }
                 axum::extract::ws::Message::Close(_) => {
@@ -709,6 +943,9 @@ async fn handle_ws(ws: WebSocket) {
             }
         }
     }
+
+    // Cancel the forward task when the WebSocket closes
+    forward_task.abort();
 }
 
 pub async fn cmd_status(id: Option<String>) -> Result<()> {
