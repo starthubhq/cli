@@ -25,7 +25,7 @@ const ST_MARKER: &str = "::starthub:state::";
 // ============================================================================
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompositeInput { 
+struct ActionInput { 
     #[allow(dead_code)]
     name: String, 
     #[serde(default)] 
@@ -37,7 +37,7 @@ struct CompositeInput {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompositeOutput { 
+struct ActionOutput { 
     #[allow(dead_code)]
     name: String, 
     #[serde(default)] 
@@ -49,7 +49,7 @@ struct CompositeOutput {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompStep {
+struct ActionStep {
     id: String,
     #[serde(default)] 
     kind: String,            // "docker" (default) or "wasm"
@@ -85,7 +85,7 @@ struct Wire {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompositeSpec {
+struct ActionManifest {
     #[allow(dead_code)]
     name: String,
     #[allow(dead_code)]
@@ -93,10 +93,10 @@ struct CompositeSpec {
     #[serde(default)] 
     #[allow(dead_code)]
     description: String,
-    inputs: Vec<CompositeInput>,
+    inputs: Vec<ActionInput>,
     #[allow(dead_code)]
-    outputs: Vec<CompositeOutput>,
-    steps: Vec<CompStep>,
+    outputs: Vec<ActionOutput>,
+    steps: Vec<ActionStep>,
     #[serde(default)] 
     wires: Vec<Wire>,
     #[serde(default)] 
@@ -125,7 +125,7 @@ impl Runner for LocalRunner {
             let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
             let token = std::env::var("STARTHUB_TOKEN").ok();
             let client = HubClient::new(base, token);
-            run_composite(&client, &comp, ctx).await?;
+            execute(&client, &comp, ctx).await?;
             println!("✓ Local execution complete");
             return Ok(());
         }
@@ -171,10 +171,9 @@ impl Runner for LocalRunner {
 }
 
 // ============================================================================
-// COMPOSITE EXECUTION
+// EXECUTION
 // ============================================================================
-
-async fn run_composite(client: &HubClient, comp: &CompositeSpec, _ctx: &DeployCtx) -> Result<()> {
+async fn execute(client: &HubClient, comp: &ActionManifest, _ctx: &DeployCtx) -> Result<()> {
     // 0) Build fast lookup tables
     let step_map: HashMap<_,_> = comp.steps.iter().map(|s| (s.id.clone(), s)).collect();
 
@@ -516,16 +515,16 @@ fn looks_like_local_composite(s: &str) -> bool {
     t.starts_with('{') || t.ends_with(".json") || t.starts_with("file://") || Path::new(t).exists()
 }
 
-fn try_load_composite_spec(action: &str) -> Result<CompositeSpec> {
+fn try_load_composite_spec(action: &str) -> Result<ActionManifest> {
     let mut s = action.trim();
     if let Some(rest) = s.strip_prefix("file://") { s = rest; }
 
     if s.starts_with('{') {
-        return Ok(serde_json::from_str::<CompositeSpec>(s).context("parsing inline composite json")?);
+        return Ok(serde_json::from_str::<ActionManifest>(s).context("parsing inline composite json")?);
     }
     if s.ends_with(".json") || Path::new(s).exists() {
         let txt = fs::read_to_string(s).with_context(|| format!("reading composite file '{}'", s))?;
-        return Ok(serde_json::from_str::<CompositeSpec>(&txt).context("parsing composite json")?);
+        return Ok(serde_json::from_str::<ActionManifest>(&txt).context("parsing composite json")?);
     }
     Err(anyhow!("not a composite spec reference: {}", action))
 }
@@ -552,7 +551,7 @@ fn absolutize(p: &str, base: Option<&str>) -> Result<String> {
 // GRAPH ALGORITHMS
 // ============================================================================
 
-fn topo_order(steps: &[CompStep], wires: &[Wire]) -> Result<Vec<String>> {
+fn topo_order(steps: &[ActionStep], wires: &[Wire]) -> Result<Vec<String>> {
     let ids: HashSet<_> = steps.iter().map(|s| s.id.clone()).collect();
     let mut indeg: HashMap<String, usize> = steps.iter().map(|s| (s.id.clone(), 0)).collect();
     let mut adj: HashMap<String, Vec<String>> = steps.iter().map(|s| (s.id.clone(), vec![])).collect();
@@ -761,10 +760,10 @@ async fn docker_pull(image: &str) -> Result<()> {
 // ============================================================================
 
 /// Convert ActionMetadata from the API to a CompositeSpec for local execution
-fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<CompositeSpec> {
+fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<ActionManifest> {
     // Since the current API doesn't provide steps/wires/export, create a simple single-step composite
     // that can be executed locally
-    let comp_steps = vec![CompStep {
+    let comp_steps = vec![ActionStep {
         id: "run".to_string(),
         kind: "docker".to_string(),
         uses: "alpine:latest".to_string(), // Default to alpine for now
@@ -772,7 +771,7 @@ fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<Com
     }];
 
     let inputs = metadata.inputs.as_ref()
-        .map(|inputs| inputs.iter().map(|input| CompositeInput {
+        .map(|inputs| inputs.iter().map(|input| ActionInput {
             name: input.name.clone(),
             r#type: input.action_port_type.clone(),
             description: format!("Input: {}", input.action_port_direction),
@@ -780,14 +779,14 @@ fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<Com
         .unwrap_or_default();
 
     let outputs = metadata.outputs.as_ref()
-        .map(|outputs| outputs.iter().map(|output| CompositeOutput {
+        .map(|outputs| outputs.iter().map(|output| ActionOutput {
             name: output.name.clone(),
             r#type: output.action_port_type.clone(),
             description: format!("Output: {}", output.action_port_direction),
         }).collect())
         .unwrap_or_default();
 
-    Ok(CompositeSpec {
+    Ok(ActionManifest {
         name: metadata.name.clone(),
         version: metadata.version_number.clone(),
         description: metadata.description.clone(),
@@ -811,27 +810,27 @@ mod tests {
     // TEST HELPERS
     // ============================================================================
 
-    fn create_test_composite_spec() -> CompositeSpec {
-        CompositeSpec {
+    fn create_test_composite_spec() -> ActionManifest {
+        ActionManifest {
             name: "test-composite".to_string(),
             version: "1.0.0".to_string(),
             description: "Test composite for unit testing".to_string(),
             inputs: vec![
-                CompositeInput {
+                ActionInput {
                     name: "test_input".to_string(),
                     r#type: "string".to_string(),
                     description: "Test input".to_string(),
                 }
             ],
             outputs: vec![
-                CompositeOutput {
+                ActionOutput {
                     name: "test_output".to_string(),
                     r#type: "string".to_string(),
                     description: "Test output".to_string(),
                 }
             ],
             steps: vec![
-                CompStep {
+                ActionStep {
                     id: "step1".to_string(),
                     kind: "docker".to_string(),
                     uses: "alpine:latest".to_string(),
@@ -903,13 +902,13 @@ mod tests {
     #[test]
     fn test_topo_order_simple() {
         let steps = vec![
-            CompStep {
+            ActionStep {
                 id: "step1".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
                 with: HashMap::new(),
             },
-            CompStep {
+            ActionStep {
                 id: "step2".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
@@ -940,13 +939,13 @@ mod tests {
     #[test]
     fn test_topo_order_cycle_detection() {
         let steps = vec![
-            CompStep {
+            ActionStep {
                 id: "step1".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
                 with: HashMap::new(),
             },
-            CompStep {
+            ActionStep {
                 id: "step2".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
