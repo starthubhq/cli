@@ -7,11 +7,9 @@ use anyhow::Result;
 #[derive(Clone, Debug)]
 pub struct DeployCtx {
     pub action: String,
-    pub env: Option<String>,
     // filled by prepare()
     pub owner: Option<String>,
     pub repo: Option<String>,
-    pub secrets: Vec<(String, String)>,
 }
 
 
@@ -21,7 +19,6 @@ pub trait Runner {
     async fn ensure_auth(&self) -> Result<()>;
     async fn prepare(&self, ctx: &mut DeployCtx) -> Result<()>;
     async fn put_files(&self, ctx: &DeployCtx) -> Result<()>;
-    async fn set_secrets(&self, ctx: &DeployCtx) -> Result<()>;
     async fn dispatch(&self, ctx: &DeployCtx) -> Result<()>;
 }
 

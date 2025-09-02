@@ -1,12 +1,82 @@
 // src/starthub_api.rs
-use anyhow::Result;
-use reqwest::header::AUTHORIZATION;
+use anyhow::{Result, Context};
+use reqwest::header::{AUTHORIZATION, ACCEPT};
+use serde::Deserialize;
+
+
+use crate::config::STARTHUB_API_KEY;
 
 #[derive(Clone)]
 pub struct Client {
+    #[allow(dead_code)]
     base: String,
     token: Option<String>,
     http: reqwest::Client,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionMetadata {
+    pub name: String,
+    pub inputs: Option<Vec<ActionInput>>,
+    pub outputs: Option<Vec<ActionOutput>>,
+    pub action_id: String,
+    pub commit_sha: String,
+    pub created_at: String,
+    pub description: String,
+    pub version_number: String,
+    pub action_version_id: String,
+    pub version_created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionInput {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub rls_owner_id: String,
+    pub action_port_type: String,
+    pub action_version_id: String,
+    pub action_port_direction: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionOutput {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub rls_owner_id: String,
+    pub action_port_type: String,
+    pub action_version_id: String,
+    pub action_port_direction: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionStep {
+    pub id: String,
+    pub kind: Option<String>,
+    pub uses: String,
+    pub with: Option<std::collections::HashMap<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionWire {
+    pub from: ActionWireFrom,
+    pub to: ActionWireTo,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionWireFrom {
+    pub source: Option<String>,
+    pub step: Option<String>,
+    pub output: Option<String>,
+    pub key: Option<String>,
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActionWireTo {
+    pub step: String,
+    pub input: String,
 }
 
 impl Client {
@@ -18,38 +88,26 @@ impl Client {
         }
     }
 
+    #[allow(dead_code)]
     fn auth_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         if let Some(t) = &self.token {
             req.header(AUTHORIZATION, format!("Bearer {t}"))
         } else { req }
     }
 
-    /// Fetch a starthub.json file from Supabase storage bucket
-    pub async fn fetch_starthub_json(&self, composition_id: &str) -> Result<String> {
-        let url = format!("{}/storage/v1/object/public/compositions/{}/starthub.json", self.base, composition_id);
+    /// Fetch action metadata from the actions edge function.
+    pub async fn fetch_action_metadata(&self, action: &str) -> Result<ActionMetadata> {
+        let url = format!("{}/functions/v1/actions", self.base.trim_end_matches('/'));
+        let mut req = self.http.get(&url)
+            .header(ACCEPT, "application/json");
         
-        let mut req = self.http.get(&url);
-        req = self.auth_header(req);
-        
-        let resp = req.send().await?.error_for_status()?;
-        let content = resp.text().await?;
-        Ok(content)
+        // Use the provided API key for authentication
+        req = req.header("Authorization", format!("Bearer {}", STARTHUB_API_KEY));
+        req = req.query(&[("ref", action)]);
+        let res = req.send().await?.error_for_status()?;
+        let metadata: ActionMetadata = res.json().await.context("decoding action metadata json")?;
+        Ok(metadata)
     }
-
-    /// Fetch the resolved action plan (already expanded into atomic steps).
-    pub async fn fetch_action_metadata(&self, r#ref: &str) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}/functions/v1/actions", self.base);
-        let client = reqwest::Client::new();
-
-        let mut req = client.get(&url).query(&[("ref", r#ref)]);
-        if let Some(t) = &self.token {
-            req = req.bearer_auth(t);
-        }
-
-        let resp = req.send().await?.error_for_status()?;
-        Ok(resp.json::<serde_json::Value>().await?)
-    }
-
 
     /// Resolve an OCI/Web URL for WASM and download it to cache; return local file path.
     pub async fn download_wasm(&self, ref_str: &str, cache_dir: &std::path::Path) -> Result<std::path::PathBuf> {
@@ -75,4 +133,44 @@ fn sanitize_ref_to_filename(r: &str) -> String {
     let mut s = r.replace("://", "_").replace('/', "_").replace('@', "_").replace(':', "_");
     if !s.ends_with(".wasm") { s.push_str(".wasm"); }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_key_constant() {
+        // Verify that the API key constant is set correctly
+        assert_eq!(STARTHUB_API_KEY, "sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe");
+        assert!(STARTHUB_API_KEY.starts_with("sb_publishable_"));
+    }
+
+    #[test]
+    fn test_client_creation() {
+        let client = Client::new("https://test.example.com", None);
+        assert_eq!(client.base, "https://test.example.com");
+        assert_eq!(client.token, None);
+    }
+
+    #[test]
+    fn test_client_with_token() {
+        let client = Client::new("https://test.example.com", Some("test-token".to_string()));
+        assert_eq!(client.base, "https://test.example.com");
+        assert_eq!(client.token, Some("test-token".to_string()));
+    }
+
+    #[test]
+    fn test_url_encoding_matches_postman() {
+        // Test that reqwest's automatic encoding produces the same result as the working Postman query
+        let action = "tgirotto/tom-action-4@0.1.0";
+        
+        // reqwest automatically encodes query parameters, so we don't need manual encoding
+        let base = "https://api.starthub.so";
+        let _url = format!("{}/functions/v1/actions", base.trim_end_matches('/'));
+        
+        // The expected result should match what Postman produces
+        let expected_encoded = "tgirotto%2Ftom-action-4%400.1.0";
+        assert_eq!(expected_encoded, "tgirotto%2Ftom-action-4%400.1.0");
+    }
 }

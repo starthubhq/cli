@@ -6,11 +6,12 @@ use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command};
 use tokio::sync::mpsc;
 use std::path::Path;
 use std::fs;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashSet, HashMap, VecDeque};
 use which::which;
 
 use super::{Runner, DeployCtx};
-use crate::starthub_api::Client as HubClient;
+use crate::starthub_api::{Client as HubClient, ActionMetadata};
+use crate::config::{STARTHUB_API_BASE, STARTHUB_API_KEY};
 use crate::runners::models::{ActionPlan, StepSpec, MountSpec};
 
 // ============================================================================
@@ -24,25 +25,31 @@ const ST_MARKER: &str = "::starthub:state::";
 // ============================================================================
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompositeInput { 
+struct ActionInput { 
+    #[allow(dead_code)]
     name: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     r#type: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     description: String 
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompositeOutput { 
+struct ActionOutput { 
+    #[allow(dead_code)]
     name: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     r#type: String, 
     #[serde(default)] 
+    #[allow(dead_code)]
     description: String 
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompStep {
+struct ActionStep {
     id: String,
     #[serde(default)] 
     kind: String,            // "docker" (default) or "wasm"
@@ -78,262 +85,22 @@ struct Wire {
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct CompositeSpec {
+struct ActionManifest {
+    #[allow(dead_code)]
     name: String,
+    #[allow(dead_code)]
     version: String,
     #[serde(default)] 
+    #[allow(dead_code)]
     description: String,
-    inputs: Vec<CompositeInput>,
-    outputs: Vec<CompositeOutput>,
-    steps: Vec<CompStep>,
-    #[serde(default)] wires: Vec<Wire>,
-    #[serde(default)] export: Value, // optional; often { "project_id": { "from": {...} } }
-}
-
-fn looks_like_local_composite(s: &str) -> bool {
-    let t = s.trim();
-    t.starts_with('{') || t.ends_with(".json") || t.starts_with("file://") || Path::new(t).exists()
-}
-
-fn looks_like_composition_id(s: &str) -> bool {
-    let t = s.trim();
-    // Composition IDs are typically UUIDs or short identifiers
-    // They don't contain special characters that would indicate other formats
-    !t.contains('{') && !t.contains('}') && !t.contains('/') && !t.contains(':') && 
-    !t.ends_with(".json") && !t.starts_with("file://") && !Path::new(t).exists() &&
-    !t.contains('@') && t.len() > 0
-}
-
-async fn try_load_composite_spec_from_id(client: &HubClient, composition_id: &str) -> Result<CompositeSpec> {
-    let json_content = client.fetch_starthub_json(composition_id).await
-        .with_context(|| format!("fetching starthub.json for composition '{}'", composition_id))?;
-    
-    serde_json::from_str::<CompositeSpec>(&json_content)
-        .with_context(|| format!("parsing starthub.json for composition '{}'", composition_id))
-}
-
-fn try_load_composite_spec(action: &str) -> Result<CompositeSpec> {
-    let mut s = action.trim();
-    if let Some(rest) = s.strip_prefix("file://") { s = rest; }
-
-    if s.starts_with('{') {
-        return Ok(serde_json::from_str::<CompositeSpec>(s).context("parsing inline composite json")?);
-    }
-    if s.ends_with(".json") || Path::new(s).exists() {
-        let txt = fs::read_to_string(s).with_context(|| format!("reading composite file '{}'", s))?;
-        return Ok(serde_json::from_str::<CompositeSpec>(&txt).context("parsing composite json")?);
-    }
-    Err(anyhow!("not a composite spec reference: {}", action))
-}
-
-async fn run_action_plan(client: &HubClient, plan: &ActionPlan, ctx: &DeployCtx) -> Result<()> {
-    // Prefetch
-    let cache_dir = dirs::cache_dir().unwrap_or(std::env::temp_dir()).join("starthub/oci");
-    prefetch_all(client, plan, &cache_dir).await?;
-
-    // Execute with accumulated state
-    let mut state = serde_json::json!({});
-
-    for s in &plan.steps {
-        let mut step = s.clone();
-        // merge CLI -e
-        for (k,v) in &ctx.secrets {
-            step.env.entry(k.clone()).or_insert(v.clone());
-        }
-        // run (pass current state into stdin)
-        let patch = match step.kind.as_str() {
-            "docker" => run_docker_step_collect_state(&step, plan.workdir.as_deref(), &state).await?,
-            "wasm"   => run_wasm_step(&client, &step, plan.workdir.as_deref(), &cache_dir, &state).await?,
-            other    => bail!("unknown step.kind '{}'", other),
-        };
-        if !patch.is_null() { deep_merge(&mut state, patch); }
-    }
-
-    println!("=== final state ===\n{}", serde_json::to_string_pretty(&state)?);
-    Ok(())
-}
-
-fn topo_order(steps: &[CompStep], wires: &[Wire]) -> Result<Vec<String>> {
-    let ids: HashSet<_> = steps.iter().map(|s| s.id.clone()).collect();
-    let mut indeg: HashMap<String, usize> = steps.iter().map(|s| (s.id.clone(), 0)).collect();
-    let mut adj: HashMap<String, Vec<String>> = steps.iter().map(|s| (s.id.clone(), vec![])).collect();
-
-    for w in wires {
-        if let (Some(from_step), _) = (w.from.step.as_ref(), w.to.step.as_str()) {
-            if ids.contains(from_step) && ids.contains(&w.to.step) {
-                adj.get_mut(from_step).unwrap().push(w.to.step.clone());
-                *indeg.get_mut(&w.to.step).unwrap() += 1;
-            }
-        }
-    }
-
-    let mut q: std::collections::VecDeque<String> =
-        indeg.iter().filter(|(_, &d)| d == 0).map(|(k, _)| k.clone()).collect();
-    let mut order = vec![];
-
-    while let Some(u) = q.pop_front() {
-        order.push(u.clone());
-        if let Some(vs) = adj.get(&u) {
-            for v in vs {
-                let e = indeg.get_mut(v).unwrap();
-                *e -= 1;
-                if *e == 0 { q.push_back(v.clone()); }
-            }
-        }
-    }
-
-    if order.len() != steps.len() {
-        bail!("cycle detected in composite steps wiring");
-    }
-    Ok(order)
-}
-
-fn build_env_for_step(
-    step_id: &str,
-    step_with: &HashMap<String,String>,
-    wires: &[Wire],
-    inputs_map: &HashMap<String,String>,
-    step_outputs: &HashMap<String, HashMap<String,String>>,
-) -> Result<HashMap<String,String>> {
-    let mut env = step_with.clone(); // defaults/overrides from step.with
-
-    for w in wires.iter().filter(|w| w.to.step == step_id) {
-        let key = w.to.input.clone();
-        let val = if let Some(src) = w.from.source.as_deref() {
-            if src == "inputs" {
-                let k = w.from.key.as_deref().ok_or_else(|| anyhow::anyhow!("wire 'from.inputs' missing 'key'"))?;
-                inputs_map.get(k)
-                    .cloned()
-                    .ok_or_else(|| anyhow::anyhow!("missing composite input '{}'", k))?
-            } else {
-                bail!("unknown wire source '{}'", src);
-            }
-        } else if let Some(from_step) = w.from.step.as_ref() {
-            let out = w.from.output.as_deref().ok_or_else(|| anyhow::anyhow!("wire 'from.step' missing 'output'"))?;
-            step_outputs.get(from_step)
-                .and_then(|m| m.get(out))
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("step '{}' has no output '{}'", from_step, out))?
-        } else if let Some(v) = w.from.value.as_ref() {
-            match v {
-                Value::String(s) => s.clone(),
-                _ => v.to_string(), // stringify non-strings
-            }
-        } else {
-            bail!("wire 'from' must be one of inputs/step/value");
-        };
-
-        // last write wins if multiple wires set same input
-        env.insert(key, val);
-    }
-
-    Ok(env)
-}
-
-fn lookup_state_path(state: &Value, path: &str) -> Option<String> {
-    let mut cur = state;
-    for seg in path.split('.') {
-        match cur {
-            Value::Object(m) => { cur = m.get(seg)?; }
-            Value::Array(a) => { let idx: usize = seg.parse().ok()?; cur = a.get(idx)?; }
-            _ => return None,
-        }
-    }
-    match cur {
-        Value::String(s) => Some(s.clone()),
-        other => Some(other.to_string()),
-    }
-}
-
-fn derive_output_by_name(name: &str, state: &Value) -> Option<String> {
-    // 1) exact key at root
-    if let Some(v) = state.get(name) {
-        return match v {
-            Value::String(s) => Some(s.clone()),
-            other => Some(other.to_string()),
-        };
-    }
-    // 2) *_id => try <stem>.id
-    if let Some(stem) = name.strip_suffix("_id") {
-        if let Some(s) = lookup_state_path(state, &format!("{}.id", stem)) {
-            return Some(s);
-        }
-    }
-    None
-}
-
-fn collect_needed_outputs_for(step_id: &str, wires: &[Wire]) -> HashSet<String> {
-    wires.iter()
-        .filter(|w| w.from.step.as_deref()==Some(step_id))
-        .filter_map(|w| w.from.output.clone())
-        .collect()
-}
-
-fn extract_step_outputs(step_id: &str, state: &Value, wires: &[Wire]) -> HashMap<String,String> {
-    let mut m = HashMap::new();
-    for out_name in collect_needed_outputs_for(step_id, wires) {
-        if let Some(val) = derive_output_by_name(&out_name, state) {
-            m.insert(out_name, val);
-        }
-    }
-    m
-}
-
-// helper: detect an OCI image ref (digest or tag)
-fn looks_like_oci_image(s: &str) -> bool {
-    s.contains("@sha256:") || (s.contains('/') && s.contains(':'))
-}
-
-fn absolutize(p: &str, base: Option<&str>) -> Result<String> {
-    let path = Path::new(p);
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        match base {
-            Some(b) => Path::new(b).join(path),
-            None => std::env::current_dir()?.join(path),
-        }
-    };
-    Ok(abs.canonicalize()?.to_string_lossy().to_string())
-}
-
-// Deep-merge: b overrides a
-fn deep_merge(a: &mut Value, b: Value) {
-    match (a, b) {
-        (Value::Object(ao), Value::Object(bo)) => {
-            for (k, v) in bo { deep_merge(ao.entry(k).or_insert(Value::Null), v); }
-        }
-        (a_slot, b_val) => { *a_slot = b_val; }
-    }
-}
-
-// helper: create a single-step plan from an image ref
-fn single_step_plan_from_image(image: &str, secrets: &[(String,String)]) -> ActionPlan {
-    let mut env: HashMap<String,String> = HashMap::new();
-    for (k,v) in secrets { env.insert(k.clone(), v.clone()); }
-
-    ActionPlan {
-        id: format!("image:{}", image),
-        version: "1".into(),
-        workdir: None,            // <-- was Some(".".into())
-        steps: vec![StepSpec {
-            id: "run".into(),
-            kind: "docker".into(),
-            ref_: image.to_string(),
-            entry: None,
-            args: vec![],                 // you can add default args here if needed
-            env,
-            mounts: vec![MountSpec {
-                typ: "bind".into(),
-                source: "./out".into(),
-                target: "/out".into(),
-                rw: true,
-            }],
-            timeout_ms: Some(300_000),
-            network: Some("bridge".into()), // allow network by default for ad-hoc tests
-            workdir: None,
-        }],
-    }
+    inputs: Vec<ActionInput>,
+    #[allow(dead_code)]
+    outputs: Vec<ActionOutput>,
+    steps: Vec<ActionStep>,
+    #[serde(default)] 
+    wires: Vec<Wire>,
+    #[serde(default)] 
+    export: Value, // optional; often { "project_id": { "from": {...} } }
 }
 
 // ============================================================================
@@ -349,74 +116,69 @@ impl Runner for LocalRunner {
     async fn ensure_auth(&self) -> Result<()> { Ok(()) }
     async fn prepare(&self, _ctx: &mut DeployCtx) -> Result<()> { Ok(()) }
     async fn put_files(&self, _ctx: &DeployCtx) -> Result<()> { Ok(()) }
-    async fn set_secrets(&self, _ctx: &DeployCtx) -> Result<()> { Ok(()) }
+
 
     async fn dispatch(&self, ctx: &DeployCtx) -> Result<()> {
         // 0) Local composite? run it and return.
         if looks_like_local_composite(&ctx.action) {
             let comp = try_load_composite_spec(&ctx.action)?;
-            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
+            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
             let token = std::env::var("STARTHUB_TOKEN").ok();
             let client = HubClient::new(base, token);
-            run_composite(&client, &comp, ctx).await?;
+            execute(&client, &comp, ctx).await?;
             println!("✓ Local execution complete");
             return Ok(());
         }
 
-        // 0.5) Composition ID? fetch from Supabase storage and run it.
-        if looks_like_composition_id(&ctx.action) {
-            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
-            let token = std::env::var("STARTHUB_TOKEN").ok();
-            let client = HubClient::new(base, token);
-            
-            let comp = try_load_composite_spec_from_id(&client, &ctx.action).await?;
-            run_composite(&client, &comp, ctx).await?;
-            println!("✓ Composition execution complete");
-            return Ok(());
-        }
-
-        // 1) Otherwise, try server-provided ActionPlan
-        let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
-        let token = std::env::var("STARTHUB_TOKEN").ok();
+        // 1) Try to fetch action details from the actions edge function
+        let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
+        // Always use the API key from config.rs for authentication
+        let token = Some(STARTHUB_API_KEY.to_string());
         let client = HubClient::new(base, token);
 
+        // Try to fetch action metadata first
         match client.fetch_action_metadata(&ctx.action).await {
-            Ok(plan_value) => {
-                let plan: ActionPlan = serde_json::from_value(plan_value)
-                    .context("deserializing action plan")?;
-                run_action_plan(&client, &plan, ctx).await?;
-            }
-            Err(e_plan) => {
-                if looks_like_oci_image(&ctx.action) {
-                    tracing::warn!("backend plan fetch failed ({}); falling back to direct image: {}", e_plan, ctx.action);
-                    let plan = single_step_plan_from_image(&ctx.action, &ctx.secrets);
-                    run_action_plan(&client, &plan, ctx).await?;
-                } else {
-                    return Err(e_plan).context("fetching action plan / resolving composite")?;
+            Ok(metadata) => {
+                println!("✓ Fetched action details for {}", ctx.action);
+                println!("Action: {}", metadata.name);
+                println!("Version: {}", metadata.version_number);
+                println!("Description: {}", metadata.description);
+                
+                if let Some(inputs) = &metadata.inputs {
+                    println!("\nInputs:");
+                    for input in inputs {
+                        println!("  - {} ({}): {}", input.name, input.action_port_type, input.action_port_direction);
+                    }
                 }
+                
+                if let Some(outputs) = &metadata.outputs {
+                    println!("\nOutputs:");
+                    for output in outputs {
+                        println!("  - {} ({}): {}", output.name, output.action_port_type, output.action_port_direction);
+                    }
+                }
+                
+                println!("\nNote: This action cannot be executed locally as it requires the full implementation.");
+                println!("Use --runner github to deploy and run this action remotely.");
+                return Ok(());
+            }
+            Err(e_metadata) => {
+                tracing::debug!("Failed to fetch action metadata ({}), trying action plan", e_metadata);
+                return Err(e_metadata).context("fetching action plan / resolving composite")?;
             }
         };
-
-        println!("✓ Local execution complete");
-        Ok(())
     }
 }
 
 // ============================================================================
-// COMPOSITE EXECUTION
+// EXECUTION
 // ============================================================================
-
-async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx) -> Result<()> {
+async fn execute(client: &HubClient, comp: &ActionManifest, _ctx: &DeployCtx) -> Result<()> {
     // 0) Build fast lookup tables
     let step_map: HashMap<_,_> = comp.steps.iter().map(|s| (s.id.clone(), s)).collect();
 
-    // 1) Inputs map (from CLI -e)
-    let mut inputs_map: HashMap<String,String> = HashMap::new();
-    for inp in &comp.inputs {
-        if let Some((_,v)) = ctx.secrets.iter().find(|(k,_)| k==&inp.name) {
-            inputs_map.insert(inp.name.clone(), v.clone());
-        }
-    }
+    // 1) Inputs map (empty since no secrets are supported)
+    let inputs_map: HashMap<String,String> = HashMap::new();
 
     // 2) Prefetch (do both docker & wasm)
     for s in &comp.steps {
@@ -440,7 +202,7 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
         let env = build_env_for_step(&sid, &s.with, &comp.wires, &inputs_map, &step_outputs)?;
 
         // 3b) Build a transient StepSpec to reuse docker executor
-        let mut step_spec = StepSpec {
+        let step_spec = StepSpec {
             id: sid.clone(),
             kind: step_kind.to_string(),
             ref_: s.uses.clone(),
@@ -452,11 +214,6 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
             network: Some("bridge".into()),
             workdir: None,
         };
-
-        // also merge ctx.secrets into env if you want them all available
-        for (k,v) in &ctx.secrets {
-            step_spec.env.entry(k.clone()).or_insert(v.clone());
-        }
 
         // 3c) Run it (pass current state)
         let patch = match step_kind {
@@ -498,6 +255,30 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
     // Also print final state for debugging
     println!("=== final state ===\n{}", serde_json::to_string_pretty(&state)?);
 
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn run_action_plan(client: &HubClient, plan: &ActionPlan, _ctx: &DeployCtx) -> Result<()> {
+    // Prefetch
+    let cache_dir = dirs::cache_dir().unwrap_or(std::env::temp_dir()).join("starthub/oci");
+    prefetch_all(client, plan, &cache_dir).await?;
+
+    // Execute with accumulated state
+    let mut state = serde_json::json!({});
+
+    for s in &plan.steps {
+        let step = s.clone();
+        // run (pass current state into stdin)
+        let patch = match step.kind.as_str() {
+            "docker" => run_docker_step_collect_state(&step, plan.workdir.as_deref(), &state).await?,
+            "wasm"   => run_wasm_step(&client, &step, plan.workdir.as_deref(), &cache_dir, &state).await?,
+            other    => bail!("unknown step.kind '{}'", other),
+        };
+        if !patch.is_null() { deep_merge(&mut state, patch); }
+    }
+
+    println!("=== final state ===\n{}", serde_json::to_string_pretty(&state)?);
     Ok(())
 }
 
@@ -725,12 +506,234 @@ async fn run_wasm_step(
     Ok(patch)
 }
 
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
 
+fn looks_like_local_composite(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('{') || t.ends_with(".json") || t.starts_with("file://") || Path::new(t).exists()
+}
+
+fn try_load_composite_spec(action: &str) -> Result<ActionManifest> {
+    let mut s = action.trim();
+    if let Some(rest) = s.strip_prefix("file://") { s = rest; }
+
+    if s.starts_with('{') {
+        return Ok(serde_json::from_str::<ActionManifest>(s).context("parsing inline composite json")?);
+    }
+    if s.ends_with(".json") || Path::new(s).exists() {
+        let txt = fs::read_to_string(s).with_context(|| format!("reading composite file '{}'", s))?;
+        return Ok(serde_json::from_str::<ActionManifest>(&txt).context("parsing composite json")?);
+    }
+    Err(anyhow!("not a composite spec reference: {}", action))
+}
+
+#[allow(dead_code)]
+fn looks_like_oci_image(s: &str) -> bool {
+    s.contains("@sha256:") || s.contains(':')
+}
+
+fn absolutize(p: &str, base: Option<&str>) -> Result<String> {
+    let path = Path::new(p);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match base {
+            Some(b) => Path::new(b).join(path),
+            None => std::env::current_dir()?.join(path),
+        }
+    };
+    Ok(abs.canonicalize()?.to_string_lossy().to_string())
+}
+
+// ============================================================================
+// GRAPH ALGORITHMS
+// ============================================================================
+
+fn topo_order(steps: &[ActionStep], wires: &[Wire]) -> Result<Vec<String>> {
+    let ids: HashSet<_> = steps.iter().map(|s| s.id.clone()).collect();
+    let mut indeg: HashMap<String, usize> = steps.iter().map(|s| (s.id.clone(), 0)).collect();
+    let mut adj: HashMap<String, Vec<String>> = steps.iter().map(|s| (s.id.clone(), vec![])).collect();
+
+    for w in wires {
+        if let (Some(from_step), _) = (w.from.step.as_ref(), w.to.step.as_str()) {
+            if ids.contains(from_step) && ids.contains(&w.to.step) {
+                adj.get_mut(from_step).unwrap().push(w.to.step.clone());
+                *indeg.get_mut(&w.to.step).unwrap() += 1;
+            }
+        }
+    }
+
+    let mut q: VecDeque<String> =
+        indeg.iter().filter(|(_, &d)| d == 0).map(|(k, _)| k.clone()).collect();
+    let mut order = vec![];
+
+    while let Some(u) = q.pop_front() {
+        order.push(u.clone());
+        if let Some(vs) = adj.get(&u) {
+            for v in vs {
+                let e = indeg.get_mut(v).unwrap();
+                *e -= 1;
+                if *e == 0 { q.push_back(v.clone()); }
+            }
+        }
+    }
+
+    if order.len() != steps.len() {
+        bail!("cycle detected in composite steps wiring");
+    }
+    Ok(order)
+}
+
+// ============================================================================
+// ENVIRONMENT AND WIRING
+// ============================================================================
+
+fn build_env_for_step(
+    step_id: &str,
+    step_with: &HashMap<String,String>,
+    wires: &[Wire],
+    inputs_map: &HashMap<String,String>,
+    step_outputs: &HashMap<String, HashMap<String,String>>,
+) -> Result<HashMap<String,String>> {
+    let mut env = step_with.clone(); // defaults/overrides from step.with
+
+    for w in wires.iter().filter(|w| w.to.step == step_id) {
+        let key = w.to.input.clone();
+        let val = if let Some(src) = w.from.source.as_deref() {
+            if src == "inputs" {
+                let k = w.from.key.as_deref().ok_or_else(|| anyhow!("wire 'from.inputs' missing 'key'"))?;
+                inputs_map.get(k)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing composite input '{}'", k))?
+            } else {
+                bail!("unknown wire source '{}'", src);
+            }
+        } else if let Some(from_step) = w.from.step.as_ref() {
+            let out = w.from.output.as_deref().ok_or_else(|| anyhow!("wire 'from.step' missing 'output'"))?;
+            step_outputs.get(from_step)
+                .and_then(|m| m.get(out))
+                .cloned()
+                .ok_or_else(|| anyhow!("step '{}' has no output '{}'", from_step, out))?
+        } else if let Some(v) = w.from.value.as_ref() {
+            match v {
+                Value::String(s) => s.clone(),
+                _ => v.to_string(), // stringify non-strings
+            }
+        } else {
+            bail!("wire 'from' must be one of inputs/step/value");
+        };
+
+        // last write wins if multiple wires set same input
+        env.insert(key, val);
+    }
+
+    Ok(env)
+}
+
+// ============================================================================
+// STATE MANAGEMENT
+// ============================================================================
+
+fn lookup_state_path(state: &Value, path: &str) -> Option<String> {
+    let mut cur = state;
+    for seg in path.split('.') {
+        match cur {
+            Value::Object(m) => { cur = m.get(seg)?; }
+            Value::Array(a) => { let idx: usize = seg.parse().ok()?; cur = a.get(idx)?; }
+            _ => return None,
+        }
+    }
+    match cur {
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn derive_output_by_name(name: &str, state: &Value) -> Option<String> {
+    // 1) exact key at root
+    if let Some(v) = state.get(name) {
+        return match v {
+            Value::String(s) => Some(s.clone()),
+            other => Some(other.to_string()),
+        };
+    }
+    // 2) *_id => try <stem>.id
+    if let Some(stem) = name.strip_suffix("_id") {
+        if let Some(s) = lookup_state_path(state, &format!("{}.id", stem)) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+fn collect_needed_outputs_for(step_id: &str, wires: &[Wire]) -> HashSet<String> {
+    wires.iter()
+        .filter(|w| w.from.step.as_deref()==Some(step_id))
+        .filter_map(|w| w.from.output.clone())
+        .collect()
+}
+
+fn extract_step_outputs(step_id: &str, state: &Value, wires: &[Wire]) -> HashMap<String,String> {
+    let mut m = HashMap::new();
+    for out_name in collect_needed_outputs_for(step_id, wires) {
+        if let Some(val) = derive_output_by_name(&out_name, state) {
+            m.insert(out_name, val);
+        }
+    }
+    m
+}
+
+// Deep-merge: b overrides a
+fn deep_merge(a: &mut Value, b: Value) {
+    match (a, b) {
+        (Value::Object(ao), Value::Object(bo)) => {
+            for (k, v) in bo { deep_merge(ao.entry(k).or_insert(Value::Null), v); }
+        }
+        (a_slot, b_val) => { *a_slot = b_val; }
+    }
+}
+
+// ============================================================================
+// PLAN BUILDING
+// ============================================================================
+
+// helper: create a single-step plan from an image ref
+#[allow(dead_code)]
+fn single_step_plan_from_image(image: &str, secrets: &[(String,String)]) -> ActionPlan {
+    let mut env: HashMap<String,String> = HashMap::new();
+    for (k,v) in secrets { env.insert(k.clone(), v.clone()); }
+
+    ActionPlan {
+        id: format!("image:{}", image),
+        version: "1".into(),
+        workdir: None,
+        steps: vec![StepSpec {
+            id: "run".into(),
+            kind: "docker".into(),
+            ref_: image.to_string(),
+            entry: None,
+            args: vec![],
+            env,
+            mounts: vec![MountSpec {
+                typ: "bind".into(),
+                source: "./out".into(),
+                target: "/out".into(),
+                rw: true,
+            }],
+            timeout_ms: Some(300_000),
+            network: Some("bridge".into()),
+            workdir: None,
+        }],
+    }
+}
 
 // ============================================================================
 // PREFETCHING
 // ============================================================================
 
+#[allow(dead_code)]
 async fn prefetch_all(client: &HubClient, plan: &ActionPlan, cache_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(cache_dir)?;
     for s in &plan.steps {
@@ -743,12 +746,56 @@ async fn prefetch_all(client: &HubClient, plan: &ActionPlan, cache_dir: &Path) -
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn docker_pull(image: &str) -> Result<()> {
     if which("docker").is_err() {
         bail!("docker not found on PATH (required for docker steps)");
     }
     let _ = Command::new("docker").arg("pull").arg(image).status().await?;
     Ok(())
+}
+
+// ============================================================================
+// ACTION METADATA CONVERSION
+// ============================================================================
+
+/// Convert ActionMetadata from the API to a CompositeSpec for local execution
+fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<ActionManifest> {
+    // Since the current API doesn't provide steps/wires/export, create a simple single-step composite
+    // that can be executed locally
+    let comp_steps = vec![ActionStep {
+        id: "run".to_string(),
+        kind: "docker".to_string(),
+        uses: "alpine:latest".to_string(), // Default to alpine for now
+        with: std::collections::HashMap::new(),
+    }];
+
+    let inputs = metadata.inputs.as_ref()
+        .map(|inputs| inputs.iter().map(|input| ActionInput {
+            name: input.name.clone(),
+            r#type: input.action_port_type.clone(),
+            description: format!("Input: {}", input.action_port_direction),
+        }).collect())
+        .unwrap_or_default();
+
+    let outputs = metadata.outputs.as_ref()
+        .map(|outputs| outputs.iter().map(|output| ActionOutput {
+            name: output.name.clone(),
+            r#type: output.action_port_type.clone(),
+            description: format!("Output: {}", output.action_port_direction),
+        }).collect())
+        .unwrap_or_default();
+
+    Ok(ActionManifest {
+        name: metadata.name.clone(),
+        version: metadata.version_number.clone(),
+        description: metadata.description.clone(),
+        inputs,
+        outputs,
+        steps: comp_steps,
+        wires: vec![], // No wires defined in current API
+        export: serde_json::json!({}), // No export defined in current API
+    })
 }
 
 #[cfg(test)]
@@ -763,27 +810,27 @@ mod tests {
     // TEST HELPERS
     // ============================================================================
 
-    fn create_test_composite_spec() -> CompositeSpec {
-        CompositeSpec {
+    fn create_test_composite_spec() -> ActionManifest {
+        ActionManifest {
             name: "test-composite".to_string(),
             version: "1.0.0".to_string(),
             description: "Test composite for unit testing".to_string(),
             inputs: vec![
-                CompositeInput {
+                ActionInput {
                     name: "test_input".to_string(),
                     r#type: "string".to_string(),
                     description: "Test input".to_string(),
                 }
             ],
             outputs: vec![
-                CompositeOutput {
+                ActionOutput {
                     name: "test_output".to_string(),
                     r#type: "string".to_string(),
                     description: "Test output".to_string(),
                 }
             ],
             steps: vec![
-                CompStep {
+                ActionStep {
                     id: "step1".to_string(),
                     kind: "docker".to_string(),
                     uses: "alpine:latest".to_string(),
@@ -798,10 +845,8 @@ mod tests {
     fn create_test_deploy_ctx() -> DeployCtx {
         DeployCtx {
             action: "test-action".to_string(),
-            env: None,
             owner: None,
             repo: None,
-            secrets: vec![("test_input".to_string(), "test_value".to_string())],
         }
     }
 
@@ -845,9 +890,9 @@ mod tests {
         let abs_path = absolutize("/tmp", None).unwrap();
         assert!(abs_path.starts_with('/'));
         
-        // Test relative path with base (use a path that actually exists)
-        let rel_path = absolutize("local.rs", Some("src/runners")).unwrap();
-        assert!(rel_path.contains("local.rs"));
+        // Test relative path with base (use a known absolute path)
+        let rel_path = absolutize("tmp", Some("/")).unwrap();
+        assert!(rel_path.contains("tmp"));
     }
 
     // ============================================================================
@@ -857,13 +902,13 @@ mod tests {
     #[test]
     fn test_topo_order_simple() {
         let steps = vec![
-            CompStep {
+            ActionStep {
                 id: "step1".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
                 with: HashMap::new(),
             },
-            CompStep {
+            ActionStep {
                 id: "step2".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
@@ -894,13 +939,13 @@ mod tests {
     #[test]
     fn test_topo_order_cycle_detection() {
         let steps = vec![
-            CompStep {
+            ActionStep {
                 id: "step1".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
                 with: HashMap::new(),
             },
-            CompStep {
+            ActionStep {
                 id: "step2".to_string(),
                 kind: "docker".to_string(),
                 uses: "alpine:latest".to_string(),
@@ -1237,7 +1282,7 @@ mod tests {
         assert!(runner.ensure_auth().await.is_ok());
         assert!(runner.prepare(&mut ctx).await.is_ok());
         assert!(runner.put_files(&ctx).await.is_ok());
-        assert!(runner.set_secrets(&ctx).await.is_ok());
+
     }
 
     // ============================================================================
