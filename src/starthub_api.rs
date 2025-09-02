@@ -1,9 +1,6 @@
 // src/starthub_api.rs
-use anyhow::{Result, Context};
-use reqwest::header::{AUTHORIZATION, ACCEPT, CONTENT_TYPE};
-use serde::Deserialize;
-
-use crate::runners::models::ActionPlan;
+use anyhow::Result;
+use reqwest::header::AUTHORIZATION;
 
 #[derive(Clone)]
 pub struct Client {

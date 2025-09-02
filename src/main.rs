@@ -8,7 +8,7 @@ use tokio::time::{sleep, Duration};
 use std::{fs, path::Path};
 use std::process::Command as PCommand;
 use serde::{Serialize, Deserialize};
-use serde_json::{Value as JsonValue, json};
+use serde_json::Value as JsonValue;
 use inquire::{Text, Select, Confirm};
 use tokio::sync::oneshot;
 use std::net::SocketAddr;
@@ -32,7 +32,7 @@ mod runners;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
-enum RunnerKind {    
+pub enum RunnerKind {    
     Github,
     #[default] // <- this one is the default
     Local, // placeholder for future
@@ -379,7 +379,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { path } => cmd_init(path).await?,
         Commands::Publish { no_build } => cmd_publish(no_build).await?,   // 👈
-        Commands::Run { action, secrets, env, runner } => cmd_run(action, runner).await?,
+        Commands::Run { action, secrets: _, env: _, runner } => cmd_run(action, runner).await?,
         Commands::Status { id } => cmd_status(id).await?,
     }
     Ok(())
@@ -714,14 +714,7 @@ fn run_capture(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
         Err(e) => Err(e.into()),
     }
 }
-fn parse_digest(s: &str) -> Option<String> {
-    for line in s.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Digest: ") {
-            if rest.starts_with("sha256:") { return Some(rest.to_string()); }
-        }
-    }
-    None
-}
+
 
 // ------------------- cmd_init -------------------
 async fn cmd_init(path: String) -> anyhow::Result<()> {
@@ -839,28 +832,9 @@ async fn cmd_init(path: String) -> anyhow::Result<()> {
 }
 
 
-async fn cmd_login(runner: RunnerKind) -> anyhow::Result<()> {
-    let r = make_runner(runner);
-    println!("→ Logging in for runner: {}", r.name());
-    r.ensure_auth().await?;
-    println!("✓ Login complete for {}", r.name());
-    Ok(())
-}
 
-// Parse KEY=VALUE items into Vec<(String,String)>, with friendly errors.
-fn parse_secret_pairs(items: &[String]) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for raw in items {
-        let (k, v) = raw
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!(format!("invalid -e value '{raw}', expected KEY=VALUE")))?;
-        if k.trim().is_empty() {
-            anyhow::bail!("secret name empty in '{raw}'");
-        }
-        out.push((k.trim().to_string(), v.to_string()));
-    }
-    Ok(out)
-}
+
+
 
 fn open_actions_page(owner: &str, repo: &str) {
     let url = format!("https://github.com/{owner}/{repo}/actions");
@@ -971,7 +945,7 @@ fn api_router(state: AppState) -> Router {
 }
 
 
-async fn cmd_run(action: String, runner: RunnerKind) -> Result<()> {
+async fn cmd_run(action: String, _runner: RunnerKind) -> Result<()> {
     // oneshot to receive the first /api/run payload
     let (tx, rx) = oneshot::channel::<RunRequest>();
     let state = AppState { tx: Arc::new(Mutex::new(Some(tx))) };
@@ -1010,7 +984,7 @@ async fn cmd_run(action: String, runner: RunnerKind) -> Result<()> {
     });
 
     // Run the server in the background
-    let server = tokio::spawn(async move {
+    let _server = tokio::spawn(async move {
         axum::serve(listener, app.into_make_service()).await.unwrap();
     });
 
