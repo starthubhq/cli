@@ -14,9 +14,12 @@ inquire = "0.7"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
 chrono = "0.4"
 dirs = "5"
 which = "6"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs", "compression-gzip"] }
 sodiumoxide = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1"
@@ -25,6 +28,8 @@ webbrowser = "0.8"
 async-trait = "0.1"
 flate2 = "1"
 tar = "0.4"
+rust-embed = "8"
+mime_guess = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["macros","rt-multi-thread","process","fs","time"] }
 

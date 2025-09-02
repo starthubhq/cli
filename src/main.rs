@@ -1,12 +1,26 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use axum::{routing::{get, post}, Router, extract::State, Json};
+use std::sync::{Arc, Mutex};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use clap::{ValueEnum};
 use tokio::time::{sleep, Duration};
 use std::{fs, path::Path};
 use std::process::Command as PCommand;
 use serde::{Serialize, Deserialize};
+use serde_json::{Value as JsonValue, json};
 use inquire::{Text, Select, Confirm};
+use tokio::sync::oneshot;
+use std::net::SocketAddr;
+use tokio::net::TcpListener;
+use axum::{
+    body::Body,
+    http::{header::CONTENT_TYPE, StatusCode, Uri},
+    response::Response,
+};
+use rust_embed::RustEmbed;
+use mime_guess::from_path;
+
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -16,9 +30,11 @@ mod ghapp;
 mod config; // 👈 add
 mod runners;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum RunnerKind {
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum RunnerKind {    
     Github,
+    #[default] // <- this one is the default
     Local, // placeholder for future
 }
 
@@ -363,7 +379,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { path } => cmd_init(path).await?,
         Commands::Publish { no_build } => cmd_publish(no_build).await?,   // 👈
-        Commands::Run { action, secrets, env, runner } => cmd_run(action, secrets, env, runner).await?,
+        Commands::Run { action, secrets, env, runner } => cmd_run(action, runner).await?,
         Commands::Status { id } => cmd_status(id).await?,
     }
     Ok(())
@@ -854,24 +870,177 @@ fn open_actions_page(owner: &str, repo: &str) {
     }
 }
 
-async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, runner: RunnerKind) -> Result<()> {
-    let parsed_secrets = parse_secret_pairs(&secrets)?;
+#[derive(RustEmbed)]
+#[folder = "ui/dist/"]     // embedded at compile time
+struct Assets;
+
+async fn embedded_assets(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    // Try requested path directly (for real assets like *.js, *.css, *.png)
+    let candidate = if path.is_empty() { "index.html" } else { path };
+    let asset = Assets::get(candidate);
+
+    if let Some(content) = asset {
+        let body = Body::from(content.data.into_owned());
+        let mime = from_path(candidate).first_or_octet_stream();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, mime.as_ref())
+            .body(body.into())
+            .unwrap();
+    }
+
+    // 👉 If not found, always serve index.html with text/html (SPA fallback)
+    if let Some(index) = Assets::get("index.html") {
+        let body = Body::from(index.data.into_owned());
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(CONTENT_TYPE, "text/html")
+            .body(body.into())
+            .unwrap();
+    }
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+// Shared app state to deliver the first POSTed RunRequest to cmd_run
+#[derive(Clone)]
+struct AppState {
+    tx: Arc<Mutex<Option<oneshot::Sender<RunRequest>>>>,
+}
+
+// ---------- API types ----------
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunRequest {
+    action: String,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    runner: RunnerKind,
+    /// Arbitrary inputs keyed by input-port name
+    #[serde(default)]
+    inputs: JsonValue,     
+    /// secrets as { "KEY": "VALUE", ... }
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, String>,
+}
+
+fn parse_action_ref(s: &str) -> Option<(String, String, Option<String>)> {
+    // Accept: ns/slug@1.2.3 | ns/slug | slug (fallback → no ns)
+    let (path, ver) = match s.split_once('@') {
+        Some((p, v)) if !v.is_empty() => (p, Some(v.to_string())),
+        _ => (s, None),
+    };
+
+    // ns/slug
+    let mut parts = path.split('/').filter(|p| !p.is_empty());
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(ns), Some(slug), None) => Some((ns.to_string(), slug.to_string(), ver)),
+        // allow single `slug` (no namespace) if you want → map to just `/slug` (or return None)
+        (Some(slug_only), None, None) => Some(("".to_string(), slug_only.to_string(), ver)),
+        _ => None,
+    }
+}
+
+// ---------- API router ----------
+fn api_router(state: AppState) -> Router {
+    async fn health() -> &'static str { "ok" }
+
+    async fn post_run(
+        State(state): State<AppState>,
+        Json(req): Json<RunRequest>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        if let Some(tx) = state.tx.lock().unwrap().take() {
+            // deliver the request to cmd_run
+            let _ = tx.send(req);
+            Ok(Json(serde_json::json!({ "ok": true })))
+        } else {
+            // already consumed
+            Err(StatusCode::CONFLICT)
+        }
+    }
+
+    Router::new()
+        .route("/health", get(health))
+        .route("/run", post(post_run))
+        .with_state(state)
+}
+
+
+async fn cmd_run(action: String, runner: RunnerKind) -> Result<()> {
+    // oneshot to receive the first /api/run payload
+    let (tx, rx) = oneshot::channel::<RunRequest>();
+    let state = AppState { tx: Arc::new(Mutex::new(Some(tx))) };
+
+    // Build the app: API + SPA
+    let app = Router::new()
+        .nest("/api", api_router(state.clone()))
+        .fallback(embedded_assets);
+
+    let addr: SocketAddr = ([127, 0, 0, 1], 8888).into();
+    let listener = TcpListener::bind(addr).await.unwrap();
+
+    println!("UI at http://{}", addr);
+
+    // Decide which URL to open (deep-link if action is ns/slug[@version])
+    let start_url = match parse_action_ref(&action) {
+        Some((ns, slug, ver)) if !ns.is_empty() => match ver {
+            Some(v) => format!("http://localhost:8888/{}/{}/{}", ns, slug, v),
+            None    => format!("http://localhost:8888/{}/{}", ns, slug),
+        },
+        Some((_, slug, ver)) => match ver { // no namespace case: /<slug>[/<version>]
+            Some(v) => format!("http://localhost:8888/{}/{}", slug, v),
+            None    => format!("http://localhost:8888/{}", slug),
+        },
+        None => "http://localhost:8888/".to_string(), // fallback
+    };
+
+    println!("Opening browser at {start_url}");
+
+    tokio::spawn({
+        let start_url = start_url.clone();
+        async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let _ = webbrowser::open(&start_url);
+        }
+    });
+
+    // Run the server in the background
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service()).await.unwrap();
+    });
+
+    println!("Waiting for input from the UI… (POST /api/run)");
+
+    // Wait for the first /api/run
+    let req = rx.await.map_err(|_| anyhow::anyhow!("server channel closed"))?;
+    println!("→ Received run request from UI: action={} runner={:?} env={:?}", req.action, req.runner, req.env);
+
+    // Build your deployment context from req (replace current TODO block)
+    let parsed_secrets: Vec<(String, String)> = req.secrets.into_iter().collect();
+
     let mut ctx = runners::DeployCtx {
-        action,
-        env,
+        action: req.action,
+        env: req.env,
         owner: None,
         repo: None,
-        secrets: parsed_secrets,       // <— pass to runner
+        secrets: parsed_secrets,
+        // if you want to pass inputs to the runner, add a field in DeployCtx:
+        // inputs: req.inputs,  // (change DeployCtx accordingly)
     };
-    let r = make_runner(runner);
 
-    // 1) ensure auth for selected runner; guide if missing
+    let r = make_runner(req.runner);
+
+    // 1) ensure auth for selected runner
     r.ensure_auth().await?;
-
-    // 2) do the runner-specific steps
+    // 2) runner-specific steps
     r.prepare(&mut ctx).await?;
     r.put_files(&ctx).await?;
-    r.set_secrets(&ctx).await?;       // <— will create repo secrets
+    r.set_secrets(&ctx).await?;
     r.dispatch(&ctx).await?;
 
     if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
@@ -881,9 +1050,30 @@ async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, runn
 
     println!("✓ Dispatch complete for {}", r.name());
 
-    
+    // let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // let server = tokio::spawn(async move {
+    //     axum::serve(listener, app.into_make_service())
+    //         .with_graceful_shutdown(async {
+    //             let _ = shutdown_rx.await; // wait for signal
+    //         })
+    //         .await
+    //         .unwrap();
+    // });
+
+    // After dispatch completes, stop the server:
+    // let _ = shutdown_tx.send(());
+
+    // If you want to wait for clean shutdown:
+    // let _ = server.await;
+
+    // Optionally: stop the server by exiting the process here,
+    // or keep it running by awaiting it (will block):
+    // server.await.ok();
+
     Ok(())
 }
+
 
 async fn cmd_status(id: Option<String>) -> Result<()> {
     println!("Status for {id:?}");
