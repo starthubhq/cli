@@ -17,11 +17,14 @@ use axum::{
     routing::{get, post},
     response::{Html, Json},
     Router,
+    extract::ws::{WebSocket, WebSocketUpgrade},
+    response::IntoResponse,
 };
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 use tower_http::cors::CorsLayer;
 use serde_json::{Value, json};
+use futures_util::{StreamExt, SinkExt};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -594,6 +597,7 @@ async fn start_server() -> Result<()> {
         .route("/api/status", get(get_status))
         .route("/api/action", post(handle_action))
         .route("/api/run", post(handle_run))
+        .route("/ws", get(ws_handler)) // WebSocket endpoint
         .nest_service("/assets", ServeDir::new("ui/dist/assets"))
         .nest_service("/favicon.ico", ServeDir::new("ui/dist"))
         .fallback(serve_spa) // SPA fallback for Vue Router
@@ -662,6 +666,49 @@ async fn handle_run(Json(payload): Json<Value>) -> Json<Value> {
     });
     
     Json(response)
+}
+
+async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(handle_ws)
+}
+
+async fn handle_ws(ws: WebSocket) {
+    let (mut sender, mut receiver) = ws.split();
+
+    // Send a welcome message
+    let welcome_msg = json!({
+        "type": "connection",
+        "message": "Connected to Starthub WebSocket server",
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    });
+    
+    if let Ok(msg) = serde_json::to_string(&welcome_msg) {
+        let _ = sender.send(axum::extract::ws::Message::Text(msg)).await;
+    }
+
+    // Handle incoming messages and echo them back
+    while let Some(msg) = receiver.next().await {
+        if let Ok(msg) = msg {
+            match msg {
+                axum::extract::ws::Message::Text(text) => {
+                    // Echo back the message for now
+                    let echo_msg = json!({
+                        "type": "echo",
+                        "message": text,
+                        "timestamp": chrono::Utc::now().to_rfc3339()
+                    });
+                    
+                    if let Ok(msg_str) = serde_json::to_string(&echo_msg) {
+                        let _ = sender.send(axum::extract::ws::Message::Text(msg_str)).await;
+                    }
+                }
+                axum::extract::ws::Message::Close(_) => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 pub async fn cmd_status(id: Option<String>) -> Result<()> {
