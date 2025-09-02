@@ -497,21 +497,6 @@ pub async fn cmd_login(runner: crate::RunnerKind) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Parse KEY=VALUE items into Vec<(String,String)>, with friendly errors.
-pub fn parse_secret_pairs(items: &[String]) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    for raw in items {
-        let (k, v) = raw
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!(format!("invalid -e value '{raw}', expected KEY=VALUE")))?;
-        if k.trim().is_empty() {
-            anyhow::bail!("secret name empty in '{raw}'");
-        }
-        out.push((k.trim().to_string(), v.to_string()));
-    }
-    Ok(out)
-}
-
 pub fn open_actions_page(owner: &str, repo: &str) {
     let url = format!("https://github.com/{owner}/{repo}/actions");
     match webbrowser::open(&url) {
@@ -520,14 +505,11 @@ pub fn open_actions_page(owner: &str, repo: &str) {
     }
 }
 
-pub async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, runner: crate::RunnerKind) -> Result<()> {
-    let parsed_secrets = parse_secret_pairs(&secrets)?;
+pub async fn cmd_run(action: String, runner: crate::RunnerKind) -> Result<()> {
     let mut ctx = runners::DeployCtx {
         action,
-        env,
         owner: None,
         repo: None,
-        secrets: parsed_secrets,       // <— pass to runner
     };
     let r = crate::make_runner(runner);
 
@@ -537,7 +519,6 @@ pub async fn cmd_run(action: String, secrets: Vec<String>, env: Option<String>, 
     // 2) do the runner-specific steps
     r.prepare(&mut ctx).await?;
     r.put_files(&ctx).await?;
-    r.set_secrets(&ctx).await?;       // <— will create repo secrets
     r.dispatch(&ctx).await?;
 
     if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
@@ -588,34 +569,6 @@ mod tests {
         let output = "digest: sha256:invalid";
         let digest = parse_digest_any(output);
         assert_eq!(digest, None);
-    }
-
-    #[test]
-    fn test_parse_secret_pairs() {
-        // Test valid secret pairs
-        let secrets = vec!["KEY1=value1".to_string(), "KEY2=value2".to_string()];
-        let result = parse_secret_pairs(&secrets).unwrap();
-        assert_eq!(result, vec![("KEY1".to_string(), "value1".to_string()), ("KEY2".to_string(), "value2".to_string())]);
-
-        // Test with spaces
-        let secrets = vec![" KEY1 = value1 ".to_string()];
-        let result = parse_secret_pairs(&secrets).unwrap();
-        assert_eq!(result, vec![("KEY1".to_string(), " value1 ".to_string())]);
-
-        // Test empty input
-        let secrets: Vec<String> = vec![];
-        let result = parse_secret_pairs(&secrets).unwrap();
-        assert_eq!(result, Vec::<(String, String)>::new());
-
-        // Test invalid format
-        let secrets = vec!["invalid_format".to_string()];
-        let result = parse_secret_pairs(&secrets);
-        assert!(result.is_err());
-
-        // Test empty key
-        let secrets = vec!["=value".to_string()];
-        let result = parse_secret_pairs(&secrets);
-        assert!(result.is_err());
     }
 
     #[test]

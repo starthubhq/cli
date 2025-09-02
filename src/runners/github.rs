@@ -6,33 +6,7 @@ use tempfile::tempdir;
 use flate2::read::GzDecoder;
 use tar::Archive;
 use std::{fs, io, path::{Path, PathBuf}, time::Duration};
-// + encryption crates
-use base64::engine::general_purpose::STANDARD as B64;
-use base64::Engine as _;
-use sodiumoxide::init as sodium_init;
-use sodiumoxide::crypto::{sealedbox, box_}; // <-- note: both modules imported
 use chrono::Local;
-
-
-fn sanitize_secret_name(s: &str) -> String {
-    // GitHub requires [A-Z0-9_]; normalize user-provided keys
-    let up = s.trim().to_uppercase();
-    up.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
-}
-
-fn sealed_box_encrypt_b64(pubkey_b64: &str, plaintext: &[u8]) -> Result<String> {
-    sodium_init().map_err(|_| anyhow::anyhow!("libsodium init failed"))?;
-
-    let pk_bytes = B64.decode(pubkey_b64)?;
-    // sealedbox expects a box_::PublicKey
-    let pk = box_::PublicKey::from_slice(&pk_bytes)
-        .ok_or_else(|| anyhow::anyhow!("invalid public key length"))?;
-
-    let cipher = sealedbox::seal(plaintext, &pk);
-    Ok(B64.encode(cipher))
-}
 
 pub struct GithubRunner;
 
@@ -137,29 +111,8 @@ impl Runner for GithubRunner {
         Ok(())
     }
 
-
     async fn put_files(&self, _ctx: &DeployCtx) -> Result<()> {
         // Not needed if the template already has the workflow & files.
-        Ok(())
-    }
-
-    async fn set_secrets(&self, ctx: &DeployCtx) -> Result<()> {
-        if ctx.secrets.is_empty() {
-            println!("→ No -e secrets provided; skipping secret creation.");
-            return Ok(());
-        }
-        let owner = ctx.owner.as_deref().ok_or_else(|| anyhow::anyhow!("owner missing; call prepare() first"))?;
-        let repo  = ctx.repo.as_deref().ok_or_else(|| anyhow::anyhow!("repo missing; call prepare() first"))?;
-
-        let creds = ghapp::load_token_for("github")?;
-        let pk = ghapp::get_repo_public_key(&creds.access_token, owner, repo).await?;
-
-        for (k, v) in &ctx.secrets {
-            let name = sanitize_secret_name(k);
-            let enc  = sealed_box_encrypt_b64(&pk.key, v.as_bytes())?;
-            ghapp::put_repo_secret(&creds.access_token, owner, repo, &name, &pk.key_id, &enc).await?;
-            println!("✓ Secret set: {}", name);
-        }
         Ok(())
     }
 

@@ -11,6 +11,7 @@ use which::which;
 
 use super::{Runner, DeployCtx};
 use crate::starthub_api::{Client as HubClient, ActionMetadata};
+use crate::config::{STARTHUB_API_BASE, STARTHUB_API_KEY};
 use crate::runners::models::{ActionPlan, StepSpec, MountSpec};
 
 // ============================================================================
@@ -115,13 +116,13 @@ impl Runner for LocalRunner {
     async fn ensure_auth(&self) -> Result<()> { Ok(()) }
     async fn prepare(&self, _ctx: &mut DeployCtx) -> Result<()> { Ok(()) }
     async fn put_files(&self, _ctx: &DeployCtx) -> Result<()> { Ok(()) }
-    async fn set_secrets(&self, _ctx: &DeployCtx) -> Result<()> { Ok(()) }
+
 
     async fn dispatch(&self, ctx: &DeployCtx) -> Result<()> {
         // 0) Local composite? run it and return.
         if looks_like_local_composite(&ctx.action) {
             let comp = try_load_composite_spec(&ctx.action)?;
-            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
+            let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
             let token = std::env::var("STARTHUB_TOKEN").ok();
             let client = HubClient::new(base, token);
             run_composite(&client, &comp, ctx).await?;
@@ -130,17 +131,35 @@ impl Runner for LocalRunner {
         }
 
         // 1) Try to fetch action details from the actions edge function
-        let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
-        let token = std::env::var("STARTHUB_TOKEN").ok();
+        let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
+        // Always use the API key from config.rs for authentication
+        let token = Some(STARTHUB_API_KEY.to_string());
         let client = HubClient::new(base, token);
 
         // Try to fetch action metadata first
         match client.fetch_action_metadata(&ctx.action).await {
             Ok(metadata) => {
                 println!("✓ Fetched action details for {}", ctx.action);
-                let comp = convert_action_metadata_to_composite(&metadata)?;
-                run_composite(&client, &comp, ctx).await?;
-                println!("✓ Local execution complete");
+                println!("Action: {}", metadata.name);
+                println!("Version: {}", metadata.version_number);
+                println!("Description: {}", metadata.description);
+                
+                if let Some(inputs) = &metadata.inputs {
+                    println!("\nInputs:");
+                    for input in inputs {
+                        println!("  - {} ({}): {}", input.name, input.action_port_type, input.action_port_direction);
+                    }
+                }
+                
+                if let Some(outputs) = &metadata.outputs {
+                    println!("\nOutputs:");
+                    for output in outputs {
+                        println!("  - {} ({}): {}", output.name, output.action_port_type, output.action_port_direction);
+                    }
+                }
+                
+                println!("\nNote: This action cannot be executed locally as it requires the full implementation.");
+                println!("Use --runner github to deploy and run this action remotely.");
                 return Ok(());
             }
             Err(e_metadata) => {
@@ -155,17 +174,12 @@ impl Runner for LocalRunner {
 // COMPOSITE EXECUTION
 // ============================================================================
 
-async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx) -> Result<()> {
+async fn run_composite(client: &HubClient, comp: &CompositeSpec, _ctx: &DeployCtx) -> Result<()> {
     // 0) Build fast lookup tables
     let step_map: HashMap<_,_> = comp.steps.iter().map(|s| (s.id.clone(), s)).collect();
 
-    // 1) Inputs map (from CLI -e)
-    let mut inputs_map: HashMap<String,String> = HashMap::new();
-    for inp in &comp.inputs {
-        if let Some((_,v)) = ctx.secrets.iter().find(|(k,_)| k==&inp.name) {
-            inputs_map.insert(inp.name.clone(), v.clone());
-        }
-    }
+    // 1) Inputs map (empty since no secrets are supported)
+    let inputs_map: HashMap<String,String> = HashMap::new();
 
     // 2) Prefetch (do both docker & wasm)
     for s in &comp.steps {
@@ -189,7 +203,7 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
         let env = build_env_for_step(&sid, &s.with, &comp.wires, &inputs_map, &step_outputs)?;
 
         // 3b) Build a transient StepSpec to reuse docker executor
-        let mut step_spec = StepSpec {
+        let step_spec = StepSpec {
             id: sid.clone(),
             kind: step_kind.to_string(),
             ref_: s.uses.clone(),
@@ -201,11 +215,6 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
             network: Some("bridge".into()),
             workdir: None,
         };
-
-        // also merge ctx.secrets into env if you want them all available
-        for (k,v) in &ctx.secrets {
-            step_spec.env.entry(k.clone()).or_insert(v.clone());
-        }
 
         // 3c) Run it (pass current state)
         let patch = match step_kind {
@@ -251,7 +260,7 @@ async fn run_composite(client: &HubClient, comp: &CompositeSpec, ctx: &DeployCtx
 }
 
 #[allow(dead_code)]
-async fn run_action_plan(client: &HubClient, plan: &ActionPlan, ctx: &DeployCtx) -> Result<()> {
+async fn run_action_plan(client: &HubClient, plan: &ActionPlan, _ctx: &DeployCtx) -> Result<()> {
     // Prefetch
     let cache_dir = dirs::cache_dir().unwrap_or(std::env::temp_dir()).join("starthub/oci");
     prefetch_all(client, plan, &cache_dir).await?;
@@ -260,11 +269,7 @@ async fn run_action_plan(client: &HubClient, plan: &ActionPlan, ctx: &DeployCtx)
     let mut state = serde_json::json!({});
 
     for s in &plan.steps {
-        let mut step = s.clone();
-        // merge CLI -e
-        for (k,v) in &ctx.secrets {
-            step.env.entry(k.clone()).or_insert(v.clone());
-        }
+        let step = s.clone();
         // run (pass current state into stdin)
         let patch = match step.kind.as_str() {
             "docker" => run_docker_step_collect_state(&step, plan.workdir.as_deref(), &state).await?,
@@ -757,62 +762,40 @@ async fn docker_pull(image: &str) -> Result<()> {
 
 /// Convert ActionMetadata from the API to a CompositeSpec for local execution
 fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<CompositeSpec> {
-    let steps = metadata.steps.as_ref()
-        .ok_or_else(|| anyhow!("Action metadata missing steps"))?;
-    
-    let mut comp_steps = Vec::new();
-    for step in steps {
-        comp_steps.push(CompStep {
-            id: step.id.clone(),
-            kind: step.kind.clone().unwrap_or_else(|| "docker".to_string()),
-            uses: step.uses.clone(),
-            with: step.with.as_ref()
-                .map(|w| w.iter().map(|(k, v)| (k.clone(), v.to_string())).collect())
-                .unwrap_or_default(),
-        });
-    }
+    // Since the current API doesn't provide steps/wires/export, create a simple single-step composite
+    // that can be executed locally
+    let comp_steps = vec![CompStep {
+        id: "run".to_string(),
+        kind: "docker".to_string(),
+        uses: "alpine:latest".to_string(), // Default to alpine for now
+        with: std::collections::HashMap::new(),
+    }];
 
     let inputs = metadata.inputs.as_ref()
         .map(|inputs| inputs.iter().map(|input| CompositeInput {
             name: input.name.clone(),
-            r#type: input.input_type.clone(),
-            description: input.description.clone().unwrap_or_default(),
+            r#type: input.action_port_type.clone(),
+            description: format!("Input: {}", input.action_port_direction),
         }).collect())
         .unwrap_or_default();
 
     let outputs = metadata.outputs.as_ref()
         .map(|outputs| outputs.iter().map(|output| CompositeOutput {
             name: output.name.clone(),
-            r#type: output.output_type.clone(),
-            description: output.description.clone().unwrap_or_default(),
-        }).collect())
-        .unwrap_or_default();
-
-    let wires = metadata.wires.as_ref()
-        .map(|wires| wires.iter().map(|wire| Wire {
-            from: WireFrom {
-                source: wire.from.source.clone(),
-                step: wire.from.step.clone(),
-                output: wire.from.output.clone(),
-                key: wire.from.key.clone(),
-                value: wire.from.value.clone(),
-            },
-            to: WireTo {
-                step: wire.to.step.clone(),
-                input: wire.to.input.clone(),
-            },
+            r#type: output.action_port_type.clone(),
+            description: format!("Output: {}", output.action_port_direction),
         }).collect())
         .unwrap_or_default();
 
     Ok(CompositeSpec {
-        name: metadata.name.clone().unwrap_or_else(|| format!("{}/{}", metadata.namespace, metadata.slug)),
-        version: metadata.version.clone(),
-        description: metadata.description.clone().unwrap_or_default(),
+        name: metadata.name.clone(),
+        version: metadata.version_number.clone(),
+        description: metadata.description.clone(),
         inputs,
         outputs,
         steps: comp_steps,
-        wires,
-        export: metadata.export.clone().unwrap_or_default(),
+        wires: vec![], // No wires defined in current API
+        export: serde_json::json!({}), // No export defined in current API
     })
 }
 
@@ -863,10 +846,8 @@ mod tests {
     fn create_test_deploy_ctx() -> DeployCtx {
         DeployCtx {
             action: "test-action".to_string(),
-            env: None,
             owner: None,
             repo: None,
-            secrets: vec![("test_input".to_string(), "test_value".to_string())],
         }
     }
 
@@ -1302,7 +1283,7 @@ mod tests {
         assert!(runner.ensure_auth().await.is_ok());
         assert!(runner.prepare(&mut ctx).await.is_ok());
         assert!(runner.put_files(&ctx).await.is_ok());
-        assert!(runner.set_secrets(&ctx).await.is_ok());
+
     }
 
     // ============================================================================

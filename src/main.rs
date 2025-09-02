@@ -44,15 +44,9 @@ enum Commands {
     Run {
         /// Package slug/name, e.g. "chirpstack"
         action: String,       
-                    /// Repeatable env secret: -e KEY=VALUE (will become a repo secret)
-            #[arg(short = 'e', long = "secret", value_name = "KEY=VALUE")]
-            secrets: Vec<String>,                    // <— collect multiple -e
-            /// Choose where to run the deployment
-            #[arg(long, value_enum, default_value_t = RunnerKind::Github)]
-            runner: RunnerKind,
-            /// Optional environment name
-            #[arg(long)]
-            env: Option<String>,
+        /// Choose where to run the deployment
+        #[arg(long, value_enum, default_value_t = RunnerKind::Github)]
+        runner: RunnerKind,
     },
     /// Show deployment status
     Status {
@@ -76,7 +70,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { path } => commands::cmd_init(path).await?,
         Commands::Publish { no_build } => publish::cmd_publish(no_build).await?,
-        Commands::Run { action, secrets, env, runner } => commands::cmd_run(action, secrets, env, runner).await?,
+        Commands::Run { action, runner } => commands::cmd_run(action, runner).await?,
         Commands::Status { id } => commands::cmd_status(id).await?,
     }
     Ok(())
@@ -138,30 +132,12 @@ mod tests {
 
     #[test]
     fn test_cli_run_command() {
-        let args = vec!["starthub", "run", "test-action", "--secret", "KEY1=value1", "--secret", "KEY2=value2"];
+        let args = vec!["starthub", "run", "test-action", "--runner", "github"];
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Run { action, secrets, env, runner } => {
+            Commands::Run { action, runner } => {
                 assert_eq!(action, "test-action");
-                assert_eq!(secrets, vec!["KEY1=value1", "KEY2=value2"]);
-                assert_eq!(env, None);
-                assert!(matches!(runner, RunnerKind::Github));
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_cli_run_command_with_env() {
-        let args = vec!["starthub", "run", "test-action", "--env", "production"];
-        let cli = Cli::try_parse_from(args).unwrap();
-        
-        match cli.command {
-            Commands::Run { action, secrets, env, runner } => {
-                assert_eq!(action, "test-action");
-                assert_eq!(secrets, Vec::<String>::new());
-                assert_eq!(env, Some("production".to_string()));
                 assert!(matches!(runner, RunnerKind::Github));
             }
             _ => panic!("Expected Run command"),
@@ -174,10 +150,8 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Run { action, secrets, env, runner } => {
+            Commands::Run { action, runner } => {
                 assert_eq!(action, "test-action");
-                assert_eq!(secrets, Vec::<String>::new());
-                assert_eq!(env, None);
                 assert!(matches!(runner, RunnerKind::Local));
             }
             _ => panic!("Expected Run command"),
@@ -234,8 +208,6 @@ mod tests {
         let publish_cmd = Commands::Publish { no_build: false };
         let run_cmd = Commands::Run { 
             action: "test".to_string(), 
-            secrets: vec![], 
-            env: None, 
             runner: RunnerKind::Github 
         };
         let status_cmd = Commands::Status { id: None };
