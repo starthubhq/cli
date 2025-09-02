@@ -7,7 +7,21 @@ use webbrowser;
 
 use crate::models::{ShManifest, ShKind, ShPort, ShLock, ShDistribution};
 use crate::templates;
-use crate::runners;
+
+// Global constants for local development server
+// Change these if you need to use a different port or host
+const LOCAL_SERVER_URL: &str = "http://127.0.0.1:3000";
+const LOCAL_SERVER_HOST: &str = "127.0.0.1:3000";
+
+use axum::{
+    routing::{get, post},
+    response::{Html, Json},
+    Router,
+};
+use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
+use tower_http::cors::CorsLayer;
+use serde_json::{Value, json};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -505,30 +519,149 @@ pub fn open_actions_page(owner: &str, repo: &str) {
     }
 }
 
-pub async fn cmd_run(action: String, runner: crate::RunnerKind) -> Result<()> {
-    let mut ctx = runners::DeployCtx {
-        action,
-        owner: None,
-        repo: None,
-    };
-    let r = crate::make_runner(runner);
-
-    // 1) ensure auth for selected runner; guide if missing
-    r.ensure_auth().await?;
-
-    // 2) do the runner-specific steps
-    r.prepare(&mut ctx).await?;
-    r.put_files(&ctx).await?;
-    r.dispatch(&ctx).await?;
-
-    if let (Some(owner), Some(repo)) = (ctx.owner.as_deref(), ctx.repo.as_deref()) {
-        sleep(Duration::from_secs(5)).await;
-        open_actions_page(owner, repo);
+pub async fn cmd_run(action: String, _runner: crate::RunnerKind) -> Result<()> {
+    // Start the server first
+    let _server_handle = tokio::spawn(start_server());
+    
+    // Wait a moment for server to start
+    sleep(Duration::from_millis(100)).await;
+    
+    // Parse the action argument to extract namespace, slug, and version
+    let (namespace, slug, version) = parse_action_arg(&action);
+    
+    // Open browser to the server with a proper route for the Vue app
+    let url = format!("{}/{}/{}/{}", LOCAL_SERVER_URL, namespace, slug, version);
+    match webbrowser::open(&url) {
+        Ok(_) => println!("↗ Opened browser to: {url}"),
+        Err(e) => println!("→ Browser: {url} (couldn't auto-open: {e})"),
     }
-
-    println!("✓ Dispatch complete for {}", r.name());
-
+    
+    println!("🚀 Server started at {}", LOCAL_SERVER_URL);
+    println!("📱 Serving UI for action: {} at route: {}", action, url);
+    println!("🔄 Press Ctrl+C to stop the server");
+    
+    // Wait for Ctrl+C signal
+    tokio::signal::ctrl_c().await?;
+    println!("\n🛑 Shutting down server...");
+    
+    // The server will automatically shut down when the task is dropped
     Ok(())
+}
+
+// Parse action argument in format "namespace/slug@version" or "namespace/slug"
+fn parse_action_arg(action: &str) -> (String, String, String) {
+    // Default values
+    let mut namespace = "tgirotto".to_string();
+    let mut slug = "test-action".to_string();
+    let mut version = "0.1.0".to_string();
+    
+    if action.contains('/') {
+        let parts: Vec<&str> = action.split('/').collect();
+        if parts.len() >= 2 {
+            namespace = parts[0].to_string();
+            let full_slug = parts[1].to_string();
+            
+            // Check if slug contains version (e.g., "test-action@0.1.0")
+            if full_slug.contains('@') {
+                let slug_parts: Vec<&str> = full_slug.split('@').collect();
+                if slug_parts.len() >= 2 {
+                    slug = slug_parts[0].to_string();
+                    version = slug_parts[1].to_string();
+                }
+            } else {
+                slug = full_slug;
+            }
+        }
+    } else if action.contains('@') {
+        // Handle case like "test-action@0.1.0"
+        let parts: Vec<&str> = action.split('@').collect();
+        if parts.len() >= 2 {
+            slug = parts[0].to_string();
+            version = parts[1].to_string();
+        }
+    } else {
+        // Just a slug, use defaults for namespace and version
+        slug = action.to_string();
+    }
+    
+    (namespace, slug, version)
+}
+
+async fn start_server() -> Result<()> {
+    // Create router with UI routes and API endpoints
+    let app = Router::new()
+        .route("/", get(serve_index))
+        .route("/api/status", get(get_status))
+        .route("/api/action", post(handle_action))
+        .route("/api/run", post(handle_run))
+        .nest_service("/assets", ServeDir::new("ui/dist/assets"))
+        .nest_service("/favicon.ico", ServeDir::new("ui/dist"))
+        .fallback(serve_spa) // SPA fallback for Vue Router
+        .layer(CorsLayer::permissive());
+
+    // Start server
+    let listener = TcpListener::bind(LOCAL_SERVER_HOST).await?;
+    println!("🌐 Server listening on {}", LOCAL_SERVER_URL);
+    
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn serve_index() -> Html<String> {
+    // Read and serve the index.html file
+    match fs::read_to_string("ui/dist/index.html") {
+        Ok(content) => Html(content),
+        Err(_) => Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+    }
+}
+
+// SPA fallback - serve index.html for all routes to support Vue Router
+async fn serve_spa() -> Html<String> {
+    match fs::read_to_string("ui/dist/index.html") {
+        Ok(content) => Html(content),
+        Err(_) => Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+    }
+}
+
+async fn get_status() -> Json<Value> {
+    Json(json!({
+        "status": "running",
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+async fn handle_action(Json(payload): Json<Value>) -> Json<Value> {
+    // Handle action requests from the UI
+    Json(json!({
+        "success": true,
+        "message": "Action received",
+        "data": payload
+    }))
+}
+
+async fn handle_run(Json(payload): Json<Value>) -> Json<Value> {
+    // Handle the /api/run endpoint that InputsComponent expects
+    println!("🚀 Received run request: {:?}", payload);
+    
+    // Extract action and inputs from payload
+    let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+    let default_inputs = json!({});
+    let inputs = payload.get("inputs").unwrap_or(&default_inputs);
+    
+    println!("📋 Action: {}", action);
+    println!("📥 Inputs: {:?}", inputs);
+    
+    // TODO: Actually execute the action here
+    // For now, just return success
+    let response = json!({
+        "success": true,
+        "message": "Action dispatched successfully",
+        "action": action,
+        "inputs": inputs,
+        "execution_id": format!("exec_{}", chrono::Utc::now().timestamp())
+    });
+    
+    Json(response)
 }
 
 pub async fn cmd_status(id: Option<String>) -> Result<()> {
