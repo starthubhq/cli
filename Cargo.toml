@@ -25,6 +25,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 webbrowser = "0.8"
+url = "2.4"
+
 async-trait = "0.1"
 flate2 = "1"
 tar = "0.4"
@@ -34,6 +36,8 @@ tempfile = "3"
 tokio = { version = "1", features = ["macros","rt-multi-thread","process","fs","time","signal"] }
 lazy_static = "1.4"
 futures-util = "0.3"
+aws-config = "1.8.6"
+aws-sdk-s3 = "1.91.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

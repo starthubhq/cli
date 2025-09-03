@@ -4,6 +4,9 @@ use std::process::Command as PCommand;
 use inquire::{Text, Select, Confirm};
 use tokio::time::{sleep, Duration};
 use webbrowser;
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::{config::Region, Client as S3Client};
+use aws_sdk_s3::primitives::ByteStream;
 
 use crate::models::{ShManifest, ShKind, ShPort, ShLock, ShDistribution};
 use crate::templates;
@@ -42,6 +45,12 @@ impl AppState {
         Self { ws_sender }
     }
 }
+
+
+
+
+
+
 
 // ============================================================================
 // HELPER FUNCTIONS FOR ACTION RESOLUTION
@@ -223,24 +232,164 @@ pub fn oci_from_manifest(m: &ShManifest) -> anyhow::Result<String> {
 }
 
 pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
-    let image_base = oci_from_manifest(m)?;           // uses m.image or maps GitHub → ghcr
-    let tag = format!("{}:{}", image_base, m.version);
+    let tag = format!("{}:{}", m.name, m.version);
 
     if !no_build {
         run("docker", &["build", "-t", &tag, "."])?;
     }
 
-    let digest = push_and_get_digest(&tag)?;         // parses digest from `docker push` output
+    // Save Docker image as tar file
+    let tar_filename = format!("{}-{}.tar", m.name, m.version);
+    run("docker", &["save", "-o", &tar_filename, &tag])?;
 
-    let primary = format!("oci://{}@{}", image_base, &digest);
+    // Compress the tar file
+    let zip_filename = format!("{}-{}.zip", m.name, m.version);
+    run("zip", &["-j", &zip_filename, &tar_filename])?;
+
+    // Extract slug from repository for better organization
+    // Use hardcoded namespace and manifest name for better organization
+    let namespace = "actions";
+    
+    // Upload to Supabase storage with new path structure: <namespace>/<name>/<version>
+    let storage_url = format!(
+        "{}/storage/v1/object/public/artifacts/{}/{}/{}/artifact.zip",
+        crate::config::STARTHUB_API_BASE, namespace, m.name, m.version
+    );
+    
+    // Upload to Supabase Storage using AWS SDK
+    println!("📤 Uploading to Supabase Storage using AWS SDK");
+    
+    // Get file size for verification
+    let metadata = fs::metadata(&zip_filename)?;
+    println!("📁 File size: {} bytes", metadata.len());
+    
+    // Use the artifacts bucket directly as specified in the URL
+    let bucket_name = "artifacts";
+    let object_key = format!("{}/{}/{}/artifact.zip", namespace, m.name, m.version);
+    
+    println!("🪣 Bucket: {}", bucket_name);
+    println!("🔑 Object key: {}", object_key);
+    
+    // Read the zip file
+    let zip_data = fs::read(&zip_filename)?;
+    
+    // Upload using AWS SDK to Supabase Storage S3 endpoint
+    println!("🔄 Uploading to Supabase Storage using AWS SDK...");
+
+    // Set AWS credentials environment variables for Supabase Storage S3 compatibility
+    std::env::set_var("AWS_ACCESS_KEY_ID", crate::config::S3_ACCESS_KEY);
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", crate::config::S3_SECRET_KEY);
+    
+    // Configure AWS SDK for Supabase Storage S3 compatibility
+    let region_provider = RegionProviderChain::first_try(Region::new(crate::config::SUPABASE_STORAGE_REGION));
+    let shared_config = aws_config::from_env()
+        .region(region_provider)
+        .load()
+        .await;
+    
+    // Create S3 client with custom endpoint
+    // Ensure the endpoint ends with a slash for proper URL construction
+    let endpoint_url = if crate::config::SUPABASE_STORAGE_S3_ENDPOINT.ends_with('/') {
+        crate::config::SUPABASE_STORAGE_S3_ENDPOINT.to_string()
+    } else {
+        format!("{}/", crate::config::SUPABASE_STORAGE_S3_ENDPOINT)
+    };
+    
+    let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+        .endpoint_url(&endpoint_url)
+        .force_path_style(true) // Use path-style for Supabase Storage S3 compatibility
+        .build();
+    
+    println!("🔗 AWS SDK S3 endpoint: {}", crate::config::SUPABASE_STORAGE_S3_ENDPOINT);
+    println!("🪣 Bucket: {}", bucket_name);
+    println!("🔑 Object key: {}", object_key);
+    
+    let s3_client = S3Client::from_conf(s3_config);
+
+    // Create ByteStream from the zip data
+    let body = ByteStream::from(zip_data.clone());
+
+    // Upload using AWS SDK
+    let put_object_output = s3_client
+        .put_object()
+        .bucket(bucket_name)
+        .key(&object_key)
+        .body(body)
+        .content_type("application/zip")
+        .send()
+        .await;
+
+    match put_object_output {
+        Ok(_) => {
+            println!("✅ Successfully uploaded to Supabase Storage using AWS SDK");
+        }
+        Err(e) => {
+            println!("❌ Upload failed: {:?}", e);
+            anyhow::bail!("Failed to upload to Supabase Storage");
+        }
+    }
+    
+    // Clean up temporary files
+    fs::remove_file(&tar_filename)?;
+    fs::remove_file(&zip_filename)?;
+
+    // Generate a digest for the uploaded artifact
+    let digest = format!("sha256:{}", m.name); // Simplified digest for now
+    
+    let primary = format!("{}@{}", storage_url, &digest);
     let lock = ShLock {
         name: m.name.clone(),
+        description: m.description.clone(),
         version: m.version.clone(),
         kind: m.kind.clone().expect("Kind should be present in manifest"),
+        manifest_version: m.manifest_version,
+        repository: m.repository.clone(),
+        image: m.image.clone(),
+        license: m.license.clone(),
+        inputs: m.inputs.clone(),
+        outputs: m.outputs.clone(),
         distribution: ShDistribution { primary, upstream: None },
         digest,
     };
+    
+    // Write lock file locally
     fs::write("starthub.lock.json", serde_json::to_string_pretty(&lock)?)?;
+    
+    // Upload lock file to the same Supabase Storage location
+    println!("📤 Uploading lock file to Supabase Storage...");
+    
+    let lock_data = serde_json::to_string_pretty(&lock)?.into_bytes();
+    let lock_object_key = format!("{}/{}/{}/lock.json", namespace, m.name, m.version);
+    
+    println!("🔑 Lock file object key: {}", lock_object_key);
+    
+    // Create ByteStream from the lock file data
+    let lock_body = ByteStream::from(lock_data);
+    
+    // Upload lock file using AWS SDK
+    let lock_put_object_output = s3_client
+        .put_object()
+        .bucket(bucket_name)
+        .key(&lock_object_key)
+        .body(lock_body)
+        .content_type("application/json")
+        .send()
+        .await;
+    
+    match lock_put_object_output {
+        Ok(_) => {
+            println!("✅ Successfully uploaded lock file to Supabase Storage");
+        }
+        Err(e) => {
+            println!("❌ Lock file upload failed: {:?}", e);
+            anyhow::bail!("Failed to upload lock file to Supabase Storage");
+        }
+    }
+    
+    println!("✅ Docker image and lock file published to Supabase storage");
+    println!("🔗 Storage URL: {}", storage_url);
+    println!("🔗 Lock file URL: {}/storage/v1/object/public/{}/{}", 
+        crate::config::STARTHUB_API_BASE, bucket_name, lock_object_key);
     Ok(())
 }
 
@@ -398,8 +547,15 @@ pub fn write_lock(m: &ShManifest, image_base: &str, digest: &str) -> anyhow::Res
     let primary = format!("oci://{}@{}", image_base, digest);
     let lock = ShLock {
         name: m.name.clone(),
+        description: m.description.clone(),
         version: m.version.clone(),
         kind: m.kind.clone().expect("Kind should be present in manifest"),
+        manifest_version: m.manifest_version,
+        repository: m.repository.clone(),
+        image: m.image.clone(),
+        license: m.license.clone(),
+        inputs: m.inputs.clone(),
+        outputs: m.outputs.clone(),
         distribution: ShDistribution { primary, upstream: None },
         digest: digest.to_string(),
     };
@@ -495,51 +651,17 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     // Repository
     let repo_default = match kind {
         ShKind::Wasm   => "github.com/starthubhq/http-get-wasm",
-        ShKind::Docker => "ghcr.io/starthubhq/http-get-wasm",
+        ShKind::Docker => "github.com/starthubhq/http-get-wasm",
         ShKind::Composition => "github.com/starthubhq/composite-action",
     };
     let repository = Text::new("Repository:")
-        .with_help_message(match kind {
-            ShKind::Wasm => "Git repo URL",
-            ShKind::Docker => "Git repo URL",
-            ShKind::Composition => "Git repo URL",
-        })
+        .with_help_message("Git repository URL (e.g., github.com/org/repo)")
         .with_default(repo_default)
         .prompt()?;
 
-    // After `repository` is collected in cmd_init:
-    let (image, _default_image) = if matches!(kind, ShKind::Composition) {
-        // Composition actions don't need an OCI image
-        ("".to_string(), "".to_string())
-    } else {
-        let default_image = if matches!(kind, ShKind::Docker) {
-            // already an OCI by default; user can edit
-            repo_default.to_string()
-        } else {
-            // WASM: map GitHub → GHCR by default for image
-            if repository.starts_with("https://github.com/") || repository.starts_with("github.com/") {
-                let trimmed = repository
-                    .trim_start_matches("https://")
-                    .trim_start_matches("http://")
-                    .trim_start_matches("github.com/");
-                let mut parts = trimmed.split('/');
-                if let (Some(org), Some(name)) = (parts.next(), parts.next()) {
-                    format!("ghcr.io/{}/{}", org, name.trim_end_matches(".git"))
-                } else {
-                    "ghcr.io/owner/package".to_string()
-                }
-            } else {
-                "ghcr.io/owner/package".to_string()
-            }
-        };
-
-        let image = Text::new("Image (OCI path, no tag):")
-            .with_help_message("e.g., ghcr.io/org/package")
-            .with_default(&default_image)
-            .prompt()?;
-        
-        (image, default_image)
-    };
+    // Since we're using Supabase Storage instead of OCI registries, 
+    // we don't need to prompt for OCI image paths anymore
+    let image: Option<String> = None;
 
     // License
     let license = Select::new("License:", vec![
@@ -558,7 +680,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         manifest_version: 1,
         kind: Some(kind.clone()), 
         repository: repository.clone(), 
-        image: if matches!(kind, ShKind::Composition) { None } else { Some(image.clone()) }, 
+        image: None, // No OCI image needed with Supabase Storage
         license: license.clone(), 
         inputs, 
         outputs,
@@ -1023,14 +1145,18 @@ mod tests {
         // Test GitHub URLs
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
             manifest_version: 1,
-            kind: ShKind::Docker,
+            kind: Some(ShKind::Docker),
             repository: "https://github.com/org/repo".to_string(),
-            image: "ghcr.io/org/repo".to_string(),
+            image: Some("ghcr.io/org/repo".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = oci_from_manifest(&manifest).unwrap();
         assert_eq!(result, "ghcr.io/org/repo");
@@ -1038,14 +1164,18 @@ mod tests {
         // Test GitHub URLs without scheme
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
-            kind: ShKind::Docker,
             manifest_version: 1,
+            kind: Some(ShKind::Docker),
             repository: "github.com/org/repo".to_string(),
-            image: "ghcr.io/org/repo".to_string(),
+            image: Some("ghcr.io/org/repo".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = oci_from_manifest(&manifest).unwrap();
         assert_eq!(result, "github.com/org/repo");
@@ -1053,14 +1183,18 @@ mod tests {
         // Test invalid repository
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
             manifest_version: 1,
-            kind: ShKind::Docker,
+            kind: Some(ShKind::Docker),
             repository: "invalid".to_string(),
-            image: "invalid".to_string(),
+            image: Some("invalid".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = oci_from_manifest(&manifest);
         assert!(result.is_err());
