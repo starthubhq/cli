@@ -15,12 +15,17 @@ pub struct ShManifest {
     pub inputs: Vec<ShPort>,
     pub outputs: Vec<ShPort>,
     // Composite action fields
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<ShActionStep>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub wires: Vec<ShWire>,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "is_default_export")]
     pub export: serde_json::Value,
+}
+
+// Helper function to determine if export field should be skipped during serialization
+fn is_default_export(export: &serde_json::Value) -> bool {
+    export == &serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -125,7 +130,7 @@ mod tests {
             kind: Some(ShKind::Wasm),
             manifest_version: 1,
             repository: "github.com/test/package".to_string(),
-            image: "ghcr.io/test/package".to_string(),
+            image: Some("ghcr.io/test/package".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
@@ -278,7 +283,7 @@ mod tests {
             kind: Some(ShKind::Docker),
             manifest_version: 1,
             repository: "github.com/test/package".to_string(),
-            image: "ghcr.io/test/package".to_string(),
+            image: Some("ghcr.io/test/package".to_string()),
             license: "MIT".to_string(),
             inputs: vec![
                 ShPort {
