@@ -542,6 +542,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     let manifest = ShManifest { 
         name: name.clone(), 
         version: version.clone(), 
+        manifest_version: 1,
         kind: kind.clone(), 
         repository: repository.clone(), 
         image: image.clone(), 
@@ -995,6 +996,7 @@ mod tests {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
             kind: ShKind::Docker,
+            manifest_version: 1,
             repository: "ghcr.io/org/image".to_string(),
             image: "ghcr.io/org/image".to_string(),
             license: "MIT".to_string(),
@@ -1008,6 +1010,7 @@ mod tests {
         let manifest = ShManifest {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
+            manifest_version: 1,
             kind: ShKind::Docker,
             repository: "https://github.com/org/repo".to_string(),
             image: "ghcr.io/org/repo".to_string(),
@@ -1023,6 +1026,7 @@ mod tests {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
             kind: ShKind::Docker,
+            manifest_version: 1,
             repository: "github.com/org/repo".to_string(),
             image: "ghcr.io/org/repo".to_string(),
             license: "MIT".to_string(),
@@ -1036,6 +1040,7 @@ mod tests {
         let manifest = ShManifest {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
+            manifest_version: 1,
             kind: ShKind::Docker,
             repository: "invalid".to_string(),
             image: "invalid".to_string(),
@@ -1091,6 +1096,7 @@ mod tests {
         let manifest = ShManifest {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
+            manifest_version: 1,
             kind: ShKind::Docker,
             repository: "https://github.com/org/repo".to_string(),
             image: "ghcr.io/org/repo".to_string(),
@@ -1106,6 +1112,7 @@ mod tests {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
             kind: ShKind::Wasm,
+            manifest_version: 1,
             repository: "https://github.com/org/repo".to_string(),
             image: "ghcr.io/org/repo".to_string(),
             license: "MIT".to_string(),
@@ -1119,6 +1126,7 @@ mod tests {
         let manifest = ShManifest {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
+            manifest_version: 1,
             kind: ShKind::Docker,
             repository: "https://gitlab.com/org/repo".to_string(),
             image: "ghcr.io/owner/package".to_string(),
@@ -1244,6 +1252,7 @@ mod tests {
             name: "test".to_string(),
             version: "1.0.0".to_string(),
             kind: ShKind::Docker,
+            manifest_version: 1,
             repository: "ghcr.io/org/image".to_string(),
             image: "ghcr.io/org/image".to_string(),
             license: "MIT".to_string(),
