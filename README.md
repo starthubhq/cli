@@ -1,25 +1,47 @@
+I'll rewrite the README file to reflect all the new functionality we've implemented today. Let me create a comprehensive and up-to-date README:
+
+
+[1 tool called]
+
+Now I'll rewrite the README to reflect all the new functionality we've implemented today:
+
+
+[1 tool called]
+
+I need to use the correct tool. Let me create a new README file:
+
+
+[1 tool called]
+
+Now I'll create a completely rewritten README that reflects all the new functionality:
+
+```markdown
 # Starthub CLI
 
-A powerful command-line tool for building, publishing, and deploying cloud-native applications and WebAssembly modules. Starthub CLI simplifies the process of creating, packaging, and distributing applications with support for both Docker containers and WebAssembly modules.
+A powerful command-line tool for building, publishing, and managing cloud-native applications and WebAssembly modules. Starthub CLI provides a unified workflow for creating, packaging, distributing, and tracking applications with support for both Docker containers and WebAssembly modules.
 
-## Features
+## 🚀 Features
 
 - **Multi-format Support**: Build and publish both Docker containers and WebAssembly (WASM) modules
 - **Smart Scaffolding**: Automatically generate project structure, Dockerfiles, and configuration files
-- **OCI Integration**: Seamless integration with OCI registries (Docker Hub, GitHub Container Registry, etc.)
-- **GitHub Actions**: Deploy applications directly to GitHub repositories with automated workflows
+- **Supabase Storage Integration**: Secure artifact storage with S3-compatible API
+- **Database Tracking**: Automatic action and version management with duplicate prevention
+- **Namespace Isolation**: User-specific namespaces for organized action management
+- **Port Management**: Automatic input/output port tracking from manifests
 - **Local Development**: Support for local deployment and testing
 - **Secret Management**: Secure handling of environment variables and secrets during deployment
 
-## Installation
+## 📦 Installation
 
 ### From Source (Recommended)
 
 ```bash
 git clone https://github.com/starthubhq/cli.git
 cd cli
-cargo build --release
+cargo +nightly build --release
 ```
+
+**Note**: The CLI requires Rust nightly toolchain due to `edition2024` features.
 
 The binary will be available at `target/release/starthub`.
 
@@ -29,35 +51,36 @@ The binary will be available at `target/release/starthub`.
 npm install -g @starthub/cli
 ```
 
-## Prerequisites
+## 🔧 Prerequisites
 
-- **Rust** (for building from source)
+- **Rust Nightly** (for building from source - `rustup default nightly`)
 - **Docker** (for Docker-based projects)
-- **Cargo** (for WASM projects)
+- **Cargo Component** (for WASM projects - `cargo install cargo-component`)
 - **GitHub account** (for GitHub Actions deployment)
 
-## Authentication
+## 🔐 Authentication
 
-The Starthub CLI requires authentication to access protected resources and publish actions. Before using commands like `publish` or `run`, you'll need to authenticate:
+The Starthub CLI requires authentication to access protected resources and publish actions. The authentication system provides secure, browser-based login with automatic namespace detection.
 
 ```bash
-# Login to Starthub backend
+# Login to Starthub backend (opens browser)
 starthub login
 
 # Check authentication status
-starthub auth
+starthub auth status
 
 # Logout when done
 starthub logout
 ```
 
 **Authentication Features:**
-- Secure credential storage in user config directory
-- Support for custom API endpoints
-- Automatic token validation
-- Clean logout functionality
+- **Browser-based login** for enhanced security
+- **Automatic namespace detection** based on username
+- **Secure credential storage** in user config directory
+- **Profile-based access control** with RLS policies
+- **Clean logout functionality**
 
-## Quick Start
+## �� Quick Start
 
 ### 1. Initialize a New Project
 
@@ -78,9 +101,16 @@ This interactive command will:
 # Build and publish (Docker or WASM)
 starthub publish
 
-# Skip build, only push existing image
+# Skip build, only push existing image/artifact
 starthub publish --no-build
 ```
+
+**What happens during publish:**
+- ✅ **Builds artifact** (Docker image or WASM module)
+- ✅ **Uploads to Supabase Storage** with S3-compatible API
+- ✅ **Creates lock file** with metadata and digest
+- ✅ **Updates database** with action and version information
+- ✅ **Prevents duplicates** - blocks if version already exists
 
 ### 3. Deploy to GitHub Actions
 
@@ -92,7 +122,7 @@ starthub run my-package \
   -e DATABASE_URL=your-db-url
 ```
 
-## Commands
+## 📋 Commands
 
 ### `starthub init`
 
@@ -106,7 +136,7 @@ starthub init [--path <PATH>]
 - `--path <PATH>`: Directory to initialize (default: current directory)
 
 **What it creates:**
-- `starthub.json` - Project manifest
+- `starthub.json` - Project manifest with inputs/outputs
 - `.gitignore` - Git ignore file
 - `.dockerignore` - Docker ignore file (Docker projects only)
 - `README.md` - Project documentation
@@ -114,28 +144,42 @@ starthub init [--path <PATH>]
 
 ### `starthub publish`
 
-Build and publish your application to an OCI registry.
+Build and publish your application to Supabase Storage with automatic database tracking.
 
 ```bash
 starthub publish [--no-build]
 ```
 
+**Options:**
+- `--no-build`: Skip building, only push existing image/artifact
+
+**For Docker projects:**
+- Builds Docker image using local Dockerfile
+- Uploads to Supabase Storage using AWS SDK
+- Generates `starthub.lock.json` with digest
+- Updates database with action metadata
+
+**For WASM projects:**
+- Builds WASM module using `cargo component build --release`
+- Creates ZIP archive of the WASM file
+- Uploads to Supabase Storage using AWS SDK
+- Generates `starthub.lock.json` with digest
+- Updates database with action metadata
+
 ### `starthub login`
 
-Authenticate with the Starthub backend to access protected resources.
+Authenticate with the Starthub backend using browser-based authentication.
 
 ```bash
-starthub login [--api-base <API_BASE>]
+starthub login
 ```
 
-**Options:**
-- `--api-base <API_BASE>`: Starthub API base URL (default: https://api.starthub.so)
-
 **What it does:**
-- Prompts for email and password
-- Authenticates against Starthub backend
-- Stores access token securely in user config directory
-- Supports custom API endpoints for different environments
+- Opens browser to `https://editor.starthub.so/cli-auth`
+- Generates authentication code via backend RPC
+- Validates code and stores credentials securely
+- Automatically detects user namespace
+- Stores profile ID and API configuration
 
 ### `starthub logout`
 
@@ -146,36 +190,23 @@ starthub logout
 ```
 
 **What it does:**
-- Removes stored access token
+- Removes stored access token and profile data
 - Clears authentication state
 - Safe to run even when not logged in
 
-### `starthub auth`
+### `starthub auth status`
 
-Check current authentication status and validate stored credentials.
+Check current authentication status and namespace information.
 
 ```bash
-starthub auth
+starthub auth status
 ```
 
 **What it shows:**
 - Current authentication status
 - API base URL being used
-- Token validation results
-- Helpful messages for unauthenticated users
-
-**Options:**
-- `--no-build`: Skip building, only push existing image/artifact
-
-**For Docker projects:**
-- Builds Docker image using local Dockerfile
-- Pushes to specified OCI registry
-- Generates `starthub.lock.json` with digest
-
-**For WASM projects:**
-- Builds WASM module using Cargo
-- Pushes to specified OCI registry using ORAS
-- Generates `starthub.lock.json` with digest
+- User namespace (derived from username)
+- Profile ID and validation results
 
 ### `starthub run`
 
@@ -206,15 +237,41 @@ starthub run my-app \
 starthub run my-app --runner local
 ```
 
-### `starthub status`
+## 🗄️ Database Integration
 
-Check deployment status (currently a placeholder for future implementation).
+The CLI automatically tracks all published actions in the database:
 
-```bash
-starthub status [--id <ID>]
+### **Action Management:**
+- **Automatic creation** of actions in the `actions` table
+- **Namespace isolation** using user-specific namespaces
+- **Duplicate prevention** - blocks publishing if version already exists
+
+### **Version Tracking:**
+- **Version history** stored in `action_versions` table
+- **Commit tracking** for version management
+- **Automatic linking** to parent actions
+
+### **Port Management:**
+- **Input/output ports** automatically extracted from manifests
+- **Type mapping** from ShType to database enum values
+- **Direction tracking** (INPUT/OUTPUT) for proper port classification
+
+### **Database Schema:**
+```sql
+-- Actions table
+actions (id, name, description, profile_id, rls_owner_id)
+
+-- Action versions
+action_versions (id, action_id, version_number, commit_sha, rls_owner_id)
+
+-- Action ports
+action_ports (id, action_port_type, action_port_direction, action_version_id, rls_owner_id)
+
+-- Owners (for namespace management)
+owners (id, owner_type, profile_id, organization_id, namespace)
 ```
 
-## Project Structure
+## 📁 Project Structure
 
 ### Manifest File (`starthub.json`)
 
@@ -222,12 +279,27 @@ starthub status [--id <ID>]
 {
   "name": "my-package",
   "version": "1.0.0",
+  "description": "My awesome package",
   "kind": "docker",
   "repository": "github.com/username/my-package",
   "image": "ghcr.io/username/my-package",
   "license": "MIT",
-  "inputs": [],
-  "outputs": []
+  "inputs": [
+    {
+      "name": "input1",
+      "description": "First input",
+      "type": "string",
+      "required": true
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "description": "Output result",
+      "type": "object",
+      "required": false
+    }
+  ]
 }
 ```
 
@@ -238,11 +310,12 @@ starthub status [--id <ID>]
 ### Lock File (`starthub.lock.json`)
 
 Generated after publishing, contains:
-- Package metadata
-- OCI digest
-- Distribution information
+- Package metadata and version information
+- Distribution URLs for Supabase Storage
+- Input/output port definitions
+- Digest information for artifact verification
 
-## Runners
+## 🏃 Runners
 
 ### GitHub Runner
 
@@ -257,17 +330,25 @@ Generated after publishing, contains:
 - Useful for testing and development
 - No external dependencies
 
-## Configuration
+## ⚙️ Configuration
 
 The CLI stores configuration in:
-- `~/.starthub/creds/` - Authentication credentials
-- `~/.starthub/` - General configuration
+- `~/.config/starthub/auth.json` - Authentication credentials and profile data
+- `~/.config/starthub/` - General configuration
 
-## Environment Variables
+**Configuration includes:**
+- API base URL
+- Profile ID for database operations
+- User namespace for action isolation
+- Authentication tokens
+
+## 🔧 Environment Variables
 
 - `STARTHUB_LOG`: Set logging level (default: `warn`, use `info` for verbose)
+- `AWS_ACCESS_KEY_ID`: Supabase Storage S3 access key
+- `AWS_SECRET_ACCESS_KEY`: Supabase Storage S3 secret key
 
-## Examples
+## 📚 Examples
 
 ### Docker Application
 
@@ -275,7 +356,7 @@ The CLI stores configuration in:
 # Initialize
 starthub init --path my-docker-app
 
-# Build and publish
+# Build and publish (automatically updates database)
 starthub publish
 
 # Deploy
@@ -288,29 +369,38 @@ starthub run my-docker-app --env production
 # Initialize
 starthub init --path my-wasm-module
 
-# Build and publish
+# Build and publish (automatically updates database)
 starthub publish
 
 # Deploy
 starthub run my-wasm-module --runner local
 ```
 
-## Development
+## 🛠️ Development
 
 ### Building
 
 ```bash
+# Switch to nightly toolchain
+rustup default nightly
+
+# Build the CLI
 cargo build
+
+# Run tests
 cargo test
 ```
 
-### Running Tests
+### Architecture
 
-```bash
-cargo test
-```
+The CLI is built with:
+- **Rust** for performance and safety
+- **Tokio** for async runtime
+- **AWS SDK** for S3-compatible storage
+- **Supabase** for backend services
+- **PostgreSQL** for action tracking
 
-## Contributing
+## 🤝 Contributing
 
 1. Fork the repository
 2. Create a feature branch
@@ -318,11 +408,11 @@ cargo test
 4. Add tests
 5. Submit a pull request
 
-## License
+## 📄 License
 
 See [LICENSE](LICENSE) for details.
 
-## Support
+## �� Support
 
 - [GitHub Issues](https://github.com/starthubhq/cli/issues)
 - [Documentation](https://github.com/starthubhq/cli)
