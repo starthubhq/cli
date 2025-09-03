@@ -8,8 +8,10 @@ pub async fn cmd_publish(no_build: bool) -> anyhow::Result<()> {
     let m: ShManifest = serde_json::from_str(&manifest_str)?;
 
     match m.kind {
-        crate::models::ShKind::Docker => cmd_publish_docker_inner(&m, no_build).await,
-        crate::models::ShKind::Wasm   => cmd_publish_wasm_inner(&m, no_build).await,
+        Some(crate::models::ShKind::Docker) => cmd_publish_docker_inner(&m, no_build).await,
+        Some(crate::models::ShKind::Wasm)   => cmd_publish_wasm_inner(&m, no_build).await,
+        Some(crate::models::ShKind::Composition) => anyhow::bail!("Composition actions cannot be published directly"),
+        None => anyhow::bail!("No kind specified in manifest"),
     }
 }
 
@@ -22,13 +24,18 @@ mod tests {
     fn create_test_manifest(kind: ShKind) -> ShManifest {
         ShManifest {
             name: "test-package".to_string(),
+            description: "Test package".to_string(),
             version: "1.0.0".to_string(),
-            kind,
+            kind: Some(kind),
+            manifest_version: 1,
             repository: "github.com/test/package".to_string(),
             image: "ghcr.io/test/package".to_string(),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         }
     }
 
@@ -111,7 +118,7 @@ mod tests {
         
         assert_eq!(manifest.name, deserialized.name);
         assert_eq!(manifest.version, deserialized.version);
-        assert!(matches!(deserialized.kind, ShKind::Docker));
+        assert!(matches!(deserialized.kind, Some(ShKind::Docker)));
         assert_eq!(manifest.repository, deserialized.repository);
         assert_eq!(manifest.image, deserialized.image);
         assert_eq!(manifest.license, deserialized.license);
@@ -125,6 +132,8 @@ mod tests {
                 name: "input1".to_string(),
                 description: "Test input".to_string(),
                 ty: ShType::String,
+                required: true,
+                default: None,
             }
         ];
         manifest.outputs = vec![
@@ -132,6 +141,8 @@ mod tests {
                 name: "output1".to_string(),
                 description: "Test output".to_string(),
                 ty: ShType::Boolean,
+                required: true,
+                default: None,
             }
         ];
         

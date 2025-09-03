@@ -47,18 +47,18 @@ impl AppState {
 // HELPER FUNCTIONS FOR ACTION RESOLUTION
 // ============================================================================
 
-/// Convert starthub_api::ActionStep to local::ActionStep
-fn convert_action_step(step: &crate::starthub_api::ActionStep) -> crate::runners::local::ActionStep {
+/// Convert ShActionStep to local::ActionStep (no conversion needed since we're using ShActionStep directly)
+fn convert_action_step(step: &crate::models::ShActionStep) -> crate::runners::local::ActionStep {
     crate::runners::local::ActionStep {
         id: step.id.clone(),
-        kind: step.kind.as_deref().unwrap_or("docker").to_string(),
+        kind: step.kind.clone(),
         uses: step.uses.clone(),
-        with: step.with.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
+        with: step.with.clone(),
     }
 }
 
-/// Convert starthub_api::ActionWire to local::Wire
-fn convert_action_wire(wire: &crate::starthub_api::ActionWire) -> crate::runners::local::Wire {
+/// Convert ShWire to local::Wire
+fn convert_action_wire(wire: &crate::models::ShWire) -> crate::runners::local::Wire {
     crate::runners::local::Wire {
         from: crate::runners::local::WireFrom {
             source: wire.from.source.clone(),
@@ -76,10 +76,10 @@ fn convert_action_wire(wire: &crate::starthub_api::ActionWire) -> crate::runners
 
 /// Recursively fetch all action manifests for a composite action
 async fn fetch_all_action_manifests(
-    client: &crate::starthub_api::Client, 
+    client: &crate::starthub_api::Client,
     action_ref: &str,
     visited: &mut std::collections::HashSet<String>
-) -> Result<Vec<crate::starthub_api::ActionManifest>> {
+) -> Result<Vec<crate::models::ShManifest>> {
     if visited.contains(action_ref) {
         return Ok(vec![]); // Already fetched this action
     }
@@ -236,7 +236,7 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     let lock = ShLock {
         name: m.name.clone(),
         version: m.version.clone(),
-        kind: m.kind.clone(),
+        kind: m.kind.clone().expect("Kind should be present in manifest"),
         distribution: ShDistribution { primary, upstream: None },
         digest,
     };
@@ -366,9 +366,11 @@ pub fn derive_image_base(m: &ShManifest, cli_image: Option<String>) -> anyhow::R
         if !i.is_empty() { return Ok(i.trim_end_matches('/').to_string()); }
     }
 
-    let img = m.image.trim();
-    if !img.is_empty() && !img.starts_with("http") && img.split('/').count() >= 2 {
-        return Ok(img.trim_end_matches('/').to_string());
+    if let Some(img) = &m.image {
+        let img = img.trim();
+        if !img.is_empty() && !img.starts_with("http") && img.split('/').count() >= 2 {
+            return Ok(img.trim_end_matches('/').to_string());
+        }
     }
 
     if let Some(mapped) = github_to_ghcr_path(&m.repository) {
@@ -397,7 +399,7 @@ pub fn write_lock(m: &ShManifest, image_base: &str, digest: &str) -> anyhow::Res
     let lock = ShLock {
         name: m.name.clone(),
         version: m.version.clone(),
-        kind: m.kind.clone(),
+        kind: m.kind.clone().expect("Kind should be present in manifest"),
         distribution: ShDistribution { primary, upstream: None },
         digest: digest.to_string(),
     };
@@ -482,10 +484,11 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         .prompt()?;
 
     // Kind
-    let kind_str = Select::new("Kind:", vec!["wasm", "docker"]).prompt()?;
+    let kind_str = Select::new("Kind:", vec!["wasm", "docker", "composition"]).prompt()?;
     let kind = match kind_str {
         "wasm" => ShKind::Wasm,
         "docker" => ShKind::Docker,
+        "composition" => ShKind::Composition,
         _ => unreachable!(),
     };
 
@@ -493,41 +496,50 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     let repo_default = match kind {
         ShKind::Wasm   => "github.com/starthubhq/http-get-wasm",
         ShKind::Docker => "ghcr.io/starthubhq/http-get-wasm",
+        ShKind::Composition => "github.com/starthubhq/composite-action",
     };
     let repository = Text::new("Repository:")
         .with_help_message(match kind {
             ShKind::Wasm => "Git repo URL",
             ShKind::Docker => "Git repo URL",
+            ShKind::Composition => "Git repo URL",
         })
         .with_default(repo_default)
         .prompt()?;
 
     // After `repository` is collected in cmd_init:
-    let default_image = if matches!(kind, ShKind::Docker) {
-        // already an OCI by default; user can edit
-        repo_default.to_string()
+    let (image, _default_image) = if matches!(kind, ShKind::Composition) {
+        // Composition actions don't need an OCI image
+        ("".to_string(), "".to_string())
     } else {
-        // WASM: map GitHub → GHCR by default for image
-        if repository.starts_with("https://github.com/") || repository.starts_with("github.com/") {
-            let trimmed = repository
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .trim_start_matches("github.com/");
-            let mut parts = trimmed.split('/');
-            if let (Some(org), Some(name)) = (parts.next(), parts.next()) {
-                format!("ghcr.io/{}/{}", org, name.trim_end_matches(".git"))
+        let default_image = if matches!(kind, ShKind::Docker) {
+            // already an OCI by default; user can edit
+            repo_default.to_string()
+        } else {
+            // WASM: map GitHub → GHCR by default for image
+            if repository.starts_with("https://github.com/") || repository.starts_with("github.com/") {
+                let trimmed = repository
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .trim_start_matches("github.com/");
+                let mut parts = trimmed.split('/');
+                if let (Some(org), Some(name)) = (parts.next(), parts.next()) {
+                    format!("ghcr.io/{}/{}", org, name.trim_end_matches(".git"))
+                } else {
+                    "ghcr.io/owner/package".to_string()
+                }
             } else {
                 "ghcr.io/owner/package".to_string()
             }
-        } else {
-            "ghcr.io/owner/package".to_string()
-        }
-    };
+        };
 
-    let image = Text::new("Image (OCI path, no tag):")
-        .with_help_message("e.g., ghcr.io/org/package")
-        .with_default(&default_image)
-        .prompt()?;
+        let image = Text::new("Image (OCI path, no tag):")
+            .with_help_message("e.g., ghcr.io/org/package")
+            .with_default(&default_image)
+            .prompt()?;
+        
+        (image, default_image)
+    };
 
     // License
     let license = Select::new("License:", vec![
@@ -541,14 +553,18 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     // Manifest
     let manifest = ShManifest { 
         name: name.clone(), 
+        description: "Generated manifest".to_string(),
         version: version.clone(), 
         manifest_version: 1,
-        kind: kind.clone(), 
+        kind: Some(kind.clone()), 
         repository: repository.clone(), 
-        image: image.clone(), 
+        image: if matches!(kind, ShKind::Composition) { None } else { Some(image.clone()) }, 
         license: license.clone(), 
         inputs, 
-        outputs 
+        outputs,
+        steps: vec![],
+        wires: vec![],
+        export: serde_json::json!({}),
     };
     let json = serde_json::to_string_pretty(&manifest)?;
 
@@ -604,13 +620,7 @@ pub async fn cmd_login(runner: crate::RunnerKind) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn open_actions_page(owner: &str, repo: &str) {
-    let url = format!("https://github.com/{owner}/{repo}/actions");
-    match webbrowser::open(&url) {
-        Ok(_) => println!("↗ Opened GitHub Actions: {url}"),
-        Err(e) => println!("→ GitHub Actions: {url} (couldn't auto-open: {e})"),
-    }
-}
+
 
 pub async fn cmd_run(action: String, _runner: crate::RunnerKind) -> Result<()> {
     // Start the server first
@@ -757,7 +767,7 @@ async fn handle_run(
     let client = crate::starthub_api::Client::new(base, Some(crate::config::STARTHUB_API_KEY.to_string()));
     
     match client.fetch_action_metadata(&action).await {
-        Ok(metadata) => {
+        Ok(_metadata) => {
             println!("✓ Fetched action metadata for {}", action);
             
             // Try to download the starthub.json file and recursively fetch all action manifests
@@ -994,14 +1004,18 @@ mod tests {
         // Test OCI paths
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
-            kind: ShKind::Docker,
+            kind: Some(ShKind::Docker),
             manifest_version: 1,
             repository: "ghcr.io/org/image".to_string(),
-            image: "ghcr.io/org/image".to_string(),
+            image: Some("ghcr.io/org/image".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = oci_from_manifest(&manifest).unwrap();
         assert_eq!(result, "ghcr.io/org/image");
