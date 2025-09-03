@@ -577,8 +577,23 @@ pub fn write_lock(m: &ShManifest, image_base: &str, digest: &str) -> anyhow::Res
 }
 
 pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
-    let image_base = derive_image_base(m, None)?; // same resolver you use for docker/wasm
-    let tag = format!("{}:v{}", image_base, m.version);
+    // WASM PUBLISHING FUNCTION - This is the WASM-specific implementation
+    // Get the user's namespace from their profile
+    let namespace = match get_user_namespace().await {
+        Ok(Some(ns)) => ns,
+        Ok(None) => {
+            println!("⚠️  No authentication found. Using default namespace 'actions'");
+            println!("💡 Use 'starthub login' to authenticate and use your personal namespace");
+            "actions".to_string()
+        }
+        Err(e) => {
+            println!("⚠️  Failed to get user namespace: {}. Using default namespace 'actions'", e);
+            println!("💡 Use 'starthub login' to authenticate and use your personal namespace");
+            "actions".to_string()
+        }
+    };
+    
+    println!("🏷️  Using namespace: {}", namespace);
 
     if !no_build {
         // Try cargo-component (component model) first; fall back to plain WASI target.
@@ -596,12 +611,144 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
     let wasm_path = find_wasm_artifact(&m.name)
         .ok_or_else(|| anyhow::anyhow!("WASM build artifact not found; looked in `target/**/release/**/*.wasm`"))?;
 
-    // Push to OCI registry as an artifact
-    let digest = push_wasm_and_get_digest(&tag, &wasm_path)?;
+    // Create a zip file containing the WASM artifact
+    let zip_filename = format!("{}-{}.zip", m.name, m.version);
+    run("zip", &["-j", &zip_filename, &wasm_path])?;
+    
+    // Upload to Supabase Storage using AWS SDK
+    println!("📤 Uploading to Supabase Storage using AWS SDK");
+    
+    // Get file size for verification
+    let metadata = fs::metadata(&zip_filename)?;
+    println!("📁 File size: {} bytes", metadata.len());
+    
+    // Use the same bucket as Docker publishing since it's working
+    let bucket_name = "artifacts";
+    let object_key = format!("{}/{}/{}/artifact.zip", namespace, m.name, m.version);
+    
+    println!("🪣 Bucket: {}", bucket_name);
+    println!("🔑 Object key: {}", object_key);
+    
+    // Read the zip file
+    let zip_data = fs::read(&zip_filename)?;
+    
+    // Upload using AWS SDK to Supabase Storage S3 endpoint
+    println!("🔄 Uploading to Supabase Storage using AWS SDK...");
 
-    // Lockfile
-    write_lock(m, &image_base, &digest)?;
-    println!("✓ Pushed {tag}\n✓ Wrote starthub.lock.json");
+    // Set AWS credentials environment variables for Supabase Storage S3 compatibility
+    std::env::set_var("AWS_ACCESS_KEY_ID", crate::config::S3_ACCESS_KEY);
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", crate::config::S3_SECRET_KEY);
+
+    // Configure AWS SDK for Supabase Storage S3 compatibility
+    let region_provider = RegionProviderChain::first_try(Region::new(crate::config::SUPABASE_STORAGE_REGION));
+    let shared_config = aws_config::from_env()
+        .region(region_provider)
+        .load()
+        .await;
+    
+    // Create S3 client with custom endpoint
+    // Ensure the endpoint ends with a slash for proper URL construction
+    let endpoint_url = if crate::config::SUPABASE_STORAGE_S3_ENDPOINT.ends_with('/') {
+        crate::config::SUPABASE_STORAGE_S3_ENDPOINT.to_string()
+    } else {
+        format!("{}/", crate::config::SUPABASE_STORAGE_S3_ENDPOINT)
+    };
+    
+    let s3_config = aws_sdk_s3::config::Builder::from(&shared_config)
+        .endpoint_url(&endpoint_url)
+        .force_path_style(true) // Use path-style for Supabase Storage S3 compatibility
+        .build();
+    
+    println!("🔗 AWS SDK S3 endpoint: {}", crate::config::SUPABASE_STORAGE_S3_ENDPOINT);
+    println!("🪣 Bucket: {}", bucket_name);
+    println!("🔑 Object key: {}", object_key);
+    
+    let s3_client = S3Client::from_conf(s3_config);
+
+    // Create ByteStream from the zip file data
+    let body = ByteStream::from(zip_data);
+
+    // Upload the zip file
+    let put_object_output = s3_client
+        .put_object()
+        .bucket(bucket_name)
+        .key(&object_key)
+        .body(body)
+        .content_type("application/zip")
+        .send()
+        .await;
+
+    match put_object_output {
+        Ok(_) => {
+            println!("✅ Successfully uploaded WASM artifact to Supabase Storage");
+        }
+        Err(e) => {
+            println!("❌ Upload failed: {:?}", e);
+            anyhow::bail!("Failed to upload WASM artifact to Supabase Storage");
+        }
+    }
+
+    // Create lock file with the same structure as Docker
+    let digest = format!("sha256:{}", m.name); // Simplified digest for now
+    
+    let primary = format!("{}@{}", endpoint_url, &digest);
+    let lock = ShLock {
+        name: m.name.clone(),
+        description: m.description.clone(),
+        version: m.version.clone(),
+        kind: m.kind.clone().expect("Kind should be present in manifest"),
+        manifest_version: m.manifest_version,
+        repository: m.repository.clone(),
+        image: m.image.clone(),
+        license: m.license.clone(),
+        inputs: m.inputs.clone(),
+        outputs: m.outputs.clone(),
+        distribution: ShDistribution { primary, upstream: None },
+        digest,
+    };
+    
+    // Write lock file locally
+    fs::write("starthub.lock.json", serde_json::to_string_pretty(&lock)?)?;
+    
+    // Upload lock file to the same Supabase Storage location
+    println!("📤 Uploading lock file to Supabase Storage...");
+    
+    let lock_data = serde_json::to_string_pretty(&lock)?.into_bytes();
+    let lock_object_key = format!("{}/{}/{}/lock.json", namespace, m.name, m.version);
+    
+    println!("🔑 Lock file object key: {}", lock_object_key);
+    
+    // Create ByteStream from the lock file data
+    let lock_body = ByteStream::from(lock_data);
+    
+    // Upload lock file using AWS SDK
+    let lock_put_object_output = s3_client
+        .put_object()
+        .bucket(bucket_name)
+        .key(&lock_object_key)
+        .body(lock_body)
+        .content_type("application/json")
+        .send()
+        .await;
+    
+    match lock_put_object_output {
+        Ok(_) => {
+            println!("✅ Successfully uploaded lock file to Supabase Storage");
+        }
+        Err(e) => {
+            println!("❌ Lock file upload failed: {:?}", e);
+            anyhow::bail!("Failed to upload lock file to Supabase Storage");
+        }
+    }
+    
+    println!("✅ WASM artifact and lock file published to Supabase storage");
+    println!("🔗 Storage URL: {}", endpoint_url);
+    println!("🔗 Lock file URL: {}/storage/v1/object/public/{}/{}",
+        crate::config::STARTHUB_API_BASE, bucket_name, lock_object_key);
+    
+    // Clean up local files
+    fs::remove_file(&zip_filename)?;
+    
     Ok(())
 }
 

@@ -14,5 +14,6 @@ pub const S3_ACCESS_KEY: &str = "68ce4ca3c9283491a4242363d928ea38";
 pub const S3_SECRET_KEY: &str = "d47477e11d369cb3d2d3da2ff24de064a105276cc670e6bbc565f3ba283a902c";
 
 // Supabase Storage S3 endpoint from your project dashboard
+// For S3 compatibility, we need to use the /storage/v1/s3 path
 pub const SUPABASE_STORAGE_S3_ENDPOINT: &str = "https://smltnjrrzkmazvbrqbkq.storage.supabase.co/storage/v1/s3";
 pub const SUPABASE_STORAGE_REGION: &str = "eu-central-1";
