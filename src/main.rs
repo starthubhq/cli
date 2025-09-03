@@ -53,6 +53,15 @@ enum Commands {
         #[arg(long)]
         id: Option<String>,
     },
+    /// Authenticate with Starthub backend
+    Login {
+        /// Starthub API base URL
+        #[arg(long, default_value = "https://api.starthub.so")]
+        api_base: String,
+    },
+    /// Logout from Starthub backend
+    Logout,
+    Auth
 }
 
 #[tokio::main]
@@ -72,6 +81,9 @@ async fn main() -> Result<()> {
         Commands::Publish { no_build } => publish::cmd_publish(no_build).await?,
         Commands::Run { action, runner } => commands::cmd_run(action, runner).await?,
         Commands::Status { id } => commands::cmd_status(id).await?,
+        Commands::Login { api_base } => commands::cmd_login_starthub(api_base).await?,
+        Commands::Logout => commands::cmd_logout_starthub().await?,
+        Commands::Auth => commands::cmd_auth_status().await?,
     }
     Ok(())
 }

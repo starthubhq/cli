@@ -36,6 +36,27 @@ npm install -g @starthub/cli
 - **Cargo** (for WASM projects)
 - **GitHub account** (for GitHub Actions deployment)
 
+## Authentication
+
+The Starthub CLI requires authentication to access protected resources and publish actions. Before using commands like `publish` or `run`, you'll need to authenticate:
+
+```bash
+# Login to Starthub backend
+starthub login
+
+# Check authentication status
+starthub auth
+
+# Logout when done
+starthub logout
+```
+
+**Authentication Features:**
+- Secure credential storage in user config directory
+- Support for custom API endpoints
+- Automatic token validation
+- Clean logout functionality
+
 ## Quick Start
 
 ### 1. Initialize a New Project
@@ -98,6 +119,50 @@ Build and publish your application to an OCI registry.
 ```bash
 starthub publish [--no-build]
 ```
+
+### `starthub login`
+
+Authenticate with the Starthub backend to access protected resources.
+
+```bash
+starthub login [--api-base <API_BASE>]
+```
+
+**Options:**
+- `--api-base <API_BASE>`: Starthub API base URL (default: https://api.starthub.so)
+
+**What it does:**
+- Prompts for email and password
+- Authenticates against Starthub backend
+- Stores access token securely in user config directory
+- Supports custom API endpoints for different environments
+
+### `starthub logout`
+
+Logout and remove stored authentication credentials.
+
+```bash
+starthub logout
+```
+
+**What it does:**
+- Removes stored access token
+- Clears authentication state
+- Safe to run even when not logged in
+
+### `starthub auth`
+
+Check current authentication status and validate stored credentials.
+
+```bash
+starthub auth
+```
+
+**What it shows:**
+- Current authentication status
+- API base URL being used
+- Token validation results
+- Helpful messages for unauthenticated users
 
 **Options:**
 - `--no-build`: Skip building, only push existing image/artifact

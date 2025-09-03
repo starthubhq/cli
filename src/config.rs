@@ -5,9 +5,9 @@ pub const GH_APP_SLUG: &str = "starthub-cli";   // App slug
 
 // StarHub API configuration
 pub const STARTHUB_API_BASE: &str = "https://api.starthub.so";
-// Note: This should be a service role key (JWT), not a publishable key
-// Get this from your Supabase dashboard: Settings > API > service_role key
-pub const STARTHUB_API_KEY: &str = "sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe";
+// Note: This should be the anon key (publishable key) for PostgREST queries
+// Get this from your Supabase dashboard: Settings > API > anon key
+pub const SUPABASE_ANON_KEY: &str = "sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe";
 
 // S3 Storage credentials for Supabase Storage S3 compatibility
 pub const S3_ACCESS_KEY: &str = "68ce4ca3c9283491a4242363d928ea38";
