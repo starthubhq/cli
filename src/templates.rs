@@ -167,7 +167,8 @@ fn main() {
 pub fn readme_tpl(name: &str, kind: &crate::models::ShKind, repo: &str, license: &str) -> String {
     let kind_str = match kind { 
         crate::models::ShKind::Docker => "docker", 
-        crate::models::ShKind::Wasm => "wasm" 
+        crate::models::ShKind::Wasm => "wasm",
+        crate::models::ShKind::Composition => "composite"
     };
     format!(r#"# {name}
 

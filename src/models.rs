@@ -4,21 +4,36 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShManifest {
     pub name: String,
+    pub description: String,
     pub version: String,
-    pub kind: ShKind,
+    pub kind: Option<ShKind>,
     pub manifest_version: u32,
     pub repository: String,
-    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
     pub license: String,
     pub inputs: Vec<ShPort>,
     pub outputs: Vec<ShPort>,
+    // Composite action fields
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<ShActionStep>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub wires: Vec<ShWire>,
+    #[serde(skip_serializing_if = "is_default_export")]
+    pub export: serde_json::Value,
+}
+
+// Helper function to determine if export field should be skipped during serialization
+fn is_default_export(export: &serde_json::Value) -> bool {
+    export == &serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum ShKind { 
     Wasm, 
-    Docker 
+    Docker,
+    Composition
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +42,14 @@ pub struct ShPort {
     pub description: String,
     #[serde(rename = "type")]
     pub ty: ShType,
+    #[serde(default = "default_required")]
+    pub required: bool,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+}
+
+fn default_required() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +79,43 @@ pub enum ShType {
     Number,
 }
 
+// Composite action structures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShActionStep {
+    pub id: String,
+    #[serde(default)]
+    pub kind: Option<String>, // "docker" (default) or "wasm"
+    pub uses: String,
+    #[serde(default)]
+    pub with: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShWireFrom {
+    #[serde(default)]
+    pub source: Option<String>, // "inputs"
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>, // literal
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShWireTo {
+    pub step: String,
+    pub input: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShWire {
+    pub from: ShWireFrom,
+    pub to: ShWireTo,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,13 +125,18 @@ mod tests {
     fn test_sh_manifest_serialization() {
         let manifest = ShManifest {
             name: "test-package".to_string(),
+            description: "Test package".to_string(),
             version: "1.0.0".to_string(),
-            kind: ShKind::Wasm,
+            kind: Some(ShKind::Wasm),
+            manifest_version: 1,
             repository: "github.com/test/package".to_string(),
-            image: "ghcr.io/test/package".to_string(),
+            image: Some("ghcr.io/test/package".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
 
         let json = serde_json::to_string(&manifest).unwrap();
@@ -79,7 +144,7 @@ mod tests {
 
         assert_eq!(manifest.name, deserialized.name);
         assert_eq!(manifest.version, deserialized.version);
-        assert!(matches!(deserialized.kind, ShKind::Wasm));
+        assert!(matches!(deserialized.kind, Some(ShKind::Wasm)));
         assert_eq!(manifest.repository, deserialized.repository);
         assert_eq!(manifest.image, deserialized.image);
         assert_eq!(manifest.license, deserialized.license);
@@ -109,6 +174,8 @@ mod tests {
             name: "input_param".to_string(),
             description: "Test input parameter".to_string(),
             ty: ShType::String,
+            required: true,
+            default: None,
         };
 
         let json = serde_json::to_string(&port).unwrap();
@@ -117,6 +184,25 @@ mod tests {
         assert_eq!(port.name, deserialized.name);
         assert_eq!(port.description, deserialized.description);
         assert!(matches!(deserialized.ty, ShType::String));
+        assert_eq!(port.required, deserialized.required);
+        assert_eq!(port.default, deserialized.default);
+    }
+
+    #[test]
+    fn test_sh_port_with_default_values() {
+        let port = ShPort {
+            name: "optional_param".to_string(),
+            description: "Optional parameter with default".to_string(),
+            ty: ShType::String,
+            required: false,
+            default: Some(serde_json::json!("default_value")),
+        };
+
+        let json = serde_json::to_string(&port).unwrap();
+        let deserialized: ShPort = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(port.required, deserialized.required);
+        assert_eq!(port.default, deserialized.default);
     }
 
     #[test]
@@ -192,22 +278,27 @@ mod tests {
     fn test_manifest_with_inputs_and_outputs() {
         let manifest = ShManifest {
             name: "test-package".to_string(),
+            description: "Test package with inputs and outputs".to_string(),
             version: "1.0.0".to_string(),
-            kind: ShKind::Docker,
+            kind: Some(ShKind::Docker),
             manifest_version: 1,
             repository: "github.com/test/package".to_string(),
-            image: "ghcr.io/test/package".to_string(),
+            image: Some("ghcr.io/test/package".to_string()),
             license: "MIT".to_string(),
             inputs: vec![
                 ShPort {
                     name: "input1".to_string(),
                     description: "First input".to_string(),
                     ty: ShType::String,
+                    required: true,
+                    default: None,
                 },
                 ShPort {
                     name: "input2".to_string(),
                     description: "Second input".to_string(),
                     ty: ShType::Integer,
+                    required: false,
+                    default: Some(serde_json::json!(42)),
                 },
             ],
             outputs: vec![
@@ -215,8 +306,13 @@ mod tests {
                     name: "output1".to_string(),
                     description: "First output".to_string(),
                     ty: ShType::Boolean,
+                    required: true,
+                    default: None,
                 },
             ],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
 
         let json = serde_json::to_string(&manifest).unwrap();

@@ -11,6 +11,7 @@ use which::which;
 
 use super::{Runner, DeployCtx};
 use crate::starthub_api::{Client as HubClient, ActionMetadata};
+use crate::models::{ShManifest, ShPort, ShType, ShActionStep};
 use crate::config::{STARTHUB_API_BASE, STARTHUB_API_KEY};
 use crate::runners::models::{ActionPlan, StepSpec, MountSpec};
 
@@ -24,84 +25,15 @@ const ST_MARKER: &str = "::starthub:state::";
 // DATA STRUCTURES
 // ============================================================================
 
-#[derive(Deserialize, Debug, Clone)]
-struct ActionInput { 
-    #[allow(dead_code)]
-    name: String, 
-    #[serde(default)] 
-    #[allow(dead_code)]
-    r#type: String, 
-    #[serde(default)] 
-    #[allow(dead_code)]
-    description: String 
-}
 
-#[derive(Deserialize, Debug, Clone)]
-struct ActionOutput { 
-    #[allow(dead_code)]
-    name: String, 
-    #[serde(default)] 
-    #[allow(dead_code)]
-    r#type: String, 
-    #[serde(default)] 
-    #[allow(dead_code)]
-    description: String 
-}
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct ActionStep {
-    pub id: String,
-    #[serde(default)] 
-    pub kind: String,            // "docker" (default) or "wasm"
-    pub uses: String,
-    #[serde(default)]
-    pub with: HashMap<String, String>
-}
+// Use ShActionStep directly instead of duplicating
+pub use crate::models::ShActionStep as ActionStep;
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct WireFrom {
-    #[serde(default)] 
-    pub source: Option<String>, // "inputs"
-    #[serde(default)] 
-    pub step: Option<String>,
-    #[serde(default)] 
-    pub output: Option<String>,
-    #[serde(default)] 
-    pub key: Option<String>,
-    #[serde(default)] 
-    pub value: Option<Value>,   // literal
-}
+// Use the ShWire types from models.rs instead of duplicating
+pub use crate::models::{ShWire as Wire, ShWireFrom as WireFrom, ShWireTo as WireTo};
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct WireTo { 
-    pub step: String, 
-    pub input: String 
-}
 
-#[derive(Deserialize, Debug, Clone)]
-pub struct Wire { 
-    pub from: WireFrom, 
-    pub to: WireTo 
-}
-
-#[derive(Deserialize, Debug, Clone)]
-struct ActionManifest {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    version: String,
-    #[serde(default)] 
-    #[allow(dead_code)]
-    description: String,
-    inputs: Vec<ActionInput>,
-    #[allow(dead_code)]
-    outputs: Vec<ActionOutput>,
-    steps: Vec<ActionStep>,
-    #[serde(default)] 
-    wires: Vec<Wire>,
-    #[serde(default)] 
-    export: Value, // optional; often { "project_id": { "from": {...} } }
-}
 
 // ============================================================================
 // MAIN RUNNER IMPLEMENTATION
@@ -214,7 +146,7 @@ impl Runner for LocalRunner {
 // EXECUTION
 // ============================================================================
 #[allow(dead_code)]
-async fn execute(client: &HubClient, comp: &ActionManifest, _ctx: &DeployCtx) -> Result<()> {
+async fn execute(client: &HubClient, comp: &ShManifest, _ctx: &DeployCtx) -> Result<()> {
     // 0) Build fast lookup tables
     let step_map: HashMap<_,_> = comp.steps.iter().map(|s| (s.id.clone(), s)).collect();
 
@@ -223,9 +155,9 @@ async fn execute(client: &HubClient, comp: &ActionManifest, _ctx: &DeployCtx) ->
 
     // 2) Prefetch (do both docker & wasm)
     for s in &comp.steps {
-        match s.kind.as_str() {
-            "docker" => { let _ = docker_pull(&s.uses).await; }
-            "wasm"   => { let _ = client.download_wasm(&s.uses, &std::env::temp_dir().join("starthub/oci")).await?; }
+        match s.kind.as_deref() {
+            Some("docker") => { let _ = docker_pull(&s.uses).await; }
+            Some("wasm")   => { let _ = client.download_wasm(&s.uses, &std::env::temp_dir().join("starthub/oci")).await?; }
             _ => {}
         }
     }
@@ -237,7 +169,7 @@ async fn execute(client: &HubClient, comp: &ActionManifest, _ctx: &DeployCtx) ->
 
     for sid in order {
         let s = step_map.get(&sid).unwrap();
-        let step_kind = if s.kind.is_empty() { "docker" } else { &s.kind };
+        let step_kind = if s.kind.as_deref().unwrap_or("").is_empty() { "docker" } else { s.kind.as_deref().unwrap_or("docker") };
 
         // 3a) Resolve env for this step from wires + with
         let env = build_env_for_step(&sid, &s.with, &comp.wires, &inputs_map, &step_outputs)?;
@@ -556,16 +488,16 @@ fn looks_like_local_composite(s: &str) -> bool {
     t.starts_with('{') || t.ends_with(".json") || t.starts_with("file://") || Path::new(t).exists()
 }
 
-fn try_load_composite_spec(action: &str) -> Result<ActionManifest> {
+fn try_load_composite_spec(action: &str) -> Result<ShManifest> {
     let mut s = action.trim();
     if let Some(rest) = s.strip_prefix("file://") { s = rest; }
 
     if s.starts_with('{') {
-        return Ok(serde_json::from_str::<ActionManifest>(s).context("parsing inline composite json")?);
+        return Ok(serde_json::from_str::<ShManifest>(s).context("parsing inline composite json")?);
     }
     if s.ends_with(".json") || Path::new(s).exists() {
         let txt = fs::read_to_string(s).with_context(|| format!("reading composite file '{}'", s))?;
-        return Ok(serde_json::from_str::<ActionManifest>(&txt).context("parsing composite json")?);
+        return Ok(serde_json::from_str::<ShManifest>(&txt).context("parsing composite json")?);
     }
     Err(anyhow!("not a composite spec reference: {}", action))
 }
@@ -633,12 +565,16 @@ pub fn topo_order(steps: &[ActionStep], wires: &[Wire]) -> Result<Vec<String>> {
 
 fn build_env_for_step(
     step_id: &str,
-    step_with: &HashMap<String,String>,
+    step_with: &HashMap<String, serde_json::Value>,
     wires: &[Wire],
     inputs_map: &HashMap<String,String>,
     step_outputs: &HashMap<String, HashMap<String,String>>,
 ) -> Result<HashMap<String,String>> {
-    let mut env = step_with.clone(); // defaults/overrides from step.with
+    let mut env: HashMap<String, String> = HashMap::new();
+    // Convert step_with to string values
+    for (k, v) in step_with {
+        env.insert(k.clone(), v.as_str().unwrap_or("").to_string());
+    }
 
     for w in wires.iter().filter(|w| w.to.step == step_id) {
         let key = w.to.input.clone();
@@ -801,36 +737,45 @@ async fn docker_pull(image: &str) -> Result<()> {
 // ============================================================================
 
 /// Convert ActionMetadata from the API to a CompositeSpec for local execution
-fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<ActionManifest> {
+fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<ShManifest> {
     // Since the current API doesn't provide steps/wires/export, create a simple single-step composite
     // that can be executed locally
     let comp_steps = vec![ActionStep {
         id: "run".to_string(),
-        kind: "docker".to_string(),
+        kind: Some("docker".to_string()),
         uses: "alpine:latest".to_string(), // Default to alpine for now
         with: std::collections::HashMap::new(),
     }];
 
     let inputs = metadata.inputs.as_ref()
-        .map(|inputs| inputs.iter().map(|input| ActionInput {
+        .map(|inputs| inputs.iter().map(|input| ShPort {
             name: input.name.clone(),
-            r#type: input.action_port_type.clone(),
             description: format!("Input: {}", input.action_port_direction),
+            ty: ShType::String, // Default to string type
+            required: true,
+            default: None,
         }).collect())
         .unwrap_or_default();
 
     let outputs = metadata.outputs.as_ref()
-        .map(|outputs| outputs.iter().map(|output| ActionOutput {
+        .map(|outputs| outputs.iter().map(|output| ShPort {
             name: output.name.clone(),
-            r#type: output.action_port_type.clone(),
             description: format!("Output: {}", output.action_port_direction),
+            ty: ShType::String, // Default to string type
+            required: true,
+            default: None,
         }).collect())
         .unwrap_or_default();
 
-    Ok(ActionManifest {
+    Ok(ShManifest {
         name: metadata.name.clone(),
         version: metadata.version_number.clone(),
         description: metadata.description.clone(),
+        kind: None,
+        manifest_version: 1,
+        repository: "".to_string(),
+        image: Some("".to_string()),
+        license: "".to_string(),
         inputs,
         outputs,
         steps: comp_steps,
@@ -843,31 +788,14 @@ fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<Act
 // RECURSIVE ACTION FETCHING
 // ============================================================================
 
-/// Convert starthub_api::ActionStep to local::ActionStep
-fn convert_action_step(step: &crate::starthub_api::ActionStep) -> ActionStep {
-    ActionStep {
-        id: step.id.clone(),
-        kind: step.kind.as_deref().unwrap_or("docker").to_string(),
-        uses: step.uses.clone(),
-        with: step.with.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect(),
-    }
+/// Convert ShActionStep to ActionStep (no conversion needed since we're using ShActionStep directly)
+fn convert_action_step(step: &ActionStep) -> ActionStep {
+    step.clone()
 }
 
-/// Convert starthub_api::ActionWire to local::Wire
-fn convert_action_wire(wire: &crate::starthub_api::ActionWire) -> Wire {
-    Wire {
-        from: WireFrom {
-            source: wire.from.source.clone(),
-            step: wire.from.step.clone(),
-            output: wire.from.output.clone(),
-            key: wire.from.key.clone(),
-            value: wire.from.value.clone(),
-        },
-        to: WireTo {
-            step: wire.to.step.clone(),
-            input: wire.to.input.clone(),
-        },
-    }
+/// Convert Wire to Wire (no conversion needed since we're using ShWire directly)
+fn convert_action_wire(wire: &Wire) -> Wire {
+    wire.clone()
 }
 
 /// Recursively fetch all action manifests for a composite action
@@ -875,7 +803,7 @@ async fn fetch_all_action_manifests(
     client: &HubClient, 
     action_ref: &str,
     visited: &mut HashSet<String>
-) -> Result<Vec<crate::starthub_api::ActionManifest>> {
+) -> Result<Vec<ShManifest>> {
     if visited.contains(action_ref) {
         return Ok(vec![]); // Already fetched this action
     }
@@ -924,31 +852,40 @@ mod tests {
     // TEST HELPERS
     // ============================================================================
 
-    fn create_test_composite_spec() -> ActionManifest {
-        ActionManifest {
+    fn create_test_composite_spec() -> ShManifest {
+        ShManifest {
             name: "test-composite".to_string(),
             version: "1.0.0".to_string(),
             description: "Test composite for unit testing".to_string(),
+            kind: None,
+            manifest_version: 1,
+            repository: "test".to_string(),
+            image: Some("test".to_string()),
+            license: "MIT".to_string(),
             inputs: vec![
-                ActionInput {
+                ShPort {
                     name: "test_input".to_string(),
-                    r#type: "string".to_string(),
                     description: "Test input".to_string(),
+                    ty: ShType::String,
+                    required: true,
+                    default: None,
                 }
             ],
             outputs: vec![
-                ActionOutput {
+                ShPort {
                     name: "test_output".to_string(),
-                    r#type: "string".to_string(),
                     description: "Test output".to_string(),
+                    ty: ShType::String,
+                    required: true,
+                    default: None,
                 }
             ],
             steps: vec![
-                ActionStep {
+                ShActionStep {
                     id: "step1".to_string(),
-                    kind: "docker".to_string(),
+                    kind: Some("docker".to_string()),
                     uses: "alpine:latest".to_string(),
-                    with: HashMap::new(),
+                    with: HashMap::<String, serde_json::Value>::new(),
                 }
             ],
             wires: vec![],
@@ -1018,15 +955,15 @@ mod tests {
         let steps = vec![
             ActionStep {
                 id: "step1".to_string(),
-                kind: "docker".to_string(),
+                kind: Some("docker".to_string()),
                 uses: "alpine:latest".to_string(),
-                with: HashMap::new(),
+                with: HashMap::<String, serde_json::Value>::new(),
             },
             ActionStep {
                 id: "step2".to_string(),
-                kind: "docker".to_string(),
+                kind: Some("docker".to_string()),
                 uses: "alpine:latest".to_string(),
-                with: HashMap::new(),
+                with: HashMap::<String, serde_json::Value>::new(),
             }
         ];
         
@@ -1055,15 +992,15 @@ mod tests {
         let steps = vec![
             ActionStep {
                 id: "step1".to_string(),
-                kind: "docker".to_string(),
+                kind: Some("docker".to_string()),
                 uses: "alpine:latest".to_string(),
-                with: HashMap::new(),
+                with: HashMap::<String, serde_json::Value>::new(),
             },
             ActionStep {
                 id: "step2".to_string(),
-                kind: "docker".to_string(),
+                kind: Some("docker".to_string()),
                 uses: "alpine:latest".to_string(),
-                with: HashMap::new(),
+                with: HashMap::<String, serde_json::Value>::new(),
             }
         ];
         
