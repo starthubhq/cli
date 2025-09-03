@@ -1,21 +1,3 @@
-I'll rewrite the README file to reflect all the new functionality we've implemented today. Let me create a comprehensive and up-to-date README:
-
-
-[1 tool called]
-
-Now I'll rewrite the README to reflect all the new functionality we've implemented today:
-
-
-[1 tool called]
-
-I need to use the correct tool. Let me create a new README file:
-
-
-[1 tool called]
-
-Now I'll create a completely rewritten README that reflects all the new functionality:
-
-```markdown
 # Starthub CLI
 
 A powerful command-line tool for building, publishing, and managing cloud-native applications and WebAssembly modules. Starthub CLI provides a unified workflow for creating, packaging, distributing, and tracking applications with support for both Docker containers and WebAssembly modules.
