@@ -8,7 +8,7 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::{config::Region, Client as S3Client};
 use aws_sdk_s3::primitives::ByteStream;
 
-use crate::models::{ShManifest, ShKind, ShPort, ShLock, ShDistribution};
+use crate::models::{ShManifest, ShKind, ShPort, ShLock, ShDistribution, ShType};
 use crate::templates;
 
 // Global constants for local development server
@@ -367,6 +367,10 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     
     // Write lock file locally
     fs::write("starthub.lock.json", serde_json::to_string_pretty(&lock)?)?;
+    
+    // Now update the database with action and version information
+    println!("🗄️  Updating database with action information...");
+    update_action_database(&lock, &namespace).await?;
     
     // Upload lock file to the same Supabase Storage location
     println!("📤 Uploading lock file to Supabase Storage...");
@@ -745,6 +749,10 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
     println!("🔗 Storage URL: {}", endpoint_url);
     println!("🔗 Lock file URL: {}/storage/v1/object/public/{}/{}",
         crate::config::STARTHUB_API_BASE, bucket_name, lock_object_key);
+    
+    // Now update the database with action and version information
+    println!("🗄️  Updating database with action information...");
+    update_action_database(&lock, &namespace).await?;
     
     // Clean up local files
     fs::remove_file(&zip_filename)?;
@@ -1464,6 +1472,287 @@ async fn handle_ws(ws: WebSocket, state: AppState) {
 pub async fn cmd_status(id: Option<String>) -> Result<()> {
     println!("Status for {id:?}");
     // TODO: poll API
+    Ok(())
+}
+
+/// Updates the database with action and version information after a successful upload
+/// This function:
+/// 1. Checks if an action already exists for the given name and namespace
+/// 2. Checks if a version already exists for the given action and version number
+/// 3. Inserts new action and version if they don't exist
+/// 4. Inserts action ports from the lock file
+async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Result<()> {
+    // Load authentication config to get profile_id and API base
+    let auth_config = load_auth_config()?;
+    let (api_base, _email, profile_id, _namespace) = auth_config.ok_or_else(|| {
+        anyhow::anyhow!("No authentication found in auth config. Please run 'starthub login' first.")
+    })?;
+    
+    // First, check if an action already exists for this name and namespace
+    let action_exists = check_action_exists(&api_base, &lock.name, namespace).await?;
+    
+    let action_id = if action_exists {
+        // Get the existing action ID
+        get_action_id(&api_base, &lock.name, namespace).await?
+    } else {
+        // Create a new action
+        create_action(&api_base, &lock.name, &lock.description, namespace, &profile_id).await?
+    };
+    
+    // Check if a version already exists for this action and version number
+    let version_exists = check_version_exists(&api_base, &action_id, &lock.version).await?;
+    
+    if version_exists {
+        anyhow::bail!(
+            "Action version already exists: {}@{} in namespace '{}'. Use a different version number.",
+            lock.name, lock.version, namespace
+        );
+    }
+    
+    // Create a new version
+    let version_id = create_action_version(&api_base, &action_id, &lock.version).await?;
+    
+    // Insert action ports from the lock file
+    insert_action_ports(&api_base, &version_id, &lock.inputs, &lock.outputs).await?;
+    
+    println!("✅ Database updated successfully:");
+    println!("   🏷️  Action: {} (ID: {})", lock.name, action_id);
+    println!("   📦 Version: {} (ID: {})", lock.version, version_id);
+    println!("   🔌 Ports: {} inputs, {} outputs", lock.inputs.len(), lock.outputs.len());
+    
+    Ok(())
+}
+
+/// Checks if an action already exists for the given name and namespace
+async fn check_action_exists(api_base: &str, action_name: &str, namespace: &str) -> anyhow::Result<bool> {
+    let client = reqwest::Client::new();
+    
+    // Query the actions table joined with owners to check namespace
+    let response = client
+        .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&rls_owner_id=in.(select id from owners where namespace=eq.{})", 
+            api_base, action_name, namespace))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let actions: Vec<serde_json::Value> = response.json().await?;
+        Ok(!actions.is_empty())
+    } else {
+        anyhow::bail!("Failed to check action existence: {}", response.status())
+    }
+}
+
+/// Gets the ID of an existing action
+async fn get_action_id(api_base: &str, action_name: &str, namespace: &str) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&rls_owner_id=in.(select id from owners where namespace=eq.{})", 
+            api_base, action_name, namespace))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let actions: Vec<serde_json::Value> = response.json().await?;
+        if let Some(action) = actions.first() {
+            Ok(action["id"].as_str().unwrap_or_default().to_string())
+        } else {
+            anyhow::bail!("Action not found")
+        }
+    } else {
+        anyhow::bail!("Failed to get action ID: {}", response.status())
+    }
+}
+
+/// Creates a new action
+async fn create_action(api_base: &str, action_name: &str, description: &str, namespace: &str, profile_id: &str) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    
+    // First get the owner ID for this profile
+    let owner_response = client
+        .get(&format!("{}/rest/v1/owners?select=id&profile_id=eq.{}&owner_type=eq.PROFILE", 
+            api_base, profile_id))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .send()
+        .await?;
+    
+    if !owner_response.status().is_success() {
+        anyhow::bail!("Failed to get owner ID: {}", owner_response.status())
+    }
+    
+    let owners: Vec<serde_json::Value> = owner_response.json().await?;
+    let owner_id = owners.first()
+        .and_then(|o| o["id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("Owner not found for profile"))?;
+    
+    // Create the action
+    let action_data = serde_json::json!({
+        "name": action_name,
+        "description": description,
+        "rls_owner_id": owner_id
+    });
+    
+    let response = client
+        .post(&format!("{}/rest/v1/actions", api_base))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "return=representation")
+        .json(&action_data)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let actions: Vec<serde_json::Value> = response.json().await?;
+        if let Some(action) = actions.first() {
+            Ok(action["id"].as_str().unwrap_or_default().to_string())
+        } else {
+            anyhow::bail!("Failed to get created action ID")
+        }
+    } else {
+        anyhow::bail!("Failed to create action: {}", response.status())
+    }
+}
+
+/// Checks if a version already exists for the given action and version number
+async fn check_version_exists(api_base: &str, action_id: &str, version_number: &str) -> anyhow::Result<bool> {
+    let client = reqwest::Client::new();
+    
+    let response = client
+        .get(&format!("{}/rest/v1/action_versions?select=id&action_id=eq.{}&version_number=eq.{}", 
+            api_base, action_id, version_number))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let versions: Vec<serde_json::Value> = response.json().await?;
+        Ok(!versions.is_empty())
+    } else {
+        anyhow::bail!("Failed to check version existence: {}", response.status())
+    }
+}
+
+/// Creates a new action version
+async fn create_action_version(api_base: &str, action_id: &str, version_number: &str) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    
+    let version_data = serde_json::json!({
+        "action_id": action_id,
+        "version_number": version_number
+    });
+    
+    let response = client
+        .post(&format!("{}/rest/v1/action_versions", api_base))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "return=representation")
+        .json(&version_data)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let versions: Vec<serde_json::Value> = response.json().await?;
+        if let Some(version) = versions.first() {
+            Ok(version["id"].as_str().unwrap_or_default().to_string())
+        } else {
+            anyhow::bail!("Failed to get created version ID")
+        }
+    } else {
+        anyhow::bail!("Failed to create action version: {}", response.status())
+    }
+}
+
+/// Inserts action ports for inputs and outputs
+async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort], outputs: &[ShPort]) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    
+    // Get the owner ID for this version (needed for RLS)
+    let version_response = client
+        .get(&format!("{}/rest/v1/action_versions?select=rls_owner_id&id=eq.{}", 
+            api_base, version_id))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .send()
+        .await?;
+    
+    if !version_response.status().is_success() {
+        anyhow::bail!("Failed to get version owner ID: {}", version_response.status())
+    }
+    
+    let versions: Vec<serde_json::Value> = version_response.json().await?;
+    let owner_id = versions.first()
+        .and_then(|v| v["rls_owner_id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("Version owner ID not found"))?;
+    
+    // Insert input ports
+    for input in inputs {
+        let port_data = serde_json::json!({
+            "action_port_type": match input.ty {
+                ShType::String => "STRING",
+                ShType::Integer => "NUMBER",
+                ShType::Boolean => "BOOLEAN",
+                ShType::Object => "OBJECT",
+                ShType::Array => "OBJECT", // Map array to OBJECT for now
+                ShType::Number => "NUMBER",
+            },
+            "action_port_direction": "INPUT",
+            "action_version_id": version_id,
+            "rls_owner_id": owner_id
+        });
+        
+        let response = client
+            .post(&format!("{}/rest/v1/action_ports", api_base))
+            .header("apikey", crate::config::SUPABASE_ANON_KEY)
+            .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+            .header("Content-Type", "application/json")
+            .json(&port_data)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to insert input port: {}", response.status())
+        }
+    }
+    
+    // Insert output ports
+    for output in outputs {
+        let port_data = serde_json::json!({
+            "action_port_type": match output.ty {
+                ShType::String => "STRING",
+                ShType::Integer => "NUMBER",
+                ShType::Boolean => "BOOLEAN",
+                ShType::Object => "OBJECT",
+                ShType::Array => "OBJECT", // Map array to OBJECT for now
+                ShType::Number => "NUMBER",
+            },
+            "action_port_direction": "OUTPUT",
+            "action_version_id": version_id,
+            "rls_owner_id": owner_id
+            // Note: We don't have a 'name' field in ShPort, so we can't set it
+        });
+        
+        let response = client
+            .post(&format!("{}/rest/v1/action_ports", api_base))
+            .header("apikey", crate::config::SUPABASE_ANON_KEY)
+            .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+            .header("Content-Type", "application/json")
+            .json(&port_data)
+            .send()
+            .await?;
+        
+        if !response.status().is_success() {
+            anyhow::bail!("Failed to insert output port: {}", response.status())
+        }
+    }
+    
     Ok(())
 }
 
