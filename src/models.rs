@@ -15,10 +15,13 @@ pub struct ShManifest {
     pub inputs: Vec<ShPort>,
     pub outputs: Vec<ShPort>,
     // Composite action fields
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<ShActionStep>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub wires: Vec<ShWire>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "is_default_export")]
     pub export: serde_json::Value,
 }
@@ -55,8 +58,16 @@ fn default_required() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShLock {
     pub name: String,
+    pub description: String,
     pub version: String,
     pub kind: ShKind,
+    pub manifest_version: u32,
+    pub repository: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    pub license: String,
+    pub inputs: Vec<ShPort>,
+    pub outputs: Vec<ShPort>,
     pub distribution: ShDistribution,
     pub digest: String,
 }
@@ -227,8 +238,15 @@ mod tests {
     fn test_sh_lock_serialization() {
         let lock = ShLock {
             name: "test-package".to_string(),
+            description: "Test package".to_string(),
             version: "1.0.0".to_string(),
             kind: ShKind::Docker,
+            manifest_version: 1,
+            repository: "github.com/test/package".to_string(),
+            image: Some("ghcr.io/test/package".to_string()),
+            license: "MIT".to_string(),
+            inputs: vec![],
+            outputs: vec![],
             distribution: ShDistribution {
                 primary: "oci://ghcr.io/test/package@sha256:abc123".to_string(),
                 upstream: None,

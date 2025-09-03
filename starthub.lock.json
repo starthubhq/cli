@@ -1,9 +1,0 @@
-{
-  "name": "test",
-  "version": "1.0.0",
-  "kind": "docker",
-  "distribution": {
-    "primary": "oci://ghcr.io/org/image@sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc"
-  },
-  "digest": "sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc"
-}
