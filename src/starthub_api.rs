@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::models::ShManifest;
 
 
-use crate::config::STARTHUB_API_KEY;
+use crate::config::SUPABASE_ANON_KEY;
 
 #[derive(Clone)]
 pub struct Client {
@@ -120,7 +120,7 @@ impl Client {
             .header(ACCEPT, "application/json");
         
         // Use the provided API key for authentication
-        req = req.header("Authorization", format!("Bearer {}", STARTHUB_API_KEY));
+        req = req.header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY));
         req = req.query(&[("ref", action)]);
         let res = req.send().await?.error_for_status()?;
         let metadata: ActionMetadata = res.json().await.context("decoding action metadata json")?;
@@ -171,8 +171,8 @@ mod tests {
     #[test]
     fn test_api_key_constant() {
         // Verify that the API key constant is set correctly
-        assert_eq!(STARTHUB_API_KEY, "sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe");
-        assert!(STARTHUB_API_KEY.starts_with("sb_publishable_"));
+            assert_eq!(SUPABASE_ANON_KEY, "sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe");
+    assert!(SUPABASE_ANON_KEY.starts_with("sb_publishable_"));
     }
 
     #[test]

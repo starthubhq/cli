@@ -12,7 +12,7 @@ use which::which;
 use super::{Runner, DeployCtx};
 use crate::starthub_api::{Client as HubClient, ActionMetadata};
 use crate::models::{ShManifest, ShPort, ShType, ShActionStep};
-use crate::config::{STARTHUB_API_BASE, STARTHUB_API_KEY};
+use crate::config::{STARTHUB_API_BASE, SUPABASE_ANON_KEY};
 use crate::runners::models::{ActionPlan, StepSpec, MountSpec};
 
 // ============================================================================
@@ -65,7 +65,7 @@ impl Runner for LocalRunner {
         // 1) Try to fetch action details from the actions edge function
         let base  = std::env::var("STARTHUB_API").unwrap_or_else(|_| STARTHUB_API_BASE.to_string());
         // Always use the API key from config.rs for authentication
-        let token = Some(STARTHUB_API_KEY.to_string());
+        let token = Some(SUPABASE_ANON_KEY.to_string());
         let client = HubClient::new(base, token);
 
         // Try to fetch action metadata first

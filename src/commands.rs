@@ -246,9 +246,22 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     let zip_filename = format!("{}-{}.zip", m.name, m.version);
     run("zip", &["-j", &zip_filename, &tar_filename])?;
 
-    // Extract slug from repository for better organization
-    // Use hardcoded namespace and manifest name for better organization
-    let namespace = "actions";
+    // Get the user's namespace from their profile
+    let namespace = match get_user_namespace().await {
+        Ok(Some(ns)) => ns,
+        Ok(None) => {
+            println!("⚠️  No authentication found. Using default namespace 'actions'");
+            println!("💡 Use 'starthub login' to authenticate and use your personal namespace");
+            "actions".to_string()
+        }
+        Err(e) => {
+            println!("⚠️  Failed to get user namespace: {}. Using default namespace 'actions'", e);
+            println!("💡 Use 'starthub login' to authenticate and use your personal namespace");
+            "actions".to_string()
+        }
+    };
+    
+    println!("🏷️  Using namespace: {}", namespace);
     
     // Upload to Supabase storage with new path structure: <namespace>/<name>/<version>
     let storage_url = format!(
@@ -742,7 +755,227 @@ pub async fn cmd_login(runner: crate::RunnerKind) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Authenticate with Starthub backend using browser-based flow
+pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
+    println!("🔐 Authenticating with Starthub backend...");
+    println!("🌐 API Base: {}", api_base);
+    
+    // Open browser to editor for authentication
+    let editor_url = "https://editor.starthub.so/cli-auth";
+    println!("🌐 Opening browser to: {}", editor_url);
+    
+    match webbrowser::open(editor_url) {
+        Ok(_) => println!("✅ Browser opened successfully"),
+        Err(e) => println!("⚠️  Could not open browser automatically: {}", e),
+    }
+    
+    println!("\n📋 Please:");
+    println!("1. Wait for the authentication code to appear in your browser");
+    println!("2. Copy the authentication code from the browser");
+    println!("3. Come back here and paste the code below");
+    
+    // Wait for user to paste the code
+    let pasted_code = inquire::Text::new("Paste the authentication code:")
+        .with_help_message("Enter the code from your browser")
+        .prompt()?;
+    
+    // Validate the code against the backend
+    println!("🔄 Validating authentication code...");
+    
+    let client = reqwest::Client::new();
+    let validation_response = client
+        .post(&format!("{}/functions/v1/cli-auth", api_base))
+        .json(&serde_json::json!({
+            "code": pasted_code
+        }))
+        .send()
+        .await?;
+    
+    let status = validation_response.status();
+    if !status.is_success() {
+        let error_text = validation_response.text().await?;
+        anyhow::bail!("Code validation failed: {} ({})", status, error_text);
+    }
+    
+    let validation_data: serde_json::Value = validation_response.json().await?;
+    
+    if !validation_data.get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false) {
+        let error_msg = validation_data.get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown error");
+        anyhow::bail!("Authentication failed: {}", error_msg);
+    }
+    
+    let profile = validation_data.get("profile")
+        .ok_or_else(|| anyhow::anyhow!("No profile data in response"))?;
+    
+    let email = profile.get("email")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No email in profile"))?;
+    
+    // Store the authentication info
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        .join("starthub");
+    
+    fs::create_dir_all(&config_dir)?;
+    
+    let config_file = config_dir.join("auth.json");
+    let auth_config = serde_json::json!({
+        "api_base": api_base,
+        "email": email,
+        "profile_id": profile.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "username": profile.get("username").and_then(|v| v.as_str()).unwrap_or(""),
+        "full_name": profile.get("full_name").and_then(|v| v.as_str()).unwrap_or(""),
+        "namespace": profile.get("username").and_then(|v| v.as_str()).unwrap_or(""), // Use username as namespace for now
+        "login_time": chrono::Utc::now().to_rfc3339(),
+        "auth_method": "cli_code"
+    });
+    
+    fs::write(&config_file, serde_json::to_string_pretty(&auth_config)?)?;
+    
+    println!("✅ Authentication successful!");
+    println!("🔑 Authentication data saved to: {}", config_file.display());
+    println!("📧 Logged in as: {}", email);
+    
+    Ok(())
+}
 
+
+
+/// Load stored authentication configuration
+pub fn load_auth_config() -> anyhow::Result<Option<(String, String, String, String)>> {
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        .join("starthub");
+    
+    let config_file = config_dir.join("auth.json");
+    
+    if !config_file.exists() {
+        return Ok(None);
+    }
+    
+    let config_content = fs::read_to_string(&config_file)?;
+    let auth_config: serde_json::Value = serde_json::from_str(&config_content)?;
+    
+    let api_base = auth_config.get("api_base")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No api_base in auth config"))?;
+    
+    let email = auth_config.get("email")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No email in auth config"))?;
+    
+    let profile_id = auth_config.get("profile_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No profile_id in auth config"))?;
+    
+    let namespace = auth_config.get("namespace")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No namespace in auth config"))?;
+    
+    Ok(Some((api_base.to_string(), email.to_string(), profile_id.to_string(), namespace.to_string())))
+}
+
+/// Logout from Starthub backend
+pub async fn cmd_logout_starthub() -> anyhow::Result<()> {
+    println!("🔓 Logging out from Starthub backend...");
+    
+    let config_dir = dirs::config_dir()
+        .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+        .join("starthub");
+    
+    let config_file = config_dir.join("auth.json");
+    
+    if !config_file.exists() {
+        println!("ℹ️  No authentication found. Already logged out.");
+        return Ok(());
+    }
+    
+    // Remove the auth file
+    fs::remove_file(&config_file)?;
+    
+    println!("✅ Successfully logged out!");
+    println!("🗑️  Authentication data removed from: {}", config_file.display());
+    
+    Ok(())
+}
+
+/// Get the namespace for the currently authenticated user
+pub async fn get_user_namespace() -> anyhow::Result<Option<String>> {
+    // Load authentication config
+    let auth_config = match load_auth_config()? {
+        Some((api_base, _email, profile_id, _namespace)) => (api_base, profile_id),
+        None => return Ok(None),
+    };
+    
+    let (api_base, profile_id) = auth_config;
+    
+    // Query the owners table directly using PostgREST
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&format!("{}/rest/v1/owners?select=namespace&owner_type=eq.PROFILE&profile_id=eq.{}", api_base, profile_id))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", profile_id))
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let data: Vec<serde_json::Value> = response.json().await?;
+        if let Some(owner) = data.first() {
+            if let Some(namespace) = owner.get("namespace").and_then(|v| v.as_str()) {
+                return Ok(Some(namespace.to_string()));
+            }
+        }
+    }
+    
+    // Fallback: try to get from local auth config username
+    let auth_config = load_auth_config()?;
+    if let Some((_api_base, _email, _profile_id, namespace)) = auth_config {
+        // Use the locally stored namespace as fallback
+        return Ok(Some(namespace));
+    }
+    
+    Ok(None)
+}
+
+/// Show current authentication status
+pub async fn cmd_auth_status() -> anyhow::Result<()> {
+    println!("🔍 Checking authentication status...");
+    
+    match load_auth_config()? {
+        Some((api_base, email, profile_id, namespace)) => {
+            println!("✅ Authenticated with Starthub backend");
+            println!("🌐 API Base: {}", api_base);
+            println!("📧 Email: {}", email);
+            println!("🆔 Profile ID: {}", profile_id);
+            println!("🏷️  Namespace: {}", namespace);
+            
+            // Try to validate the authentication by making a test API call
+            println!("🔄 Validating authentication...");
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&format!("{}/functions/v1/profiles", api_base))
+                .header("Authorization", format!("Bearer {}", profile_id))
+                .send()
+                .await?;
+            
+            if response.status().is_success() {
+                println!("✅ Authentication is valid and working");
+            } else {
+                println!("⚠️  Authentication may be expired or invalid");
+            }
+        }
+        None => {
+            println!("❌ Not authenticated");
+            println!("💡 Use 'starthub login' to authenticate");
+        }
+    }
+    
+    Ok(())
+}
 
 pub async fn cmd_run(action: String, _runner: crate::RunnerKind) -> Result<()> {
     // Start the server first
@@ -886,7 +1119,7 @@ async fn handle_run(
     
     // Try to fetch action metadata and download starthub.json
     let base = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
-    let client = crate::starthub_api::Client::new(base, Some(crate::config::STARTHUB_API_KEY.to_string()));
+            let client = crate::starthub_api::Client::new(base, Some(crate::config::SUPABASE_ANON_KEY.to_string()));
     
     match client.fetch_action_metadata(&action).await {
         Ok(_metadata) => {
