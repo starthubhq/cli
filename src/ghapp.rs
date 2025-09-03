@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -41,6 +41,7 @@ struct TokenPoll {
 
 #[derive(Deserialize)]
 pub struct GhUser {
+    #[allow(dead_code)]
     pub id: i64,
     pub login: String,
 }
@@ -127,6 +128,7 @@ pub async fn get_user(access_token: &str) -> Result<GhUser> {
 
 #[derive(Deserialize)]
 struct InstallationsPage {
+    #[allow(dead_code)]
     total_count: u32,
     installations: Vec<Installation>,
 }
@@ -140,6 +142,7 @@ pub struct Installation {
 
 #[derive(Deserialize, Clone)]
 pub struct Account {
+    #[allow(dead_code)]
     pub id: i64,
     pub login: String,
     #[serde(rename = "type")]
@@ -211,6 +214,7 @@ impl StoredCredentials {
     }
 
     /// Optional: check refresh token expiry if you plan to refresh
+    #[allow(dead_code)]
     pub fn refresh_is_expired(&self) -> bool {
         match self.refresh_token_expires_at_epoch {
             None => false,
@@ -334,65 +338,5 @@ pub async fn create_user_repo(
         let s = resp.status();
         let t = resp.text().await.unwrap_or_default();
         bail!("create repo failed: {s} — {t}");
-    }
-}
-
-#[derive(Deserialize, Debug)]
-pub struct RepoPublicKey {
-    pub key_id: String,
-    pub key: String, // base64-encoded sodium public key
-}
-
-pub async fn get_repo_public_key(
-    token: &str, owner: &str, repo: &str
-) -> Result<RepoPublicKey> {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/actions/secrets/public-key"
-    );
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, UA)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .send().await?;
-    if resp.status().is_success() {
-        Ok(resp.json().await?)
-    } else {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        bail!("get public key failed: {s} — {t}");
-    }
-}
-
-pub async fn put_repo_secret(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    name: &str,
-    key_id: &str,
-    encrypted_value_b64: &str,
-) -> Result<()> {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/actions/secrets/{name}"
-    );
-    let body = serde_json::json!({
-        "encrypted_value": encrypted_value_b64,
-        "key_id": key_id,
-    });
-
-    let resp = reqwest::Client::new()
-        .put(url)
-        .header(ACCEPT, "application/vnd.github+json")
-        .header(USER_AGENT, UA)
-        .header(AUTHORIZATION, format!("Bearer {token}"))
-        .json(&body)
-        .send().await?;
-
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        let s = resp.status();
-        let t = resp.text().await.unwrap_or_default();
-        bail!("put secret {name} failed: {s} — {t}");
     }
 }
