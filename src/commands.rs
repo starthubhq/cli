@@ -370,7 +370,7 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     
     // Now update the database with action and version information
     println!("🗄️  Updating database with action information...");
-    update_action_database(&lock, &namespace).await?;
+    update_action_database(&m, &namespace).await?;
     
     // Upload lock file to the same Supabase Storage location
     println!("📤 Uploading lock file to Supabase Storage...");
@@ -752,7 +752,7 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
     
     // Now update the database with action and version information
     println!("🗄️  Updating database with action information...");
-    update_action_database(&lock, &namespace).await?;
+    update_action_database(&m, &namespace).await?;
     
     // Clean up local files
     fs::remove_file(&zip_filename)?;
@@ -1506,7 +1506,7 @@ pub async fn cmd_status(id: Option<String>) -> Result<()> {
 /// 2. Checks if a version already exists for the given action and version number
 /// 3. Inserts new action and version if they don't exist
 /// 4. Inserts action ports from the lock file
-async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Result<()> {
+async fn update_action_database(manifest: &ShManifest, namespace: &str) -> anyhow::Result<()> {
     // Load authentication config to get profile_id and API base
     let auth_config = load_auth_config()?;
     let (api_base, _email, profile_id, _namespace, access_token) = auth_config.ok_or_else(|| {
@@ -1516,7 +1516,7 @@ async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Resul
     println!("Using profile_id from auth config: {}", profile_id);
 
     // First, check if a git_allowed_repository exists for this namespace, name, and version
-    let git_allowed_repository_id = match check_git_allowed_repository_exists(&api_base, namespace, &lock.name, &lock.version, &access_token).await? {
+    let git_allowed_repository_id = match check_git_allowed_repository_exists(&api_base, namespace, &manifest.name, &manifest.version, &access_token).await? {
         Some(repo_id) => {
             println!("Using existing git_allowed_repository: {}", repo_id);
             Some(repo_id)
@@ -1540,44 +1540,44 @@ async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Resul
                 .ok_or_else(|| anyhow::anyhow!("Owner not found for namespace: {}", namespace))?;
             
             // Create a new git_allowed_repository
-            let repo_id = create_git_allowed_repository(&api_base, namespace, &lock.name, &lock.version, owner_id, &access_token).await?;
+            let repo_id = create_git_allowed_repository(&api_base, namespace, &manifest.name, &manifest.version, owner_id, &access_token, &manifest.repository).await?;
             Some(repo_id)
         }
     };
 
     // Check if an action already exists for this name and namespace
-    let action_exists = check_action_exists(&api_base, &lock.name, namespace, &access_token).await?;
+    let action_exists = check_action_exists(&api_base, &manifest.name, namespace, &access_token).await?;
     let action_id = if action_exists {
         // Get the existing action ID
-        get_action_id(&api_base, &lock.name, namespace, &access_token).await?
+        get_action_id(&api_base, &manifest.name, namespace, &access_token).await?
     } else {
         // Create a new action with the git_allowed_repository_id
-        create_action(&api_base, &lock.name, &lock.description, namespace, &profile_id, git_allowed_repository_id.as_deref(), &access_token).await?
+        create_action(&api_base, &manifest.name, &manifest.description, namespace, &profile_id, git_allowed_repository_id.as_deref(), &access_token).await?
     };
     
     // Check if a version already exists for this action and version number
-    let version_exists = check_version_exists(&api_base, &action_id, &lock.version, &access_token).await?;
+    let version_exists = check_version_exists(&api_base, &action_id, &manifest.version, &access_token).await?;
     
     if version_exists {
         anyhow::bail!(
             "Action version already exists: {}@{} in namespace '{}'. Use a different version number.",
-            lock.name, lock.version, namespace
+            manifest.name, manifest.version, namespace
         );
     }
     
     // Create a new version
-    let version_id = create_action_version(&api_base, &action_id, &lock.version, &access_token).await?;
+    let version_id = create_action_version(&api_base, &action_id, &manifest.version, &access_token).await?;
     
     // Update the action with the latest version ID
     update_action_latest_version(&api_base, &action_id, &version_id, &access_token).await?;
     
-    // Insert action ports from the lock file
-    insert_action_ports(&api_base, &version_id, &lock.inputs, &lock.outputs, &access_token).await?;
+    // Insert action ports from the manifest
+    insert_action_ports(&api_base, &version_id, &manifest.inputs, &manifest.outputs, &access_token).await?;
     
     println!("✅ Database updated successfully:");
-    println!("   🏷️  Action: {} (ID: {})", lock.name, action_id);
-    println!("   📦 Version: {} (ID: {})", lock.version, version_id);
-    println!("   🔌 Ports: {} inputs, {} outputs", lock.inputs.len(), lock.outputs.len());
+    println!("   🏷️  Action: {} (ID: {})", manifest.name, action_id);
+    println!("   📦 Version: {} (ID: {})", manifest.version, version_id);
+    println!("   🔌 Ports: {} inputs, {} outputs", manifest.inputs.len(), manifest.outputs.len());
     
     Ok(())
 }
@@ -1948,7 +1948,7 @@ async fn check_git_allowed_repository_exists(api_base: &str, namespace: &str, na
 }
 
 /// Creates a new git_allowed_repository for the given namespace, name, and version
-async fn create_git_allowed_repository(api_base: &str, namespace: &str, name: &str, version: &str, owner_id: &str, access_token: &str) -> anyhow::Result<String> {
+async fn create_git_allowed_repository(api_base: &str, namespace: &str, name: &str, version: &str, owner_id: &str, access_token: &str, repository_url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     
     println!("Creating new git_allowed_repository: namespace = '{}', name = '{}', version = '{}'", namespace, name, version);
@@ -1962,7 +1962,8 @@ async fn create_git_allowed_repository(api_base: &str, namespace: &str, name: &s
         "owner_id": owner_id,
         "git_provider": "GITHUB",
         "external_id": null,
-        "git_app_installation_id": null
+        "git_app_installation_id": null,
+        "url": repository_url
     });
     
     println!("Creating git_allowed_repository with data: {}", serde_json::to_string_pretty(&repo_data).unwrap_or_default());
