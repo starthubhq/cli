@@ -808,11 +808,11 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         .prompt()?;
 
     // Kind
-    let kind_str = Select::new("Kind:", vec!["wasm", "docker", "composition"]).prompt()?;
+    let kind_str = Select::new("Kind:", vec!["wasm", "docker"]).prompt()?;
     let kind = match kind_str {
         "wasm" => ShKind::Wasm,
         "docker" => ShKind::Docker,
-        "composition" => ShKind::Composition,
+        // "composition" => ShKind::Composition,
         _ => unreachable!(),
     };
 
