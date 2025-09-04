@@ -836,9 +836,25 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         "Apache-2.0", "MIT", "BSD-3-Clause", "GPL-3.0", "Unlicense", "Proprietary",
     ]).prompt()?.to_string();
 
-    // Empty I/O (you can extend later)
-    let inputs: Vec<ShPort> = Vec::new();
-    let outputs: Vec<ShPort> = Vec::new();
+    // Example I/O ports to show users what they should look like
+    let inputs: Vec<ShPort> = vec![
+        ShPort {
+            name: "url".to_string(),
+            description: "The URL to fetch data from".to_string(),
+            ty: crate::models::ShType::String,
+            required: true,
+            default: None,
+        }
+    ];
+    let outputs: Vec<ShPort> = vec![
+        ShPort {
+            name: "response".to_string(),
+            description: "The HTTP response data".to_string(),
+            ty: crate::models::ShType::Object,
+            required: true,
+            default: None,
+        }
+    ];
 
     // Manifest
     let manifest = ShManifest { 
@@ -1804,6 +1820,8 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
     // Insert input ports
     for input in inputs {
         let port_data = serde_json::json!({
+            "name": input.name,
+            "description": input.description,
             "action_port_type": match input.ty {
                 ShType::String => "STRING",
                 ShType::Integer => "NUMBER",
@@ -1814,8 +1832,12 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
             },
             "action_port_direction": "INPUT",
             "action_version_id": version_id,
-            "rls_owner_id": owner_id
+            "rls_owner_id": owner_id,
+            "is_required": input.required,
+            "default": input.default
         });
+        
+        println!("Inserting input port with data: {}", serde_json::to_string_pretty(&port_data).unwrap_or_default());
         
         let response = client
             .post(&format!("{}/rest/v1/action_ports", api_base))
@@ -1826,14 +1848,18 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
             .send()
             .await?;
         
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to insert input port: {}", response.status())
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("Failed to insert input port: {} - {}", status, error_text)
         }
     }
     
     // Insert output ports
     for output in outputs {
         let port_data = serde_json::json!({
+            "name": output.name,
+            "description": output.description,
             "action_port_type": match output.ty {
                 ShType::String => "STRING",
                 ShType::Integer => "NUMBER",
@@ -1844,9 +1870,12 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
             },
             "action_port_direction": "OUTPUT",
             "action_version_id": version_id,
-            "rls_owner_id": owner_id
-            // Note: We don't have a 'name' field in ShPort, so we can't set it
+            "rls_owner_id": owner_id,
+            "is_required": output.required,
+            "default": output.default
         });
+        
+        println!("Inserting output port with data: {}", serde_json::to_string_pretty(&port_data).unwrap_or_default());
         
         let response = client
             .post(&format!("{}/rest/v1/action_ports", api_base))
@@ -1857,8 +1886,10 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
             .send()
             .await?;
         
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to insert output port: {}", response.status())
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            anyhow::bail!("Failed to insert output port: {} - {}", status, error_text)
         }
     }
     
