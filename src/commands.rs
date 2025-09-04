@@ -970,6 +970,10 @@ pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No email in profile"))?;
     
+    let access_token = validation_data.get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No access token in response"))?;
+    
     // Store the authentication info
     let config_dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
@@ -985,6 +989,7 @@ pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
         "username": profile.get("username").and_then(|v| v.as_str()).unwrap_or(""),
         "full_name": profile.get("full_name").and_then(|v| v.as_str()).unwrap_or(""),
         "namespace": profile.get("username").and_then(|v| v.as_str()).unwrap_or(""), // Use username as namespace for now
+        "access_token": access_token,
         "login_time": chrono::Utc::now().to_rfc3339(),
         "auth_method": "cli_code"
     });
@@ -1001,7 +1006,7 @@ pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
 
 
 /// Load stored authentication configuration
-pub fn load_auth_config() -> anyhow::Result<Option<(String, String, String, String)>> {
+pub fn load_auth_config() -> anyhow::Result<Option<(String, String, String, String, String)>> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
         .join("starthub");
@@ -1031,7 +1036,11 @@ pub fn load_auth_config() -> anyhow::Result<Option<(String, String, String, Stri
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("No namespace in auth config"))?;
     
-    Ok(Some((api_base.to_string(), email.to_string(), profile_id.to_string(), namespace.to_string())))
+    let access_token = auth_config.get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("No access_token in auth config"))?;
+    
+    Ok(Some((api_base.to_string(), email.to_string(), profile_id.to_string(), namespace.to_string(), access_token.to_string())))
 }
 
 /// Logout from Starthub backend
@@ -1062,7 +1071,7 @@ pub async fn cmd_logout_starthub() -> anyhow::Result<()> {
 pub async fn get_user_namespace() -> anyhow::Result<Option<String>> {
     // Load authentication config
     let auth_config = match load_auth_config()? {
-        Some((api_base, _email, profile_id, _namespace)) => (api_base, profile_id),
+        Some((api_base, _email, profile_id, _namespace, _access_token)) => (api_base, profile_id),
         None => return Ok(None),
     };
     
@@ -1088,7 +1097,7 @@ pub async fn get_user_namespace() -> anyhow::Result<Option<String>> {
     
     // Fallback: try to get from local auth config username
     let auth_config = load_auth_config()?;
-    if let Some((_api_base, _email, _profile_id, namespace)) = auth_config {
+    if let Some((_api_base, _email, _profile_id, namespace, _access_token)) = auth_config {
         // Use the locally stored namespace as fallback
         return Ok(Some(namespace));
     }
@@ -1101,7 +1110,7 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
     println!("🔍 Checking authentication status...");
     
     match load_auth_config()? {
-        Some((api_base, email, profile_id, namespace)) => {
+        Some((api_base, email, profile_id, namespace, access_token)) => {
             println!("✅ Authenticated with Starthub backend");
             println!("🌐 API Base: {}", api_base);
             println!("📧 Email: {}", email);
@@ -1113,7 +1122,7 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
             let client = reqwest::Client::new();
             let response = client
                 .get(&format!("{}/functions/v1/profiles", api_base))
-                .header("Authorization", format!("Bearer {}", profile_id))
+                .header("Authorization", format!("Bearer {}", access_token))
                 .send()
                 .await?;
             
@@ -1484,23 +1493,54 @@ pub async fn cmd_status(id: Option<String>) -> Result<()> {
 async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Result<()> {
     // Load authentication config to get profile_id and API base
     let auth_config = load_auth_config()?;
-    let (api_base, _email, profile_id, _namespace) = auth_config.ok_or_else(|| {
+    let (api_base, _email, profile_id, _namespace, access_token) = auth_config.ok_or_else(|| {
         anyhow::anyhow!("No authentication found in auth config. Please run 'starthub login' first.")
     })?;
     
-    // First, check if an action already exists for this name and namespace
-    let action_exists = check_action_exists(&api_base, &lock.name, namespace).await?;
-    
+    println!("Using profile_id from auth config: {}", profile_id);
+
+    // First, check if a git_allowed_repository exists for this namespace, name, and version
+    let git_allowed_repository_id = match check_git_allowed_repository_exists(&api_base, namespace, &lock.name, &lock.version, &access_token).await? {
+        Some(repo_id) => {
+            println!("Using existing git_allowed_repository: {}", repo_id);
+            Some(repo_id)
+        }
+        None => {
+            // Get the owner ID for creating the git_allowed_repository
+            let owner_response = reqwest::Client::new()
+                .get(&format!("{}/rest/v1/owners?select=id&namespace=eq.{}", api_base, namespace))
+                .header("apikey", crate::config::SUPABASE_ANON_KEY)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .send()
+                .await?;
+            
+            if !owner_response.status().is_success() {
+                anyhow::bail!("Failed to get owner ID: {}", owner_response.status())
+            }
+            
+            let owners: Vec<serde_json::Value> = owner_response.json().await?;
+            let owner_id = owners.first()
+                .and_then(|o| o["id"].as_str())
+                .ok_or_else(|| anyhow::anyhow!("Owner not found for namespace: {}", namespace))?;
+            
+            // Create a new git_allowed_repository
+            let repo_id = create_git_allowed_repository(&api_base, namespace, &lock.name, &lock.version, owner_id, &access_token).await?;
+            Some(repo_id)
+        }
+    };
+
+    // Check if an action already exists for this name and namespace
+    let action_exists = check_action_exists(&api_base, &lock.name, namespace, &access_token).await?;
     let action_id = if action_exists {
         // Get the existing action ID
-        get_action_id(&api_base, &lock.name, namespace).await?
+        get_action_id(&api_base, &lock.name, namespace, &access_token).await?
     } else {
-        // Create a new action
-        create_action(&api_base, &lock.name, &lock.description, namespace, &profile_id).await?
+        // Create a new action with the git_allowed_repository_id
+        create_action(&api_base, &lock.name, &lock.description, namespace, &profile_id, git_allowed_repository_id.as_deref(), &access_token).await?
     };
     
     // Check if a version already exists for this action and version number
-    let version_exists = check_version_exists(&api_base, &action_id, &lock.version).await?;
+    let version_exists = check_version_exists(&api_base, &action_id, &lock.version, &access_token).await?;
     
     if version_exists {
         anyhow::bail!(
@@ -1510,10 +1550,13 @@ async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Resul
     }
     
     // Create a new version
-    let version_id = create_action_version(&api_base, &action_id, &lock.version).await?;
+    let version_id = create_action_version(&api_base, &action_id, &lock.version, &access_token).await?;
+    
+    // Update the action with the latest version ID
+    update_action_latest_version(&api_base, &action_id, &version_id, &access_token).await?;
     
     // Insert action ports from the lock file
-    insert_action_ports(&api_base, &version_id, &lock.inputs, &lock.outputs).await?;
+    insert_action_ports(&api_base, &version_id, &lock.inputs, &lock.outputs, &access_token).await?;
     
     println!("✅ Database updated successfully:");
     println!("   🏷️  Action: {} (ID: {})", lock.name, action_id);
@@ -1524,15 +1567,36 @@ async fn update_action_database(lock: &ShLock, namespace: &str) -> anyhow::Resul
 }
 
 /// Checks if an action already exists for the given name and namespace
-async fn check_action_exists(api_base: &str, action_name: &str, namespace: &str) -> anyhow::Result<bool> {
+async fn check_action_exists(api_base: &str, action_name: &str, namespace: &str, access_token: &str) -> anyhow::Result<bool> {
     let client = reqwest::Client::new();
     
-    // Query the actions table joined with owners to check namespace
-    let response = client
-        .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&rls_owner_id=in.(select id from owners where namespace=eq.{})", 
-            api_base, action_name, namespace))
+    println!("Checking if action exists: action_name = '{}', namespace = '{}'", action_name, namespace);
+    
+    // First get the owner ID for this namespace
+    let owner_response = client
+        .get(&format!("{}/rest/v1/owners?select=id&namespace=eq.{}", api_base, namespace))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await?;
+    
+    if !owner_response.status().is_success() {
+        anyhow::bail!("Failed to get owner ID: {}", owner_response.status())
+    }
+    
+    let owners: Vec<serde_json::Value> = owner_response.json().await?;
+    let owner_id = owners.first()
+        .and_then(|o| o["id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("Owner not found for namespace: {}", namespace))?;
+    
+    println!("Found owner ID: {} for namespace: {}", owner_id, namespace);
+    
+    // Now check if action exists for this owner
+    let response = client
+        .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&rls_owner_id=eq.{}", 
+            api_base, action_name, owner_id))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await?;
     
@@ -1545,14 +1609,32 @@ async fn check_action_exists(api_base: &str, action_name: &str, namespace: &str)
 }
 
 /// Gets the ID of an existing action
-async fn get_action_id(api_base: &str, action_name: &str, namespace: &str) -> anyhow::Result<String> {
+async fn get_action_id(api_base: &str, action_name: &str, namespace: &str, access_token: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     
-    let response = client
-        .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&rls_owner_id=in.(select id from owners where namespace=eq.{})", 
-            api_base, action_name, namespace))
+    // First get the owner ID for this namespace
+    let owner_response = client
+        .get(&format!("{}/rest/v1/owners?select=id&namespace=eq.{}", api_base, namespace))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await?;
+    
+    if !owner_response.status().is_success() {
+        anyhow::bail!("Failed to get owner ID: {}", owner_response.status())
+    }
+    
+    let owners: Vec<serde_json::Value> = owner_response.json().await?;
+    let owner_id = owners.first()
+        .and_then(|o| o["id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("Owner not found for namespace: {}", namespace))?;
+    
+    // Now get the action ID
+    let response = client
+        .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&rls_owner_id=eq.{}", 
+            api_base, action_name, owner_id))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await?;
     
@@ -1569,15 +1651,16 @@ async fn get_action_id(api_base: &str, action_name: &str, namespace: &str) -> an
 }
 
 /// Creates a new action
-async fn create_action(api_base: &str, action_name: &str, description: &str, namespace: &str, profile_id: &str) -> anyhow::Result<String> {
+async fn create_action(api_base: &str, action_name: &str, description: &str, namespace: &str, profile_id: &str, git_allowed_repository_id: Option<&str>, access_token: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     
     // First get the owner ID for this profile
+    println!("Looking up owner for profile_id: {}", profile_id);
     let owner_response = client
-        .get(&format!("{}/rest/v1/owners?select=id&profile_id=eq.{}&owner_type=eq.PROFILE", 
+        .get(&format!("{}/rest/v1/owners?select=id,profile_id,owner_type&profile_id=eq.{}&owner_type=eq.PROFILE", 
             api_base, profile_id))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await?;
     
@@ -1586,28 +1669,53 @@ async fn create_action(api_base: &str, action_name: &str, description: &str, nam
     }
     
     let owners: Vec<serde_json::Value> = owner_response.json().await?;
+    println!("Found owners: {}", serde_json::to_string_pretty(&owners).unwrap_or_default());
+    
     let owner_id = owners.first()
         .and_then(|o| o["id"].as_str())
         .ok_or_else(|| anyhow::anyhow!("Owner not found for profile"))?;
+    
+    println!("Using owner_id: {}", owner_id);
     
     // Create the action
     let action_data = serde_json::json!({
         "name": action_name,
         "description": description,
-        "rls_owner_id": owner_id
+        "rls_owner_id": owner_id,
+        "git_allowed_repository_id": git_allowed_repository_id
     });
+    
+    println!("Creating action with data: {}", serde_json::to_string_pretty(&action_data).unwrap_or_default());
+    
+    // Debug: Test can_act_on_owner function directly
+    let debug_response = client
+        .post(&format!("{}/rest/v1/rpc/can_act_on_owner", api_base))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({"p_owner_id": owner_id}))
+        .send()
+        .await?;
+    
+    if debug_response.status().is_success() {
+        let can_act: serde_json::Value = debug_response.json().await?;
+        println!("can_act_on_owner({}) returns: {}", owner_id, can_act);
+    } else {
+        println!("Failed to test can_act_on_owner: {}", debug_response.status());
+    }
     
     let response = client
         .post(&format!("{}/rest/v1/actions", api_base))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .header("Prefer", "return=representation")
         .json(&action_data)
         .send()
         .await?;
     
-    if response.status().is_success() {
+    let status = response.status();
+    if status.is_success() {
         let actions: Vec<serde_json::Value> = response.json().await?;
         if let Some(action) = actions.first() {
             Ok(action["id"].as_str().unwrap_or_default().to_string())
@@ -1615,19 +1723,20 @@ async fn create_action(api_base: &str, action_name: &str, description: &str, nam
             anyhow::bail!("Failed to get created action ID")
         }
     } else {
-        anyhow::bail!("Failed to create action: {}", response.status())
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        anyhow::bail!("Failed to create action: {} - {}", status, error_text)
     }
 }
 
 /// Checks if a version already exists for the given action and version number
-async fn check_version_exists(api_base: &str, action_id: &str, version_number: &str) -> anyhow::Result<bool> {
+async fn check_version_exists(api_base: &str, action_id: &str, version_number: &str, access_token: &str) -> anyhow::Result<bool> {
     let client = reqwest::Client::new();
     
     let response = client
         .get(&format!("{}/rest/v1/action_versions?select=id&action_id=eq.{}&version_number=eq.{}", 
             api_base, action_id, version_number))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await?;
     
@@ -1640,7 +1749,7 @@ async fn check_version_exists(api_base: &str, action_id: &str, version_number: &
 }
 
 /// Creates a new action version
-async fn create_action_version(api_base: &str, action_id: &str, version_number: &str) -> anyhow::Result<String> {
+async fn create_action_version(api_base: &str, action_id: &str, version_number: &str, access_token: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     
     let version_data = serde_json::json!({
@@ -1651,7 +1760,7 @@ async fn create_action_version(api_base: &str, action_id: &str, version_number: 
     let response = client
         .post(&format!("{}/rest/v1/action_versions", api_base))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
         .header("Content-Type", "application/json")
         .header("Prefer", "return=representation")
         .json(&version_data)
@@ -1671,7 +1780,7 @@ async fn create_action_version(api_base: &str, action_id: &str, version_number: 
 }
 
 /// Inserts action ports for inputs and outputs
-async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort], outputs: &[ShPort]) -> anyhow::Result<()> {
+async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort], outputs: &[ShPort], access_token: &str) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     
     // Get the owner ID for this version (needed for RLS)
@@ -1679,7 +1788,7 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
         .get(&format!("{}/rest/v1/action_versions?select=rls_owner_id&id=eq.{}", 
             api_base, version_id))
         .header("apikey", crate::config::SUPABASE_ANON_KEY)
-        .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+        .header("Authorization", format!("Bearer {}", access_token))
         .send()
         .await?;
     
@@ -1711,7 +1820,7 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
         let response = client
             .post(&format!("{}/rest/v1/action_ports", api_base))
             .header("apikey", crate::config::SUPABASE_ANON_KEY)
-            .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+            .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
             .json(&port_data)
             .send()
@@ -1742,7 +1851,7 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
         let response = client
             .post(&format!("{}/rest/v1/action_ports", api_base))
             .header("apikey", crate::config::SUPABASE_ANON_KEY)
-            .header("Authorization", format!("Bearer {}", crate::config::SUPABASE_ANON_KEY))
+            .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
             .json(&port_data)
             .send()
@@ -1754,6 +1863,132 @@ async fn insert_action_ports(api_base: &str, version_id: &str, inputs: &[ShPort]
     }
     
     Ok(())
+}
+
+/// Checks if a git_allowed_repository exists for the given namespace, name, and version
+async fn check_git_allowed_repository_exists(api_base: &str, namespace: &str, name: &str, version: &str, access_token: &str) -> anyhow::Result<Option<String>> {
+    let client = reqwest::Client::new();
+    
+    println!("Checking if git_allowed_repository exists: namespace = '{}', name = '{}', version = '{}'", namespace, name, version);
+    
+    // First get the owner ID for this namespace
+    let owner_response = client
+        .get(&format!("{}/rest/v1/owners?select=id&namespace=eq.{}", api_base, namespace))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await?;
+    
+    if !owner_response.status().is_success() {
+        anyhow::bail!("Failed to get owner ID: {}", owner_response.status())
+    }
+    
+    let owners: Vec<serde_json::Value> = owner_response.json().await?;
+    let owner_id = owners.first()
+        .and_then(|o| o["id"].as_str())
+        .ok_or_else(|| anyhow::anyhow!("Owner not found for namespace: {}", namespace))?;
+    
+    println!("Found owner ID: {} for namespace: {}", owner_id, namespace);
+    
+    // Check if git_allowed_repository exists for this owner, name, and version
+    // We'll use the name as the slug and create a full_name from namespace/name
+    let full_name = format!("{}/{}", namespace, name);
+    let response = client
+        .get(&format!("{}/rest/v1/git_allowed_repositories?select=id&owner_id=eq.{}&full_name=eq.{}", 
+            api_base, owner_id, full_name))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        let repos: Vec<serde_json::Value> = response.json().await?;
+        if let Some(repo) = repos.first() {
+            let repo_id = repo["id"].as_str().unwrap_or_default().to_string();
+            println!("Found existing git_allowed_repository: {}", repo_id);
+            Ok(Some(repo_id))
+        } else {
+            println!("No existing git_allowed_repository found");
+            Ok(None)
+        }
+    } else {
+        anyhow::bail!("Failed to check git_allowed_repository existence: {}", response.status())
+    }
+}
+
+/// Creates a new git_allowed_repository for the given namespace, name, and version
+async fn create_git_allowed_repository(api_base: &str, namespace: &str, name: &str, version: &str, owner_id: &str, access_token: &str) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    
+    println!("Creating new git_allowed_repository: namespace = '{}', name = '{}', version = '{}'", namespace, name, version);
+    
+    // Create the git_allowed_repository data
+    let full_name = format!("{}/{}", namespace, name);
+    let repo_data = serde_json::json!({
+        "namespace": namespace,
+        "slug": name,
+        "full_name": full_name,
+        "owner_id": owner_id,
+        "git_provider": "GITHUB",
+        "external_id": null,
+        "git_app_installation_id": null
+    });
+    
+    println!("Creating git_allowed_repository with data: {}", serde_json::to_string_pretty(&repo_data).unwrap_or_default());
+    
+    let response = client
+        .post(&format!("{}/rest/v1/git_allowed_repositories", api_base))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .header("Prefer", "return=representation")
+        .json(&repo_data)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    if status.is_success() {
+        let repos: Vec<serde_json::Value> = response.json().await?;
+        if let Some(repo) = repos.first() {
+            let repo_id = repo["id"].as_str().unwrap_or_default().to_string();
+            println!("✅ Created git_allowed_repository: {}", repo_id);
+            Ok(repo_id)
+        } else {
+            anyhow::bail!("Failed to get created git_allowed_repository ID")
+        }
+    } else {
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        anyhow::bail!("Failed to create git_allowed_repository: {} - {}", status, error_text)
+    }
+}
+
+/// Updates the actions table to set the latest_action_version_id
+async fn update_action_latest_version(api_base: &str, action_id: &str, version_id: &str, access_token: &str) -> anyhow::Result<()> {
+    let client = reqwest::Client::new();
+    
+    println!("Updating action {} with latest_action_version_id: {}", action_id, version_id);
+    
+    let update_data = serde_json::json!({
+        "latest_action_version_id": version_id
+    });
+    
+    let response = client
+        .patch(&format!("{}/rest/v1/actions?id=eq.{}", api_base, action_id))
+        .header("apikey", crate::config::SUPABASE_ANON_KEY)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&update_data)
+        .send()
+        .await?;
+    
+    let status = response.status();
+    if status.is_success() {
+        println!("✅ Successfully updated action with latest_action_version_id");
+        Ok(())
+    } else {
+        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        anyhow::bail!("Failed to update action latest version: {} - {}", status, error_text)
+    }
 }
 
 #[cfg(test)]
@@ -1912,14 +2147,18 @@ mod tests {
         // Test Docker kind
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
             manifest_version: 1,
-            kind: ShKind::Docker,
+            kind: Some(ShKind::Docker),
             repository: "https://github.com/org/repo".to_string(),
-            image: "ghcr.io/org/repo".to_string(),
+            image: Some("ghcr.io/org/repo".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = derive_image_base(&manifest, None);
         assert_eq!(result.unwrap(), "ghcr.io/org/repo");
@@ -1927,14 +2166,18 @@ mod tests {
         // Test WASM kind
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
-            kind: ShKind::Wasm,
             manifest_version: 1,
+            kind: Some(ShKind::Wasm),
             repository: "https://github.com/org/repo".to_string(),
-            image: "ghcr.io/org/repo".to_string(),
+            image: Some("ghcr.io/org/repo".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = derive_image_base(&manifest, None);
         assert_eq!(result.unwrap(), "ghcr.io/org/repo");
@@ -1942,14 +2185,18 @@ mod tests {
         // Test with non-GitHub repository
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
             manifest_version: 1,
-            kind: ShKind::Docker,
+            kind: Some(ShKind::Docker),
             repository: "https://gitlab.com/org/repo".to_string(),
-            image: "ghcr.io/owner/package".to_string(),
+            image: Some("ghcr.io/owner/package".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let result = derive_image_base(&manifest, None);
         assert_eq!(result.unwrap(), "ghcr.io/owner/package");
@@ -2067,14 +2314,18 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manifest = ShManifest {
             name: "test".to_string(),
+            description: "Test manifest".to_string(),
             version: "1.0.0".to_string(),
-            kind: ShKind::Docker,
             manifest_version: 1,
+            kind: Some(ShKind::Docker),
             repository: "ghcr.io/org/image".to_string(),
-            image: "ghcr.io/org/image".to_string(),
+            image: Some("ghcr.io/org/image".to_string()),
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
         };
         let image_base = "ghcr.io/org/image";
         let digest = "sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
