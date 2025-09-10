@@ -1552,7 +1552,7 @@ async fn update_action_database(manifest: &ShManifest, namespace: &str) -> anyho
         get_action_id(&api_base, &manifest.name, namespace, &access_token).await?
     } else {
         // Create a new action with the git_allowed_repository_id
-        create_action(&api_base, &manifest.name, &manifest.description, namespace, &profile_id, git_allowed_repository_id.as_deref(), &access_token).await?
+        create_action(&api_base, &manifest.name, &manifest.description, namespace, &profile_id, git_allowed_repository_id.as_deref(), manifest.kind.as_ref(), &access_token).await?
     };
     
     // Check if a version already exists for this action and version number
@@ -1667,7 +1667,7 @@ async fn get_action_id(api_base: &str, action_name: &str, namespace: &str, acces
 }
 
 /// Creates a new action
-async fn create_action(api_base: &str, action_name: &str, description: &str, namespace: &str, profile_id: &str, git_allowed_repository_id: Option<&str>, access_token: &str) -> anyhow::Result<String> {
+async fn create_action(api_base: &str, action_name: &str, description: &str, namespace: &str, profile_id: &str, git_allowed_repository_id: Option<&str>, kind: Option<&crate::models::ShKind>, access_token: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     
     // First get the owner ID for this profile
@@ -1693,12 +1693,21 @@ async fn create_action(api_base: &str, action_name: &str, description: &str, nam
     
     println!("Using owner_id: {}", owner_id);
     
+    // Convert ShKind to database enum value
+    let kind_value = match kind {
+        Some(crate::models::ShKind::Docker) => "DOCKER",
+        Some(crate::models::ShKind::Wasm) => "WASM", 
+        Some(crate::models::ShKind::Composition) => "COMPOSITION",
+        None => "COMPOSITION", // Default to COMPOSITION if not specified
+    };
+    
     // Create the action
     let action_data = serde_json::json!({
         "name": action_name,
         "description": description,
         "rls_owner_id": owner_id,
-        "git_allowed_repository_id": git_allowed_repository_id
+        "git_allowed_repository_id": git_allowed_repository_id,
+        "kind": kind_value
     });
     
     println!("Creating action with data: {}", serde_json::to_string_pretty(&action_data).unwrap_or_default());
