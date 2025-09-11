@@ -14,6 +14,10 @@ pub struct ShManifest {
     pub license: String,
     pub inputs: Vec<ShPort>,
     pub outputs: Vec<ShPort>,
+    // Custom type definitions
+    #[serde(default)]
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub types: std::collections::HashMap<String, serde_json::Value>,
     // Composite action fields
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -79,8 +83,7 @@ pub struct ShDistribution {
     pub upstream: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ShType {
     String,
     Integer,
@@ -88,6 +91,52 @@ pub enum ShType {
     Object,
     Array,
     Number,
+    Custom(String), // For custom types like "HttpHeaders", "HttpResponse", etc.
+}
+
+impl ShType {
+    pub fn from_str(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "string" => ShType::String,
+            "integer" => ShType::Integer,
+            "boolean" => ShType::Boolean,
+            "object" => ShType::Object,
+            "array" => ShType::Array,
+            "number" => ShType::Number,
+            _ => ShType::Custom(s.to_string()),
+        }
+    }
+    
+    pub fn to_string(&self) -> String {
+        match self {
+            ShType::String => "string".to_string(),
+            ShType::Integer => "integer".to_string(),
+            ShType::Boolean => "boolean".to_string(),
+            ShType::Object => "object".to_string(),
+            ShType::Array => "array".to_string(),
+            ShType::Number => "number".to_string(),
+            ShType::Custom(name) => name.clone(),
+        }
+    }
+}
+
+impl serde::Serialize for ShType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ShType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(ShType::from_str(&s))
+    }
 }
 
 // Composite action structures
@@ -145,6 +194,7 @@ mod tests {
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            types: std::collections::HashMap::new(),
             steps: vec![],
             wires: vec![],
             export: serde_json::json!({}),
@@ -328,6 +378,7 @@ mod tests {
                     default: None,
                 },
             ],
+            types: std::collections::HashMap::new(),
             steps: vec![],
             wires: vec![],
             export: serde_json::json!({}),
@@ -340,5 +391,71 @@ mod tests {
         assert_eq!(manifest.outputs.len(), deserialized.outputs.len());
         assert_eq!(manifest.inputs[0].name, deserialized.inputs[0].name);
         assert_eq!(manifest.outputs[0].name, deserialized.outputs[0].name);
+    }
+
+    #[test]
+    fn test_custom_types() {
+        let mut types = std::collections::HashMap::new();
+        types.insert("HttpHeaders".to_string(), serde_json::json!({
+            "Content-Type": "string",
+            "Authorization": "string",
+            "User-Agent": "string"
+        }));
+        types.insert("HttpResponse".to_string(), serde_json::json!({
+            "status": "number",
+            "body": "string"
+        }));
+
+        let manifest = ShManifest {
+            name: "test-package".to_string(),
+            description: "Test package with custom types".to_string(),
+            version: "1.0.0".to_string(),
+            kind: Some(ShKind::Wasm),
+            manifest_version: 1,
+            repository: "github.com/test/package".to_string(),
+            image: Some("ghcr.io/test/package".to_string()),
+            license: "MIT".to_string(),
+            inputs: vec![
+                ShPort {
+                    name: "headers".to_string(),
+                    description: "HTTP headers".to_string(),
+                    ty: ShType::Custom("HttpHeaders".to_string()),
+                    required: false,
+                    default: None,
+                },
+            ],
+            outputs: vec![
+                ShPort {
+                    name: "response".to_string(),
+                    description: "HTTP response".to_string(),
+                    ty: ShType::Custom("HttpResponse".to_string()),
+                    required: true,
+                    default: None,
+                },
+            ],
+            types,
+            steps: vec![],
+            wires: vec![],
+            export: serde_json::json!({}),
+        };
+
+        let json = serde_json::to_string(&manifest).unwrap();
+        let deserialized: ShManifest = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(manifest.types.len(), deserialized.types.len());
+        assert!(deserialized.types.contains_key("HttpHeaders"));
+        assert!(deserialized.types.contains_key("HttpResponse"));
+        assert!(matches!(deserialized.inputs[0].ty, ShType::Custom(ref name) if name == "HttpHeaders"));
+        assert!(matches!(deserialized.outputs[0].ty, ShType::Custom(ref name) if name == "HttpResponse"));
+    }
+
+    #[test]
+    fn test_sh_type_custom_serialization() {
+        let custom_type = ShType::Custom("HttpHeaders".to_string());
+        let json = serde_json::to_string(&custom_type).unwrap();
+        assert_eq!(json, r#""HttpHeaders""#);
+
+        let deserialized: ShType = serde_json::from_str(&json).unwrap();
+        assert!(matches!(deserialized, ShType::Custom(ref name) if name == "HttpHeaders"));
     }
 }

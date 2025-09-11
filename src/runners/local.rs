@@ -778,6 +778,7 @@ fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<ShM
         license: "".to_string(),
         inputs,
         outputs,
+        types: std::collections::HashMap::new(),
         steps: comp_steps,
         wires: vec![], // No wires defined in current API
         export: serde_json::json!({}), // No export defined in current API
@@ -880,6 +881,7 @@ mod tests {
                     default: None,
                 }
             ],
+            types: std::collections::HashMap::new(),
             steps: vec![
                 ShActionStep {
                     id: "step1".to_string(),
