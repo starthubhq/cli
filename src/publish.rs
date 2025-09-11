@@ -33,6 +33,7 @@ mod tests {
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            types: std::collections::HashMap::new(),
             steps: vec![],
             wires: vec![],
             export: serde_json::json!({}),
