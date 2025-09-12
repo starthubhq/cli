@@ -72,6 +72,10 @@ pub struct ShLock {
     pub license: String,
     pub inputs: Vec<ShPort>,
     pub outputs: Vec<ShPort>,
+    // Custom type definitions
+    #[serde(default)]
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub types: std::collections::HashMap<String, serde_json::Value>,
     pub distribution: ShDistribution,
     pub digest: String,
 }
@@ -297,6 +301,7 @@ mod tests {
             license: "MIT".to_string(),
             inputs: vec![],
             outputs: vec![],
+            types: std::collections::HashMap::new(),
             distribution: ShDistribution {
                 primary: "oci://ghcr.io/test/package@sha256:abc123".to_string(),
                 upstream: None,

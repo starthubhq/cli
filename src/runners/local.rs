@@ -1,24 +1,23 @@
 // src/runners/local.rs
 use anyhow::{Result, bail, Context, anyhow};
-use serde::{Deserialize};
 use serde_json::{json, Value, Map};
 use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command};
 use tokio::sync::mpsc;
 use std::path::Path;
-use std::fs;
 use std::collections::{HashSet, HashMap, VecDeque};
 use which::which;
 
 use super::{Runner, DeployCtx};
-use crate::starthub_api::{Client as HubClient, ActionMetadata};
-use crate::models::{ShManifest, ShPort, ShType, ShActionStep};
+use crate::starthub_api::Client as HubClient;
+use crate::models::ShManifest;
 use crate::config::{STARTHUB_API_BASE, SUPABASE_ANON_KEY};
-use crate::runners::models::{ActionPlan, StepSpec, MountSpec};
+use crate::runners::models::{ActionPlan, StepSpec};
 
 // ============================================================================
 // CONSTANTS
 // ============================================================================
 
+#[allow(dead_code)]
 const ST_MARKER: &str = "::starthub:state::";
 
 // ============================================================================
@@ -31,7 +30,7 @@ const ST_MARKER: &str = "::starthub:state::";
 pub use crate::models::ShActionStep as ActionStep;
 
 // Use the ShWire types from models.rs instead of duplicating
-pub use crate::models::{ShWire as Wire, ShWireFrom as WireFrom, ShWireTo as WireTo};
+pub use crate::models::ShWire as Wire;
 
 
 
@@ -146,92 +145,6 @@ impl Runner for LocalRunner {
 // EXECUTION
 // ============================================================================
 #[allow(dead_code)]
-async fn execute(client: &HubClient, comp: &ShManifest, _ctx: &DeployCtx) -> Result<()> {
-    // 0) Build fast lookup tables
-    let step_map: HashMap<_,_> = comp.steps.iter().map(|s| (s.id.clone(), s)).collect();
-
-    // 1) Inputs map (empty since no secrets are supported)
-    let inputs_map: HashMap<String,String> = HashMap::new();
-
-    // 2) Prefetch (do both docker & wasm)
-    for s in &comp.steps {
-        match s.kind.as_deref() {
-            Some("docker") => { let _ = docker_pull(&s.uses).await; }
-            Some("wasm")   => { let _ = client.download_wasm(&s.uses, &std::env::temp_dir().join("starthub/oci")).await?; }
-            _ => {}
-        }
-    }
-
-    // 3) Run in topo order
-    let order = topo_order(&comp.steps, &comp.wires)?;
-    let mut state = json!({});
-    let mut step_outputs: HashMap<String, HashMap<String,String>> = HashMap::new();
-
-    for sid in order {
-        let s = step_map.get(&sid).unwrap();
-        let step_kind = if s.kind.as_deref().unwrap_or("").is_empty() { "docker" } else { s.kind.as_deref().unwrap_or("docker") };
-
-        // 3a) Resolve env for this step from wires + with
-        let env = build_env_for_step(&sid, &s.with, &comp.wires, &inputs_map, &step_outputs)?;
-
-        // 3b) Build a transient StepSpec to reuse docker executor
-        let step_spec = StepSpec {
-            id: sid.clone(),
-            kind: step_kind.to_string(),
-            ref_: s.uses.clone(),
-            entry: None,
-            args: vec![],
-            env: env.clone(),
-            mounts: vec![],
-            timeout_ms: Some(300_000),
-            network: Some("bridge".into()),
-            workdir: None,
-        };
-
-        // 3c) Run it (pass current state)
-        let patch = match step_kind {
-            "docker" => run_docker_step_collect_state(&step_spec, None, &state).await?,
-            "wasm"   => run_wasm_step(client, &step_spec, None, &std::env::temp_dir().join("starthub/oci"), &state).await?,
-            other    => bail!("unknown step.kind '{}'", other),
-        };
-
-        // 3d) Merge state
-        if !patch.is_null() { deep_merge(&mut state, patch); }
-
-        // 3e) Compute step outputs (only those referenced by downstream wires)
-        let outs = extract_step_outputs(&sid, &state, &comp.wires);
-        step_outputs.insert(sid.clone(), outs);
-    }
-
-    // 4) Composite export (optional)
-    if !comp.export.is_null() {
-        // Very small evaluator that supports { "from": { step/key/value } }
-        if let Some(project_id_from) = comp.export.get("project_id") {
-            if let Some(from) = project_id_from.get("from") {
-                let val = if let Some(s) = from.get("step").and_then(|x| x.as_str()) {
-                    let out = from.get("output").and_then(|x| x.as_str()).unwrap_or("");
-                    step_outputs.get(s).and_then(|m| m.get(out)).cloned().unwrap_or_default()
-                } else if let Some(src) = from.get("source").and_then(|x| x.as_str()) {
-                    if src == "inputs" {
-                        let key = from.get("key").and_then(|x| x.as_str()).unwrap_or("");
-                        inputs_map.get(key).cloned().unwrap_or_default()
-                    } else { String::new() }
-                } else if let Some(v) = from.get("value") {
-                    if let Some(s) = v.as_str() { s.to_string() } else { v.to_string() }
-                } else { String::new() };
-
-                println!("project_id={}", val);
-            }
-        }
-    }
-
-    // Also print final state for debugging
-    println!("=== final state ===\n{}", serde_json::to_string_pretty(&state)?);
-
-    Ok(())
-}
-
-#[allow(dead_code)]
 async fn run_action_plan(client: &HubClient, plan: &ActionPlan, _ctx: &DeployCtx) -> Result<()> {
     // Prefetch
     let cache_dir = dirs::cache_dir().unwrap_or(std::env::temp_dir()).join("starthub/oci");
@@ -259,6 +172,7 @@ async fn run_action_plan(client: &HubClient, plan: &ActionPlan, _ctx: &DeployCtx
 // STEP EXECUTION
 // ============================================================================
 
+#[allow(dead_code)]
 async fn run_docker_step_collect_state(
     step: &StepSpec,
     pipeline_workdir: Option<&str>,
@@ -380,6 +294,7 @@ async fn run_docker_step_collect_state(
     Ok(patch)
 }
 
+#[allow(dead_code)]
 async fn run_wasm_step(
     client: &HubClient,
     step: &StepSpec,
@@ -483,30 +398,8 @@ async fn run_wasm_step(
 // UTILITY FUNCTIONS
 // ============================================================================
 
-fn looks_like_local_composite(s: &str) -> bool {
-    let t = s.trim();
-    t.starts_with('{') || t.ends_with(".json") || t.starts_with("file://") || Path::new(t).exists()
-}
-
-fn try_load_composite_spec(action: &str) -> Result<ShManifest> {
-    let mut s = action.trim();
-    if let Some(rest) = s.strip_prefix("file://") { s = rest; }
-
-    if s.starts_with('{') {
-        return Ok(serde_json::from_str::<ShManifest>(s).context("parsing inline composite json")?);
-    }
-    if s.ends_with(".json") || Path::new(s).exists() {
-        let txt = fs::read_to_string(s).with_context(|| format!("reading composite file '{}'", s))?;
-        return Ok(serde_json::from_str::<ShManifest>(&txt).context("parsing composite json")?);
-    }
-    Err(anyhow!("not a composite spec reference: {}", action))
-}
 
 #[allow(dead_code)]
-fn looks_like_oci_image(s: &str) -> bool {
-    s.contains("@sha256:") || s.contains(':')
-}
-
 fn absolutize(p: &str, base: Option<&str>) -> Result<String> {
     let path = Path::new(p);
     let abs = if path.is_absolute() {
@@ -563,6 +456,7 @@ pub fn topo_order(steps: &[ActionStep], wires: &[Wire]) -> Result<Vec<String>> {
 // ENVIRONMENT AND WIRING
 // ============================================================================
 
+#[allow(dead_code)]
 fn build_env_for_step(
     step_id: &str,
     step_with: &HashMap<String, serde_json::Value>,
@@ -613,6 +507,7 @@ fn build_env_for_step(
 // STATE MANAGEMENT
 // ============================================================================
 
+#[allow(dead_code)]
 fn lookup_state_path(state: &Value, path: &str) -> Option<String> {
     let mut cur = state;
     for seg in path.split('.') {
@@ -628,6 +523,7 @@ fn lookup_state_path(state: &Value, path: &str) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 fn derive_output_by_name(name: &str, state: &Value) -> Option<String> {
     // 1) exact key at root
     if let Some(v) = state.get(name) {
@@ -645,6 +541,7 @@ fn derive_output_by_name(name: &str, state: &Value) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn collect_needed_outputs_for(step_id: &str, wires: &[Wire]) -> HashSet<String> {
     wires.iter()
         .filter(|w| w.from.step.as_deref()==Some(step_id))
@@ -652,6 +549,7 @@ fn collect_needed_outputs_for(step_id: &str, wires: &[Wire]) -> HashSet<String> 
         .collect()
 }
 
+#[allow(dead_code)]
 fn extract_step_outputs(step_id: &str, state: &Value, wires: &[Wire]) -> HashMap<String,String> {
     let mut m = HashMap::new();
     for out_name in collect_needed_outputs_for(step_id, wires) {
@@ -663,6 +561,7 @@ fn extract_step_outputs(step_id: &str, state: &Value, wires: &[Wire]) -> HashMap
 }
 
 // Deep-merge: b overrides a
+#[allow(dead_code)]
 fn deep_merge(a: &mut Value, b: Value) {
     match (a, b) {
         (Value::Object(ao), Value::Object(bo)) => {
@@ -677,34 +576,6 @@ fn deep_merge(a: &mut Value, b: Value) {
 // ============================================================================
 
 // helper: create a single-step plan from an image ref
-#[allow(dead_code)]
-fn single_step_plan_from_image(image: &str, secrets: &[(String,String)]) -> ActionPlan {
-    let mut env: HashMap<String,String> = HashMap::new();
-    for (k,v) in secrets { env.insert(k.clone(), v.clone()); }
-
-    ActionPlan {
-        id: format!("image:{}", image),
-        version: "1".into(),
-        workdir: None,
-        steps: vec![StepSpec {
-            id: "run".into(),
-            kind: "docker".into(),
-            ref_: image.to_string(),
-            entry: None,
-            args: vec![],
-            env,
-            mounts: vec![MountSpec {
-                typ: "bind".into(),
-                source: "./out".into(),
-                target: "/out".into(),
-                rw: true,
-            }],
-            timeout_ms: Some(300_000),
-            network: Some("bridge".into()),
-            workdir: None,
-        }],
-    }
-}
 
 // ============================================================================
 // PREFETCHING
@@ -736,54 +607,6 @@ async fn docker_pull(image: &str) -> Result<()> {
 // ACTION METADATA CONVERSION
 // ============================================================================
 
-/// Convert ActionMetadata from the API to a CompositeSpec for local execution
-fn convert_action_metadata_to_composite(metadata: &ActionMetadata) -> Result<ShManifest> {
-    // Since the current API doesn't provide steps/wires/export, create a simple single-step composite
-    // that can be executed locally
-    let comp_steps = vec![ActionStep {
-        id: "run".to_string(),
-        kind: Some("docker".to_string()),
-        uses: "alpine:latest".to_string(), // Default to alpine for now
-        with: std::collections::HashMap::new(),
-    }];
-
-    let inputs = metadata.inputs.as_ref()
-        .map(|inputs| inputs.iter().map(|input| ShPort {
-            name: input.name.clone(),
-            description: format!("Input: {}", input.action_port_direction),
-            ty: ShType::String, // Default to string type
-            required: true,
-            default: None,
-        }).collect())
-        .unwrap_or_default();
-
-    let outputs = metadata.outputs.as_ref()
-        .map(|outputs| outputs.iter().map(|output| ShPort {
-            name: output.name.clone(),
-            description: format!("Output: {}", output.action_port_direction),
-            ty: ShType::String, // Default to string type
-            required: true,
-            default: None,
-        }).collect())
-        .unwrap_or_default();
-
-    Ok(ShManifest {
-        name: metadata.name.clone(),
-        version: metadata.version_number.clone(),
-        description: metadata.description.clone(),
-        kind: None,
-        manifest_version: 1,
-        repository: "".to_string(),
-        image: Some("".to_string()),
-        license: "".to_string(),
-        inputs,
-        outputs,
-        types: std::collections::HashMap::new(),
-        steps: comp_steps,
-        wires: vec![], // No wires defined in current API
-        export: serde_json::json!({}), // No export defined in current API
-    })
-}
 
 // ============================================================================
 // RECURSIVE ACTION FETCHING
@@ -841,596 +664,3 @@ async fn fetch_all_action_manifests(
     Ok(all_manifests)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use tempfile::tempdir;
-    use std::fs;
-    use std::collections::HashMap;
-
-    // ============================================================================
-    // TEST HELPERS
-    // ============================================================================
-
-    fn create_test_composite_spec() -> ShManifest {
-        ShManifest {
-            name: "test-composite".to_string(),
-            version: "1.0.0".to_string(),
-            description: "Test composite for unit testing".to_string(),
-            kind: None,
-            manifest_version: 1,
-            repository: "test".to_string(),
-            image: Some("test".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![
-                ShPort {
-                    name: "test_input".to_string(),
-                    description: "Test input".to_string(),
-                    ty: ShType::String,
-                    required: true,
-                    default: None,
-                }
-            ],
-            outputs: vec![
-                ShPort {
-                    name: "test_output".to_string(),
-                    description: "Test output".to_string(),
-                    ty: ShType::String,
-                    required: true,
-                    default: None,
-                }
-            ],
-            types: std::collections::HashMap::new(),
-            steps: vec![
-                ShActionStep {
-                    id: "step1".to_string(),
-                    kind: Some("docker".to_string()),
-                    uses: "alpine:latest".to_string(),
-                    with: HashMap::<String, serde_json::Value>::new(),
-                }
-            ],
-            wires: vec![],
-            export: json!({}),
-        }
-    }
-
-    fn create_test_deploy_ctx() -> DeployCtx {
-        DeployCtx {
-            action: "test-action".to_string(),
-            owner: None,
-            repo: None,
-        }
-    }
-
-    // ============================================================================
-    // UTILITY FUNCTION TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_looks_like_local_composite() {
-        // Test JSON string
-        assert!(looks_like_local_composite("{ \"name\": \"test\" }"));
-        
-        // Test JSON file path
-        assert!(looks_like_local_composite("test.json"));
-        
-        // Test file:// protocol
-        assert!(looks_like_local_composite("file://test.json"));
-        
-        // Test regular string (should be false)
-        assert!(!looks_like_local_composite("just-a-string"));
-    }
-
-    #[test]
-    fn test_looks_like_oci_image() {
-        // Test with digest
-        assert!(looks_like_oci_image("alpine@sha256:abc123"));
-        
-        // Test with tag
-        assert!(looks_like_oci_image("alpine:latest"));
-        
-        // Test with registry
-        assert!(looks_like_oci_image("docker.io/alpine:latest"));
-        
-        // Test regular string (should be false)
-        assert!(!looks_like_oci_image("just-a-string"));
-    }
-
-    #[test]
-    fn test_absolutize() {
-        // Test absolute path (use a path that actually exists)
-        let abs_path = absolutize("/tmp", None).unwrap();
-        assert!(abs_path.starts_with('/'));
-        
-        // Test relative path with base (use a known absolute path)
-        let rel_path = absolutize("tmp", Some("/")).unwrap();
-        assert!(rel_path.contains("tmp"));
-    }
-
-    // ============================================================================
-    // GRAPH ALGORITHM TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_topo_order_simple() {
-        let steps = vec![
-            ActionStep {
-                id: "step1".to_string(),
-                kind: Some("docker".to_string()),
-                uses: "alpine:latest".to_string(),
-                with: HashMap::<String, serde_json::Value>::new(),
-            },
-            ActionStep {
-                id: "step2".to_string(),
-                kind: Some("docker".to_string()),
-                uses: "alpine:latest".to_string(),
-                with: HashMap::<String, serde_json::Value>::new(),
-            }
-        ];
-        
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step1".to_string()),
-                    output: Some("output".to_string()),
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step2".to_string(),
-                    input: "input".to_string(),
-                }
-            }
-        ];
-        
-        let order = topo_order(&steps, &wires).unwrap();
-        assert_eq!(order, vec!["step1", "step2"]);
-    }
-
-    #[test]
-    fn test_topo_order_cycle_detection() {
-        let steps = vec![
-            ActionStep {
-                id: "step1".to_string(),
-                kind: Some("docker".to_string()),
-                uses: "alpine:latest".to_string(),
-                with: HashMap::<String, serde_json::Value>::new(),
-            },
-            ActionStep {
-                id: "step2".to_string(),
-                kind: Some("docker".to_string()),
-                uses: "alpine:latest".to_string(),
-                with: HashMap::<String, serde_json::Value>::new(),
-            }
-        ];
-        
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step1".to_string()),
-                    output: Some("output".to_string()),
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step2".to_string(),
-                    input: "input".to_string(),
-                }
-            },
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step2".to_string()),
-                    output: Some("output".to_string()),
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input".to_string(),
-                }
-            }
-        ];
-        
-        let result = topo_order(&steps, &wires);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("cycle detected"));
-    }
-
-    // ============================================================================
-    // STATE MANAGEMENT TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_lookup_state_path() {
-        let state = json!({
-            "user": {
-                "name": "test",
-                "profile": {
-                    "age": 25
-                }
-            },
-            "items": ["item1", "item2"]
-        });
-        
-        // Test object path
-        assert_eq!(lookup_state_path(&state, "user.name"), Some("test".to_string()));
-        assert_eq!(lookup_state_path(&state, "user.profile.age"), Some("25".to_string()));
-        
-        // Test array path
-        assert_eq!(lookup_state_path(&state, "items.0"), Some("item1".to_string()));
-        assert_eq!(lookup_state_path(&state, "items.1"), Some("item2".to_string()));
-        
-        // Test non-existent path
-        assert_eq!(lookup_state_path(&state, "user.nonexistent"), None);
-    }
-
-    #[test]
-    fn test_derive_output_by_name() {
-        let state = json!({
-            "project_id": "123",
-            "user": {
-                "id": "456"
-            }
-        });
-        
-        // Test exact match
-        assert_eq!(derive_output_by_name("project_id", &state), Some("123".to_string()));
-        
-        // Test _id suffix
-        assert_eq!(derive_output_by_name("user_id", &state), Some("456".to_string()));
-        
-        // Test non-existent
-        assert_eq!(derive_output_by_name("nonexistent", &state), None);
-    }
-
-    #[test]
-    fn test_deep_merge() {
-        let mut a = json!({
-            "user": {
-                "name": "old",
-                "age": 25
-            },
-            "settings": {
-                "theme": "dark"
-            }
-        });
-        
-        let b = json!({
-            "user": {
-                "name": "new"
-            },
-            "settings": {
-                "theme": "light",
-                "language": "en"
-            }
-        });
-        
-        deep_merge(&mut a, b);
-        
-        let expected = json!({
-            "user": {
-                "name": "new",
-                "age": 25
-            },
-            "settings": {
-                "theme": "light",
-                "language": "en"
-            }
-        });
-        
-        assert_eq!(a, expected);
-    }
-
-    // ============================================================================
-    // ENVIRONMENT AND WIRING TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_build_env_for_step() {
-        let step_with = {
-            let mut map = HashMap::new();
-            map.insert("default_key".to_string(), "default_value".to_string());
-            map
-        };
-        
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: Some("inputs".to_string()),
-                    step: None,
-                    output: None,
-                    key: Some("test_input".to_string()),
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input1".to_string(),
-                }
-            },
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step0".to_string()),
-                    output: Some("output0".to_string()),
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input2".to_string(),
-                }
-            },
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: None,
-                    output: None,
-                    key: None,
-                    value: Some(json!("literal_value")),
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input3".to_string(),
-                }
-            }
-        ];
-        
-        let inputs_map = {
-            let mut map = HashMap::new();
-            map.insert("test_input".to_string(), "test_value".to_string());
-            map
-        };
-        
-        let step_outputs = {
-            let mut map = HashMap::new();
-            let mut outputs = HashMap::new();
-            outputs.insert("output0".to_string(), "step0_output".to_string());
-            map.insert("step0".to_string(), outputs);
-            map
-        };
-        
-        let env = build_env_for_step("step1", &step_with, &wires, &inputs_map, &step_outputs).unwrap();
-        
-        assert_eq!(env.get("default_key"), Some(&"default_value".to_string()));
-        assert_eq!(env.get("input1"), Some(&"test_value".to_string()));
-        assert_eq!(env.get("input2"), Some(&"step0_output".to_string()));
-        assert_eq!(env.get("input3"), Some(&"literal_value".to_string()));
-    }
-
-    #[test]
-    fn test_collect_needed_outputs_for() {
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step1".to_string()),
-                    output: Some("output1".to_string()),
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step2".to_string(),
-                    input: "input1".to_string(),
-                }
-            },
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step1".to_string()),
-                    output: Some("output2".to_string()),
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step3".to_string(),
-                    input: "input2".to_string(),
-                }
-            }
-        ];
-        
-        let outputs = collect_needed_outputs_for("step1", &wires);
-        assert_eq!(outputs.len(), 2);
-        assert!(outputs.contains("output1"));
-        assert!(outputs.contains("output2"));
-    }
-
-    // ============================================================================
-    // PLAN BUILDING TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_single_step_plan_from_image() {
-        let secrets = vec![
-            ("key1".to_string(), "value1".to_string()),
-            ("key2".to_string(), "value2".to_string()),
-        ];
-        
-        let plan = single_step_plan_from_image("alpine:latest", &secrets);
-        
-        assert_eq!(plan.id, "image:alpine:latest");
-        assert_eq!(plan.version, "1");
-        assert_eq!(plan.steps.len(), 1);
-        
-        let step = &plan.steps[0];
-        assert_eq!(step.id, "run");
-        assert_eq!(step.kind, "docker");
-        assert_eq!(step.ref_, "alpine:latest");
-        assert_eq!(step.env.get("key1"), Some(&"value1".to_string()));
-        assert_eq!(step.env.get("key2"), Some(&"value2".to_string()));
-        assert_eq!(step.mounts.len(), 1);
-        assert_eq!(step.mounts[0].typ, "bind");
-        assert_eq!(step.mounts[0].source, "./out");
-        assert_eq!(step.mounts[0].target, "/out");
-        assert!(step.mounts[0].rw);
-    }
-
-    // ============================================================================
-    // COMPOSITE SPEC PARSING TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_try_load_composite_spec_inline() {
-        let json_str = r#"{
-            "name": "test",
-            "version": "1.0.0",
-            "inputs": [],
-            "outputs": [],
-            "steps": [],
-            "wires": []
-        }"#;
-        
-        let spec = try_load_composite_spec(json_str).unwrap();
-        assert_eq!(spec.name, "test");
-        assert_eq!(spec.version, "1.0.0");
-    }
-
-    #[test]
-    fn test_try_load_composite_spec_file() {
-        let temp_dir = tempdir().unwrap();
-        let file_path = temp_dir.path().join("test.json");
-        
-        let json_content = r#"{
-            "name": "test",
-            "version": "1.0.0",
-            "inputs": [],
-            "outputs": [],
-            "steps": [],
-            "wires": []
-        }"#;
-        
-        fs::write(&file_path, json_content).unwrap();
-        
-        let spec = try_load_composite_spec(file_path.to_str().unwrap()).unwrap();
-        assert_eq!(spec.name, "test");
-        assert_eq!(spec.version, "1.0.0");
-    }
-
-    #[test]
-    fn test_try_load_composite_spec_invalid() {
-        let result = try_load_composite_spec("not-a-valid-reference");
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not a composite spec reference"));
-    }
-
-    // ============================================================================
-    // INTEGRATION TESTS
-    // ============================================================================
-
-    #[tokio::test]
-    async fn test_local_runner_name() {
-        let runner = LocalRunner;
-        assert_eq!(runner.name(), "local");
-    }
-
-    #[tokio::test]
-    async fn test_local_runner_auth_and_prepare() {
-        let runner = LocalRunner;
-        let mut ctx = create_test_deploy_ctx();
-        
-        // These should succeed without any external dependencies
-        assert!(runner.ensure_auth().await.is_ok());
-        assert!(runner.prepare(&mut ctx).await.is_ok());
-        assert!(runner.put_files(&ctx).await.is_ok());
-
-    }
-
-    // ============================================================================
-    // ERROR HANDLING TESTS
-    // ============================================================================
-
-    #[test]
-    fn test_build_env_for_step_missing_key() {
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: Some("inputs".to_string()),
-                    step: None,
-                    output: None,
-                    key: None, // Missing key
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input1".to_string(),
-                }
-            }
-        ];
-        
-        let result = build_env_for_step("step1", &HashMap::new(), &wires, &HashMap::new(), &HashMap::new());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing 'key'"));
-    }
-
-    #[test]
-    fn test_build_env_for_step_missing_output() {
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: Some("step0".to_string()),
-                    output: None, // Missing output
-                    key: None,
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input1".to_string(),
-                }
-            }
-        ];
-        
-        let result = build_env_for_step("step1", &HashMap::new(), &wires, &HashMap::new(), &HashMap::new());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("missing 'output'"));
-    }
-
-    #[test]
-    fn test_build_env_for_step_unknown_source() {
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: Some("unknown".to_string()), // Unknown source
-                    step: None,
-                    output: None,
-                    key: Some("key".to_string()),
-                    value: None,
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input1".to_string(),
-                }
-            }
-        ];
-        
-        let result = build_env_for_step("step1", &HashMap::new(), &wires, &HashMap::new(), &HashMap::new());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown wire source"));
-    }
-
-    #[test]
-    fn test_build_env_for_step_invalid_wire() {
-        let wires = vec![
-            Wire {
-                from: WireFrom {
-                    source: None,
-                    step: None,
-                    output: None,
-                    key: None,
-                    value: None, // No valid source
-                },
-                to: WireTo {
-                    step: "step1".to_string(),
-                    input: "input1".to_string(),
-                }
-            }
-        ];
-        
-        let result = build_env_for_step("step1", &HashMap::new(), &wires, &HashMap::new(), &HashMap::new());
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("must be one of inputs/step/value"));
-    }
-}
