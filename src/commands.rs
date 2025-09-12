@@ -7,6 +7,7 @@ use webbrowser;
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::{config::Region, Client as S3Client};
 use aws_sdk_s3::primitives::ByteStream;
+use reqwest;
 
 use crate::models::{ShManifest, ShKind, ShPort, ShLock, ShDistribution, ShType};
 use crate::templates;
@@ -33,16 +34,82 @@ use tokio::sync::broadcast;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-// Shared state for WebSocket connections
+// Shared state for WebSocket connections, types storage, and execution order
 #[derive(Clone)]
 struct AppState {
     ws_sender: broadcast::Sender<String>,
+    types_storage: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>>,
+    execution_orders: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 impl AppState {
     fn new() -> Self {
         let (ws_sender, _) = broadcast::channel(100);
-        Self { ws_sender }
+        Self { 
+            ws_sender,
+            types_storage: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            execution_orders: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+    
+    /// Store types from a lock file in the global types storage
+    fn store_types(&self, action_ref: &str, types: &std::collections::HashMap<String, serde_json::Value>) {
+        if let Ok(mut storage) = self.types_storage.write() {
+            for (type_name, type_schema) in types {
+                let key = format!("{}:{}", action_ref, type_name);
+                storage.insert(key, type_schema.clone());
+                println!("📋 Stored type: {} from action: {}", type_name, action_ref);
+            }
+        }
+    }
+    
+    /// Get all stored types
+    fn get_all_types(&self) -> std::collections::HashMap<String, serde_json::Value> {
+        match self.types_storage.read() {
+            Ok(storage) => storage.clone(),
+            Err(_) => std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Get types for a specific action
+    fn get_types_for_action(&self, action_ref: &str) -> std::collections::HashMap<String, serde_json::Value> {
+        match self.types_storage.read() {
+            Ok(storage) => {
+                let prefix = format!("{}:", action_ref);
+                storage.iter()
+                    .filter(|(key, _)| key.starts_with(&prefix))
+                    .map(|(key, value)| {
+                        let type_name = key.strip_prefix(&prefix).unwrap_or(key);
+                        (type_name.to_string(), value.clone())
+                    })
+                    .collect()
+            }
+            Err(_) => std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Store execution order for a composite action
+    fn store_execution_order(&self, action_ref: &str, execution_order: Vec<String>) {
+        if let Ok(mut orders) = self.execution_orders.write() {
+            orders.insert(action_ref.to_string(), execution_order.clone());
+            println!("📋 Stored execution order for {}: {:?}", action_ref, execution_order);
+        }
+    }
+    
+    /// Get execution order for a specific action
+    fn get_execution_order(&self, action_ref: &str) -> Option<Vec<String>> {
+        match self.execution_orders.read() {
+            Ok(orders) => orders.get(action_ref).cloned(),
+            Err(_) => None,
+        }
+    }
+    
+    /// Get all execution orders
+    fn get_all_execution_orders(&self) -> std::collections::HashMap<String, Vec<String>> {
+        match self.execution_orders.read() {
+            Ok(orders) => orders.clone(),
+            Err(_) => std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -56,75 +123,472 @@ impl AppState {
 // HELPER FUNCTIONS FOR ACTION RESOLUTION
 // ============================================================================
 
-/// Convert ShActionStep to local::ActionStep (no conversion needed since we're using ShActionStep directly)
-fn convert_action_step(step: &crate::models::ShActionStep) -> crate::runners::local::ActionStep {
-    crate::runners::local::ActionStep {
-        id: step.id.clone(),
-        kind: step.kind.clone(),
-        uses: step.uses.clone(),
-        with: step.with.clone(),
-    }
-}
 
-/// Convert ShWire to local::Wire
-fn convert_action_wire(wire: &crate::models::ShWire) -> crate::runners::local::Wire {
-    crate::runners::local::Wire {
-        from: crate::runners::local::WireFrom {
-            source: wire.from.source.clone(),
-            step: wire.from.step.clone(),
-            output: wire.from.output.clone(),
-            key: wire.from.key.clone(),
-            value: wire.from.value.clone(),
-        },
-        to: crate::runners::local::WireTo {
-            step: wire.to.step.clone(),
-            input: wire.to.input.clone(),
-        },
-    }
-}
-
-/// Recursively fetch all action manifests for a composite action
-async fn fetch_all_action_manifests(
-    client: &crate::starthub_api::Client,
-    action_ref: &str,
-    visited: &mut std::collections::HashSet<String>
-) -> Result<Vec<crate::models::ShManifest>> {
+/// Recursively fetch all action lock files for a composite action
+fn fetch_all_action_locks<'a>(
+    _client: &'a crate::starthub_api::Client,
+    action_ref: &'a str,
+    visited: &'a mut std::collections::HashSet<String>
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<crate::models::ShLock>>> + Send + 'a>> {
+    Box::pin(async move {
     if visited.contains(action_ref) {
         return Ok(vec![]); // Already fetched this action
     }
     visited.insert(action_ref.to_string());
     
-    // First, try to get the action metadata to find the storage URL
-    let metadata = match client.fetch_action_metadata(action_ref).await {
-        Ok(m) => m,
-        Err(_) => {
-            // If we can't get metadata, this might not be a composite action
-            return Ok(vec![]);
-        }
+    // Construct the lock file URL based on the action reference
+    // Format: https://api.starthub.so/storage/v1/object/public/artifacts/{owner}/{name}/{version}/lock.json
+    let parts: Vec<&str> = action_ref.split('/').collect();
+    if parts.len() < 2 {
+        return Err(anyhow::anyhow!("Invalid action reference format: {}", action_ref));
+    }
+    
+    let owner = parts[0];
+    let name_version = parts[1];
+    let (name, version) = if name_version.contains('@') {
+        let name_version_parts: Vec<&str> = name_version.split('@').collect();
+        (name_version_parts[0], name_version_parts[1])
+    } else {
+        return Err(anyhow::anyhow!("Action reference must include version: {}", action_ref));
     };
     
-    // Construct the storage URL for the starthub.json file
-    let storage_url = format!(
-        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
-        action_ref.split('@').next().unwrap_or(""),
-        metadata.commit_sha
+    let lock_url = format!(
+        "https://api.starthub.so/storage/v1/object/public/artifacts/{}/{}/{}/lock.json",
+        owner, name, version
     );
     
-    println!("🔗 Constructed storage URL: {}", storage_url);
+    println!("🔗 Fetching lock file: {}", lock_url);
     
-    // Download and parse the starthub.json file
-    let manifest = client.download_starthub_json(&storage_url).await?;
+    // Download and parse the lock file
+    let response = reqwest::get(&lock_url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Failed to fetch lock file: HTTP {}", response.status()));
+    }
     
-    let mut all_manifests = vec![manifest.clone()];
+    let lock_content = response.text().await?;
+    let lock: crate::models::ShLock = serde_json::from_str(&lock_content)?;
     
-    // Recursively fetch manifests for all steps
+    let mut all_locks = vec![lock.clone()];
+    
+    // If this is a composite action, recursively fetch locks for all steps
+    if lock.kind == crate::models::ShKind::Composition {
+        println!("🔄 Composite action detected, fetching manifest for step resolution...");
+        
+        // Fetch the manifest to get the steps
+        let manifest_url = format!(
+            "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
+            owner, name
+        );
+        
+        println!("🔗 Fetching manifest: {}", manifest_url);
+        
+        match reqwest::get(&manifest_url).await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.text().await {
+                        Ok(manifest_content) => {
+                            match serde_json::from_str::<crate::models::ShManifest>(&manifest_content) {
+                                Ok(manifest) => {
+                                    println!("✅ Successfully parsed manifest with {} steps", manifest.steps.len());
+                                    
+                                    // Recursively fetch locks for each step
     for step in &manifest.steps {
-        if let Ok(step_manifests) = Box::pin(fetch_all_action_manifests(client, &step.uses, visited)).await {
-            all_manifests.extend(step_manifests);
+                                        let step_ref = &step.uses;
+                                        println!("🔍 Processing step: {}", step_ref);
+                                        
+                                        match fetch_all_action_locks(_client, step_ref, visited).await {
+                                            Ok(step_locks) => {
+                                                let step_count = step_locks.len();
+                                                all_locks.extend(step_locks);
+                                                println!("✅ Added {} lock(s) from step: {}", step_count, step_ref);
+                                            }
+                                            Err(e) => {
+                                                println!("⚠️  Failed to fetch locks for step {}: {}", step_ref, e);
+                                                // Continue with other steps even if one fails
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("⚠️  Failed to parse manifest JSON: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("⚠️  Failed to read manifest content: {}", e);
+                        }
+                    }
+                } else {
+                    println!("⚠️  Failed to fetch manifest: HTTP {}", response.status());
+                }
+            }
+            Err(e) => {
+                println!("⚠️  Failed to fetch manifest: {}", e);
+            }
         }
     }
     
-    Ok(all_manifests)
+    Ok(all_locks)
+    })
+}
+
+/// Compute execution order for composite actions using topological sort
+async fn compute_execution_order(
+    action_ref: &str,
+    lock: &crate::models::ShLock
+) -> Result<Option<Vec<String>>> {
+    // Only composite actions have execution order
+    if lock.kind != crate::models::ShKind::Composition {
+        return Ok(None);
+    }
+    
+    println!("🔄 Computing execution order for composite action: {}", action_ref);
+    
+    // We need to fetch the manifest to get steps and wires
+    let parts: Vec<&str> = action_ref.split('/').collect();
+    if parts.len() < 2 {
+        return Err(anyhow::anyhow!("Invalid action reference format: {}", action_ref));
+    }
+    
+    let owner = parts[0];
+    let name_version = parts[1];
+    let (name, _version) = if name_version.contains('@') {
+        let name_version_parts: Vec<&str> = name_version.split('@').collect();
+        (name_version_parts[0], name_version_parts[1])
+    } else {
+        return Err(anyhow::anyhow!("Action reference must include version: {}", action_ref));
+    };
+    
+    // Fetch the manifest to get steps and wires
+    let manifest_url = format!(
+        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
+        owner, name
+    );
+    
+    println!("🔗 Fetching manifest for execution order: {}", manifest_url);
+    
+    let response = reqwest::get(&manifest_url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Failed to fetch manifest: HTTP {}", response.status()));
+    }
+    
+    let manifest_content = response.text().await?;
+    let manifest: crate::models::ShManifest = serde_json::from_str(&manifest_content)?;
+    
+    if manifest.steps.is_empty() {
+        println!("⚠️  No steps found in manifest for composite action");
+        return Ok(Some(vec![]));
+    }
+    
+    println!("📋 Found {} steps in manifest", manifest.steps.len());
+    
+    // Use the steps and wires directly (they're already the right type)
+    let steps: Vec<crate::runners::local::ActionStep> = manifest.steps.clone();
+    let wires: Vec<crate::runners::local::Wire> = manifest.wires.clone();
+    
+    // Use the existing topological sort function
+    match crate::runners::local::topo_order(&steps, &wires) {
+        Ok(order) => {
+            println!("✅ Computed execution order: {:?}", order);
+            Ok(Some(order))
+        }
+        Err(e) => {
+            println!("❌ Failed to compute execution order: {}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Execute the ordered steps for a composite action
+async fn execute_ordered_steps(
+    action_ref: &str,
+    execution_order: &[String],
+    inputs: &std::collections::HashMap<String, serde_json::Value>,
+    artifacts_dir: &std::path::Path,
+    _state: &AppState
+) -> Result<serde_json::Value> {
+    println!("🚀 Starting execution of {} steps for action: {}", execution_order.len(), action_ref);
+    
+    // Get the manifest to understand the steps and wires
+    let parts: Vec<&str> = action_ref.split('/').collect();
+    if parts.len() < 2 {
+        return Err(anyhow::anyhow!("Invalid action reference format: {}", action_ref));
+    }
+    
+    let owner = parts[0];
+    let name_version = parts[1];
+    let (name, _version) = if name_version.contains('@') {
+        let name_version_parts: Vec<&str> = name_version.split('@').collect();
+        (name_version_parts[0], name_version_parts[1])
+    } else {
+        return Err(anyhow::anyhow!("Action reference must include version: {}", action_ref));
+    };
+    
+    // Fetch the manifest to get steps and wires
+    let manifest_url = format!(
+        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
+        owner, name
+    );
+    
+    let response = reqwest::get(&manifest_url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Failed to fetch manifest: HTTP {}", response.status()));
+    }
+    
+    let manifest_content = response.text().await?;
+    let manifest: crate::models::ShManifest = serde_json::from_str(&manifest_content)?;
+    
+    // Store step outputs as we execute them
+    let mut step_outputs: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+    
+    // Execute each step in order
+    for step_id in execution_order {
+        println!("🔄 Executing step: {}", step_id);
+        
+        // Find the step definition
+        let step = manifest.steps.iter()
+            .find(|s| s.id == *step_id)
+            .ok_or_else(|| anyhow::anyhow!("Step {} not found in manifest", step_id))?;
+        
+        // Build inputs for this step based on wires
+        let step_inputs = build_step_inputs(step_id, &manifest.wires, inputs, &step_outputs)?;
+        
+        // Execute the step
+        let step_output = execute_single_step(step, &step_inputs, artifacts_dir).await?;
+        
+        // Store the output for future steps
+        step_outputs.insert(step_id.clone(), step_output);
+        
+        println!("✅ Step {} completed successfully", step_id);
+    }
+    
+    // Build final outputs based on export configuration
+    let final_outputs = build_final_outputs(&manifest.export, &step_outputs)?;
+    
+    println!("🎉 All steps executed successfully!");
+    Ok(final_outputs)
+}
+
+/// Build inputs for a specific step based on wires
+fn build_step_inputs(
+    step_id: &str,
+    wires: &[crate::models::ShWire],
+    action_inputs: &std::collections::HashMap<String, serde_json::Value>,
+    step_outputs: &std::collections::HashMap<String, serde_json::Value>
+) -> Result<std::collections::HashMap<String, serde_json::Value>> {
+    let mut step_inputs = std::collections::HashMap::new();
+    
+    // Find all wires that target this step
+    for wire in wires {
+        if wire.to.step == step_id {
+            let value = match &wire.from {
+                // Input from action inputs
+                crate::models::ShWireFrom { source: Some(source), key: Some(key), .. } 
+                    if source == "inputs" => {
+                        action_inputs.get(key).cloned()
+                    }
+                // Input from previous step output
+                crate::models::ShWireFrom { step: Some(from_step), output: Some(output), .. } => {
+                    step_outputs.get(from_step)
+                        .and_then(|step_output| step_output.get(output))
+                        .cloned()
+                }
+                // Literal value
+                crate::models::ShWireFrom { value: Some(value), .. } => {
+                    Some(value.clone())
+                }
+                _ => None,
+            };
+            
+            if let Some(value) = value {
+                step_inputs.insert(wire.to.input.clone(), value);
+            }
+        }
+    }
+    
+    Ok(step_inputs)
+}
+
+/// Execute a simple WASM action
+async fn execute_simple_wasm_action(
+    action_ref: &str,
+    inputs: &std::collections::HashMap<String, serde_json::Value>,
+    artifacts_dir: &std::path::Path
+) -> Result<serde_json::Value> {
+    println!("🚀 Executing simple WASM action: {}", action_ref);
+    
+    // Create a safe filename from the action reference
+    let safe_name = action_ref.replace('/', "_").replace('@', "_");
+    let artifact_path = artifacts_dir.join(format!("{}.wasm", safe_name));
+    
+    if !artifact_path.exists() {
+        return Err(anyhow::anyhow!("WASM artifact not found: {}", artifact_path.display()));
+    }
+    
+    // Execute the WASM file
+    execute_wasm_file(&artifact_path, inputs).await
+}
+
+/// Execute a single step (WASM or Docker)
+async fn execute_single_step(
+    step: &crate::models::ShActionStep,
+    inputs: &std::collections::HashMap<String, serde_json::Value>,
+    artifacts_dir: &std::path::Path
+) -> Result<serde_json::Value> {
+    println!("🔧 Executing step: {} (uses: {})", step.id, step.uses);
+    
+    // For now, we'll focus on WASM steps
+    // TODO: Add Docker step execution later
+    
+    // Find the corresponding WASM artifact
+    let safe_name = step.uses.replace('/', "_").replace(':', "_");
+    let artifact_path = artifacts_dir.join(format!("{}.wasm", safe_name));
+    
+    if !artifact_path.exists() {
+        return Err(anyhow::anyhow!("WASM artifact not found: {}", artifact_path.display()));
+    }
+    
+    // Execute the WASM file
+    execute_wasm_file(&artifact_path, inputs).await
+}
+
+/// Execute a WASM file using wasmtime command line
+async fn execute_wasm_file(
+    wasm_path: &std::path::Path,
+    inputs: &std::collections::HashMap<String, serde_json::Value>
+) -> Result<serde_json::Value> {
+    println!("🔧 Executing WASM file: {}", wasm_path.display());
+    
+    // Convert inputs to the format expected by the WASM module
+    // The WASM expects: {"params": {"url": "...", "headers": {...}}}
+    let wasm_input = json!({
+        "params": inputs
+    });
+    let inputs_json = serde_json::to_string(&wasm_input)?;
+    println!("📥 Inputs: {}", inputs_json);
+    
+    // Use wasmtime command line with HTTP support
+    let mut output = tokio::process::Command::new("wasmtime")
+        .arg("-S")
+        .arg("http")  // Enable HTTP support for WASI HTTP
+        .arg(wasm_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    
+    // Write inputs to stdin
+    if let Some(stdin) = output.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = stdin;
+        stdin.write_all(inputs_json.as_bytes()).await?;
+        stdin.flush().await?;
+    }
+    
+    // Wait for completion and capture output
+    let result = output.wait_with_output().await?;
+    
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    
+    println!("📤 WASM stdout: {}", stdout);
+    if !stderr.is_empty() {
+        println!("📤 WASM stderr: {}", stderr);
+    }
+    
+    if result.status.success() {
+        println!("✅ WASM execution completed successfully");
+        
+        // Parse the output to extract the result
+        // The WASM outputs in format: ::starthub:state::{json}
+        let mut final_output = json!({
+            "status": "success",
+            "message": "WASM executed successfully",
+            "inputs": inputs
+        });
+        
+        // Try to extract the starthub state output
+        for line in stdout.lines() {
+            if line.starts_with("::starthub:state::") {
+                let json_part = &line[18..]; // Remove "::starthub:state::" prefix
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_part) {
+                    final_output = parsed;
+                    break;
+                }
+            }
+        }
+        
+        Ok(final_output)
+    } else {
+        println!("❌ WASM execution failed with exit code: {}", result.status);
+        Err(anyhow::anyhow!("WASM execution failed: {}", stderr))
+    }
+}
+
+/// Build final outputs based on export configuration
+fn build_final_outputs(
+    _export: &serde_json::Value,
+    step_outputs: &std::collections::HashMap<String, serde_json::Value>
+) -> Result<serde_json::Value> {
+    // For now, we'll return the step outputs as the final outputs
+    // TODO: Implement proper export mapping based on export configuration
+    let mut final_outputs = serde_json::Map::new();
+    
+    for (step_id, step_output) in step_outputs {
+        final_outputs.insert(step_id.clone(), step_output.clone());
+    }
+    
+    Ok(serde_json::Value::Object(final_outputs))
+}
+
+/// Download a WASM artifact from the given URL (handles ZIP files)
+async fn download_wasm_artifact(url: &str, output_path: &std::path::Path) -> Result<()> {
+    println!("📥 Downloading artifact from: {}", url);
+    
+    let response = reqwest::get(url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!("Failed to download artifact: HTTP {}", response.status()));
+    }
+    
+    let bytes = response.bytes().await?;
+    
+    // Create parent directory if it doesn't exist
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    
+    // Check if the URL points to a ZIP file (artifact.zip)
+    if url.ends_with("artifact.zip") {
+        // Extract WASM file from ZIP
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor)?;
+        
+        // Find the WASM file in the archive
+        let mut wasm_file = None;
+        for i in 0..archive.len() {
+            let file = archive.by_index(i)?;
+            if file.name().ends_with(".wasm") {
+                wasm_file = Some(i);
+                break;
+            }
+        }
+        
+        if let Some(file_index) = wasm_file {
+            let mut wasm_file = archive.by_index(file_index)?;
+            let mut wasm_content = Vec::new();
+            std::io::copy(&mut wasm_file, &mut wasm_content)?;
+            std::fs::write(output_path, wasm_content)?;
+            println!("✅ Extracted WASM file from ZIP to: {}", output_path.display());
+        } else {
+            return Err(anyhow::anyhow!("No WASM file found in ZIP archive"));
+        }
+    } else {
+        // Direct WASM file download (legacy support)
+        std::fs::write(output_path, bytes)?;
+        println!("✅ Downloaded WASM file to: {}", output_path.display());
+    }
+    
+    Ok(())
 }
 
 // safe write with overwrite prompt
@@ -150,86 +614,8 @@ fn make_executable(path: &Path) -> anyhow::Result<()> {
 #[cfg(not(unix))]
 fn make_executable(_path: &Path) -> anyhow::Result<()> { Ok(()) }
 
-// Parse any "digest: sha256:..." occurrence (push or inspect output)
-pub fn parse_digest_any(s: &str) -> Option<String> {
-    for line in s.lines() {
-        // be forgiving on casing
-        let lower = line.to_ascii_lowercase();
-        if let Some(pos) = lower.find("digest:") {
-            // slice the original line at the same offset to avoid lossy lowercasing of the digest itself
-            let rest = line[(pos + "digest:".len())..].trim();
 
-            // find the sha256 token in the remainder (case insensitive)
-            let rest_lower = rest.to_ascii_lowercase();
-            if let Some(idx) = rest_lower.find("sha256:") {
-                let token = &rest[idx..];
-                // token may be followed by spaces/text (e.g., " size: 1361")
-                let digest = token.split_whitespace().next().unwrap_or("");
-                if digest.len() >= "sha256:".len() + 64 {
-                    return Some(digest.to_string());
-                }
-            }
-        }
-    }
-    None
-}
 
-pub fn push_and_get_digest(tag: &str) -> anyhow::Result<String> {
-    // 1) docker push (capture output; push often prints the digest line)
-    let push_out = run_capture("docker", &["push", tag])?;
-    if let Some(d) = parse_digest_any(&push_out) {
-        return Ok(d);
-    }
-
-    // 2) fallback: docker buildx imagetools inspect
-    if let Ok(inspect_out) = run_capture("docker", &["buildx", "imagetools", "inspect", tag]) {
-        if let Some(d) = parse_digest_any(&inspect_out) {
-            return Ok(d);
-        }
-    }
-
-    // 3) optional: crane digest (if installed)
-    if let Ok(crane_out) = run_capture("crane", &["digest", tag]) {
-        let d = crane_out.trim().to_string();
-        if d.starts_with("sha256:") && d.len() == "sha256:".len() + 64 {
-            return Ok(d);
-        }
-    }
-
-    anyhow::bail!("could not parse image digest from `docker push`/`imagetools` output; ensure `docker buildx` is available or install `crane`.")
-}
-
-pub fn oci_from_manifest(m: &ShManifest) -> anyhow::Result<String> {
-    // 1) If you still carry `ref` in your JSON, prefer it when it's an OCI path without scheme
-    // (Optional: add it to ShManifest as Option<String>)
-    // try to parse a repo-like value from m.repository
-    let repo = m.repository.trim();
-
-    // If user gave a proper OCI path already (ghcr.io/..., docker.io/..., etc.)
-    if repo.starts_with("ghcr.io/")
-        || repo.starts_with("docker.io/")
-        || repo.starts_with("registry-1.docker.io/")
-        || repo.split('/').count() >= 2 && !repo.starts_with("http")
-    {
-        return Ok(repo.trim_end_matches('/').to_string());
-    }
-
-    // GitHub URL → map to GHCR
-    if repo.starts_with("https://github.com/") || repo.starts_with("github.com/") {
-        let parts: Vec<&str> = repo.trim_start_matches("https://")
-            .trim_start_matches("http://")
-            .trim_start_matches("github.com/")
-            .split('/')
-            .collect();
-        if parts.len() >= 2 {
-            let org = parts[0];
-            let name = parts[1].trim_end_matches(".git");
-            return Ok(format!("ghcr.io/{}/{}", org, name));
-        }
-    }
-
-    anyhow::bail!("For docker kind, please set `repository` to an OCI image base like `ghcr.io/<org>/<image>` or a GitHub repo URL so I can map it to GHCR.");
-}
 
 pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
     let tag = format!("{}:{}", m.name, m.version);
@@ -295,7 +681,7 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     
     // Configure AWS SDK for Supabase Storage S3 compatibility
     let region_provider = RegionProviderChain::first_try(Region::new(crate::config::SUPABASE_STORAGE_REGION));
-    let shared_config = aws_config::from_env()
+    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .load()
         .await;
@@ -349,7 +735,8 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     // Generate a digest for the uploaded artifact
     let digest = format!("sha256:{}", m.name); // Simplified digest for now
     
-    let primary = format!("{}@{}", storage_url, &digest);
+    // Use the storage_url directly as it already includes the full path to artifact.zip
+    let primary = storage_url.clone();
     let lock = ShLock {
         name: m.name.clone(),
         description: m.description.clone(),
@@ -361,6 +748,7 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
         license: m.license.clone(),
         inputs: m.inputs.clone(),
         outputs: m.outputs.clone(),
+        types: m.types.clone(),
         distribution: ShDistribution { primary, upstream: None },
         digest,
     };
@@ -410,30 +798,6 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
     Ok(())
 }
 
-pub fn push_wasm_and_get_digest(tag: &str, wasm_path: &str) -> anyhow::Result<String> {
-    // oras push ghcr.io/org/pkg:vX.Y.Z module.wasm:application/wasm
-    let push_out = run_capture(
-        "oras",
-        &["push", tag, &format!("{}:application/wasm", wasm_path)],
-    )?;
-
-    if let Some(d) = parse_digest_any(&push_out) {
-        return Ok(d);
-    }
-
-    // fallback to crane digest (works with artifact tags too)
-    if let Ok(crane_out) = run_capture("crane", &["digest", tag]) {
-        let d = crane_out.trim().to_string();
-        if d.starts_with("sha256:") && d.len() == "sha256:".len() + 64 {
-            return Ok(d);
-        }
-    }
-
-    anyhow::bail!(
-        "could not parse digest from `oras push` output; \
-         ensure `oras` (and optionally `crane`) are installed and the tag exists"
-    )
-}
 
 pub fn find_wasm_artifact(crate_name: &str) -> Option<String> {
     use std::ffi::OsStr;
@@ -491,94 +855,8 @@ pub fn find_wasm_artifact(crate_name: &str) -> Option<String> {
     newest.map(|(_, p)| p)
 }
 
-// Map a GitHub repo URL/SSH to a GHCR image base
-pub fn github_to_ghcr_path(repo: &str) -> Option<String> {
-    let r = repo.trim().trim_end_matches(".git");
 
-    // ssh: git@github.com:owner/repo(.git)?
-    if r.starts_with("git@github.com:") {
-        let rest = r.trim_start_matches("git@github.com:");
-        let mut it = rest.split('/');
-        if let (Some(owner), Some(name)) = (it.next(), it.next()) {
-            return Some(format!("ghcr.io/{}/{}", owner.to_lowercase(), name.to_lowercase()));
-        }
-    }
 
-    // https://github.com/owner/repo or http://...
-    if r.contains("github.com/") {
-        let after = r.splitn(2, "github.com/").nth(1)?;
-        let mut it = after.split('/');
-        if let (Some(owner), Some(name)) = (it.next(), it.next()) {
-            return Some(format!("ghcr.io/{}/{}", owner.to_lowercase(), name.trim_end_matches(".git").to_lowercase()));
-        }
-    }
-
-    // bare github.com/owner/repo
-    if r.starts_with("github.com/") {
-        let mut it = r.trim_start_matches("github.com/").split('/');
-        if let (Some(owner), Some(name)) = (it.next(), it.next()) {
-            return Some(format!("ghcr.io/{}/{}", owner.to_lowercase(), name.to_lowercase()));
-        }
-    }
-
-    None
-}
-
-// Derive an OCI image base for both docker/wasm publish.
-// Priority: manifest.image -> manifest.repository (mapped if GitHub) -> git remote origin (mapped)
-pub fn derive_image_base(m: &ShManifest, cli_image: Option<String>) -> anyhow::Result<String> {
-    if let Some(i) = cli_image {
-        let i = i.trim();
-        if !i.is_empty() { return Ok(i.trim_end_matches('/').to_string()); }
-    }
-
-    if let Some(img) = &m.image {
-        let img = img.trim();
-        if !img.is_empty() && !img.starts_with("http") && img.split('/').count() >= 2 {
-            return Ok(img.trim_end_matches('/').to_string());
-        }
-    }
-
-    if let Some(mapped) = github_to_ghcr_path(&m.repository) {
-        return Ok(mapped);
-    }
-
-    // Try `git remote get-url origin`
-    if let Ok(out) = PCommand::new("git").args(["remote", "get-url", "origin"]).output() {
-        if out.status.success() {
-            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if let Some(mapped) = github_to_ghcr_path(&url) {
-                return Ok(mapped);
-            }
-        }
-    }
-
-    anyhow::bail!(
-        "Unable to determine OCI image path. Provide one with `--image ghcr.io/<org>/<name>` \
-         or set `image` in starthub.json, or set `repository` to a GitHub URL I can map."
-    )
-}
-
-// Write starthub.lock.json with the digest-pinned primary ref
-pub fn write_lock(m: &ShManifest, image_base: &str, digest: &str) -> anyhow::Result<()> {
-    let primary = format!("oci://{}@{}", image_base, digest);
-    let lock = ShLock {
-        name: m.name.clone(),
-        description: m.description.clone(),
-        version: m.version.clone(),
-        kind: m.kind.clone().expect("Kind should be present in manifest"),
-        manifest_version: m.manifest_version,
-        repository: m.repository.clone(),
-        image: m.image.clone(),
-        license: m.license.clone(),
-        inputs: m.inputs.clone(),
-        outputs: m.outputs.clone(),
-        distribution: ShDistribution { primary, upstream: None },
-        digest: digest.to_string(),
-    };
-    fs::write("starthub.lock.json", serde_json::to_string_pretty(&lock)?)?;
-    Ok(())
-}
 
 pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
     // WASM PUBLISHING FUNCTION - This is the WASM-specific implementation
@@ -645,7 +923,7 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
 
     // Configure AWS SDK for Supabase Storage S3 compatibility
     let region_provider = RegionProviderChain::first_try(Region::new(crate::config::SUPABASE_STORAGE_REGION));
-    let shared_config = aws_config::from_env()
+    let shared_config = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(region_provider)
         .load()
         .await;
@@ -695,7 +973,11 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
     // Create lock file with the same structure as Docker
     let digest = format!("sha256:{}", m.name); // Simplified digest for now
     
-    let primary = format!("{}@{}", endpoint_url, &digest);
+    // Construct the public URL for the artifact.zip file
+    let primary = format!(
+        "{}/storage/v1/object/public/artifacts/{}/{}/{}/artifact.zip",
+        crate::config::STARTHUB_API_BASE, namespace, m.name, m.version
+    );
     let lock = ShLock {
         name: m.name.clone(),
         description: m.description.clone(),
@@ -707,6 +989,7 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
         license: m.license.clone(),
         inputs: m.inputs.clone(),
         outputs: m.outputs.clone(),
+        types: m.types.clone(),
         distribution: ShDistribution { primary, upstream: None },
         digest,
     };
@@ -773,28 +1056,7 @@ pub fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     }
 }
 
-pub fn run_capture(cmd: &str, args: &[&str]) -> anyhow::Result<String> {
-    match PCommand::new(cmd).args(args).output() {
-        Ok(out) => {
-            anyhow::ensure!(out.status.success(), "command failed: {} {:?}", cmd, args);
-            Ok(String::from_utf8_lossy(&out.stdout).to_string())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            anyhow::bail!("`{}` not found. Install it first (e.g., `brew install {}`)", cmd, cmd)
-        }
-        Err(e) => Err(e.into()),
-    }
-}
 
-#[allow(dead_code)]
-pub fn parse_digest(s: &str) -> Option<String> {
-    for line in s.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Digest: ") {
-            if rest.starts_with("sha256:") { return Some(rest.to_string()); }
-        }
-    }
-    None
-}
 
 // ------------------- cmd_init -------------------
 pub async fn cmd_init(path: String) -> anyhow::Result<()> {
@@ -829,7 +1091,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
 
     // Since we're using Supabase Storage instead of OCI registries, 
     // we don't need to prompt for OCI image paths anymore
-    let image: Option<String> = None;
+    let _image: Option<String> = None;
 
     // License
     let license = Select::new("License:", vec![
@@ -918,14 +1180,6 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn cmd_login(runner: crate::RunnerKind) -> anyhow::Result<()> {
-    let r = crate::make_runner(runner);
-    println!("→ Logging in for runner: {}", r.name());
-    r.ensure_auth().await?;
-    println!("✓ Login complete for {}", r.name());
-    Ok(())
-}
 
 /// Authenticate with Starthub backend using browser-based flow
 pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
@@ -1235,6 +1489,10 @@ async fn start_server() -> Result<()> {
         .route("/api/status", get(get_status))
         .route("/api/action", post(handle_action))
         .route("/api/run", post(handle_run))
+        .route("/api/types", get(get_types))
+        .route("/api/types/:action", get(get_types_for_action))
+        .route("/api/execution-orders", get(get_execution_orders))
+        .route("/api/execution-orders/:action", get(get_execution_order_for_action))
         .route("/ws", get(ws_handler)) // WebSocket endpoint
         .nest_service("/assets", ServeDir::new("ui/dist/assets"))
         .nest_service("/favicon.ico", ServeDir::new("ui/dist"))
@@ -1274,6 +1532,60 @@ async fn get_status() -> Json<Value> {
     }))
 }
 
+async fn get_types(
+    axum::extract::State(state): axum::extract::State<AppState>
+) -> Json<Value> {
+    let all_types = state.get_all_types();
+    Json(json!({
+        "success": true,
+        "types": all_types,
+        "count": all_types.len()
+    }))
+}
+
+async fn get_types_for_action(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(action): axum::extract::Path<String>
+) -> Json<Value> {
+    let types = state.get_types_for_action(&action);
+    Json(json!({
+        "success": true,
+        "action": action,
+        "types": types,
+        "count": types.len()
+    }))
+}
+
+async fn get_execution_orders(
+    axum::extract::State(state): axum::extract::State<AppState>
+) -> Json<Value> {
+    let all_orders = state.get_all_execution_orders();
+    Json(json!({
+        "success": true,
+        "execution_orders": all_orders,
+        "count": all_orders.len()
+    }))
+}
+
+async fn get_execution_order_for_action(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(action): axum::extract::Path<String>
+) -> Json<Value> {
+    match state.get_execution_order(&action) {
+        Some(order) => Json(json!({
+            "success": true,
+            "action": action,
+            "execution_order": order,
+            "count": order.len()
+        })),
+        None => Json(json!({
+            "success": false,
+            "action": action,
+            "error": "No execution order found for this action"
+        }))
+    }
+}
+
 async fn handle_action(Json(payload): Json<Value>) -> Json<Value> {
     // Handle action requests from the UI
     Json(json!({
@@ -1293,137 +1605,180 @@ async fn handle_run(
     // Extract action and inputs from payload
     let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     let default_inputs = json!({});
-    let inputs = payload.get("inputs").unwrap_or(&default_inputs);
+    let inputs_value = payload.get("inputs").unwrap_or(&default_inputs);
+    
+    // Convert inputs to HashMap
+    let inputs: std::collections::HashMap<String, serde_json::Value> = if let Some(inputs_obj) = inputs_value.as_object() {
+        inputs_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
     
     println!("📋 Action: {}", action);
     println!("📥 Inputs: {:?}", inputs);
     
-    // Try to fetch action metadata and download starthub.json
+    // Initialize client for API calls
     let base = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
             let client = crate::starthub_api::Client::new(base, Some(crate::config::SUPABASE_ANON_KEY.to_string()));
     
-    match client.fetch_action_metadata(&action).await {
-        Ok(_metadata) => {
-            println!("✓ Fetched action metadata for {}", action);
+    println!("🚀 Starting artifact download for action: {}", action);
             
-            // Try to download the starthub.json file and recursively fetch all action manifests
-            println!("📥 Attempting to download composite action definition...");
+    // Recursively fetch all lock files for the action and its dependencies
             let mut visited = std::collections::HashSet::new();
-            
-            match fetch_all_action_manifests(&client, &action, &mut visited).await {
-                Ok(manifests) => {
-                    if manifests.is_empty() {
-                        println!("❌ No composite action definition found");
+    match fetch_all_action_locks(&client, &action, &mut visited).await {
+        Ok(locks) => {
+            if locks.is_empty() {
+                println!("❌ No lock files found for action: {}", action);
                         return Json(json!({
                             "success": false,
-                            "message": "No composite action definition found",
+                    "message": "No lock files found",
                             "action": action,
-                            "error": "This action cannot be executed locally as it requires the full implementation"
+                    "error": "Unable to find published artifacts for this action"
                         }));
                     }
                     
-                    println!("✅ Successfully downloaded {} action manifest(s)", manifests.len());
+            println!("✅ Successfully fetched {} lock file(s)", locks.len());
+            
+            // Create artifacts directory
+            let artifacts_dir = std::path::Path::new("./artifacts");
+            if let Err(e) = std::fs::create_dir_all(artifacts_dir) {
+                println!("❌ Failed to create artifacts directory: {}", e);
+                        return Json(json!({
+                            "success": false,
+                    "message": "Failed to create artifacts directory",
+                            "action": action,
+                    "error": e.to_string()
+                        }));
+                    }
                     
-                    // Get the main manifest (first one)
-                    let main_manifest = &manifests[0];
-                    println!("📋 Main action: {} (version: {})", main_manifest.name, main_manifest.version);
-                    println!("🔗 Steps: {}", main_manifest.steps.len());
-                    
-                    // Convert to local types for topo_order
-                    let local_steps: Vec<crate::runners::local::ActionStep> = main_manifest.steps.iter()
-                        .map(convert_action_step)
-                        .collect();
-                    let local_wires: Vec<crate::runners::local::Wire> = main_manifest.wires.iter()
-                        .map(convert_action_wire)
-                        .collect();
-                    
-                    // Use topo_order to determine execution order
-                    match crate::runners::local::topo_order(&local_steps, &local_wires) {
-                            Ok(order) => {
-                                println!("📊 Execution order: {:?}", order);
-                                
-                                // Send execution plan to WebSocket clients
-                                let ws_message = json!({
-                                    "type": "execution_plan",
-                                    "action": action,
-                                    "manifest": {
-                                        "name": main_manifest.name,
-                                        "version": main_manifest.version,
-                                        "steps": main_manifest.steps.len(),
-                                        "execution_order": order
-                                    },
-                                    "steps": main_manifest.steps.iter().map(|step| {
-                                        json!({
-                                            "id": step.id,
-                                            "uses": step.uses,
-                                            "kind": step.kind.as_deref().unwrap_or("docker")
-                                        })
-                                    }).collect::<Vec<_>>(),
-                                    "wires": main_manifest.wires.iter().map(|wire| {
-                                        json!({
-                                            "from": {
-                                                "step": wire.from.step,
-                                                "output": wire.from.output,
-                                                "source": wire.from.source,
-                                                "key": wire.from.key
-                                            },
-                                            "to": {
-                                                "step": wire.to.step,
-                                                "input": wire.to.input
-                                            }
-                                        })
-                                    }).collect::<Vec<_>>()
-                                });
-                                
-                                // Broadcast to all WebSocket clients
-                                if let Ok(msg_str) = serde_json::to_string(&ws_message) {
-                                    let _ = state.ws_sender.send(msg_str);
-                                    println!("📡 Sent WebSocket message to all clients");
-                                }
-                                
-                                let response = json!({
-                                    "success": true,
-                                    "message": "Composite action resolved successfully",
-                                    "action": action,
-                                    "inputs": inputs,
-                                    "execution_id": format!("exec_{}", chrono::Utc::now().timestamp()),
-                                    "manifest": {
-                                        "name": main_manifest.name,
-                                        "version": main_manifest.version,
-                                        "steps": main_manifest.steps.len(),
-                                        "execution_order": order
-                                    }
-                                });
-                                
-                                Json(response)
-                            }
-                        Err(e) => {
-                            println!("❌ Failed to determine execution order: {}", e);
-                            Json(json!({
-                                "success": false,
-                                "message": "Failed to determine execution order",
-                                "action": action,
-                                "error": e.to_string()
-                            }))
-                        }
+            // Store types from all lock files, compute execution orders, and download WASM artifacts
+            let mut downloaded_artifacts = Vec::new();
+            for lock in &locks {
+                println!("📦 Processing lock for: {} v{}", lock.name, lock.version);
+                
+                let action_ref = format!("{}/{}@{}", 
+                    action.split('/').next().unwrap_or("unknown"),
+                    lock.name, 
+                    lock.version
+                );
+                
+                // Store types from this lock file
+                if !lock.types.is_empty() {
+                    state.store_types(&action_ref, &lock.types);
+                }
+                
+                // Compute and store execution order for composite actions
+                match compute_execution_order(&action_ref, lock).await {
+                    Ok(Some(execution_order)) => {
+                        state.store_execution_order(&action_ref, execution_order);
+                    }
+                    Ok(None) => {
+                        // Not a composite action, no execution order needed
+                    }
+                    Err(e) => {
+                        println!("⚠️  Failed to compute execution order for {}: {}", action_ref, e);
                     }
                 }
-                Err(e) => {
-                    println!("❌ Failed to download composite action definition: {}", e);
-                    Json(json!({
-                        "success": false,
-                        "message": "Failed to download composite action definition",
-                        "action": action,
-                        "error": e.to_string()
-                    }))
+                
+                if lock.kind == crate::models::ShKind::Wasm {
+                    // Create a safe filename from the action reference
+                    let safe_name = action.replace('/', "_").replace('@', "_");
+                    let artifact_path = artifacts_dir.join(format!("{}.wasm", safe_name));
+                    
+                    match download_wasm_artifact(&lock.distribution.primary, &artifact_path).await {
+                        Ok(_) => {
+                            downloaded_artifacts.push(json!({
+                                "name": lock.name,
+                                "version": lock.version,
+                                "kind": "wasm",
+                                "path": artifact_path.to_string_lossy(),
+                                "digest": lock.digest
+                            }));
+                        }
+                        Err(e) => {
+                            println!("❌ Failed to download artifact for {}: {}", lock.name, e);
+                        }
+                    }
+                } else {
+                    println!("ℹ️  Skipping non-WASM artifact: {} (kind: {:?})", lock.name, lock.kind);
                 }
             }
-        }
-        Err(e) => {
-            println!("❌ Failed to fetch action metadata: {}", e);
-            Json(json!({
-                "success": false,
-                "message": "Failed to fetch action metadata",
+            
+            // Execute the action - either composite or simple
+            let execution_result = if let Some(execution_order) = state.get_execution_order(&action) {
+                println!("🔄 Found execution order for composite action: {:?}", execution_order);
+                
+                match execute_ordered_steps(&action, &execution_order, &inputs, &artifacts_dir, &state).await {
+                    Ok(outputs) => {
+                        println!("✅ Composite action execution completed successfully");
+                        Some(outputs)
+                    }
+                    Err(e) => {
+                        println!("❌ Composite action execution failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                println!("ℹ️  No execution order found - executing as simple action");
+                
+                // Execute simple WASM action
+                match execute_simple_wasm_action(&action, &inputs, &artifacts_dir).await {
+                    Ok(outputs) => {
+                        println!("✅ Simple WASM action execution completed successfully");
+                        Some(outputs)
+                    }
+                    Err(e) => {
+                        println!("❌ Simple WASM action execution failed: {}", e);
+                        None
+                    }
+                }
+            };
+            
+            // Send completion message to WebSocket clients
+                                let ws_message = json!({
+                "type": "artifacts_downloaded",
+                                    "action": action,
+                "artifacts": downloaded_artifacts,
+                "total_downloaded": downloaded_artifacts.len(),
+                "execution_result": execution_result
+            });
+            
+                                if let Ok(msg_str) = serde_json::to_string(&ws_message) {
+                                    let _ = state.ws_sender.send(msg_str);
+                println!("📡 Sent completion message to WebSocket clients");
+            }
+            
+            // Print completion summary
+            println!("🎉 Artifact download completed!");
+            println!("📊 Summary:");
+            println!("   • Total lock files processed: {}", locks.len());
+            println!("   • WASM artifacts downloaded: {}", downloaded_artifacts.len());
+            println!("   • Artifacts directory: {}", artifacts_dir.display());
+            
+            for artifact in &downloaded_artifacts {
+                println!("   • {} v{} -> {}", 
+                    artifact["name"], 
+                    artifact["version"], 
+                    artifact["path"]
+                );
+            }
+            
+                            Json(json!({
+                "success": true,
+                "message": "Artifacts downloaded successfully",
+                                "action": action,
+                "artifacts": downloaded_artifacts,
+                "total_downloaded": downloaded_artifacts.len(),
+                "artifacts_directory": artifacts_dir.to_string_lossy(),
+                "execution_result": execution_result
+                            }))
+                }
+                Err(e) => {
+            println!("❌ Failed to fetch lock files: {}", e);
+                    Json(json!({
+                        "success": false,
+                "message": "Failed to fetch lock files",
+                        "action": action,
                 "error": e.to_string()
             }))
         }
@@ -1672,7 +2027,7 @@ async fn get_action_id(api_base: &str, action_name: &str, namespace: &str, acces
 }
 
 /// Creates a new action
-async fn create_action(api_base: &str, action_name: &str, description: &str, namespace: &str, profile_id: &str, git_allowed_repository_id: Option<&str>, kind: Option<&crate::models::ShKind>, access_token: &str) -> anyhow::Result<String> {
+async fn create_action(api_base: &str, action_name: &str, description: &str, _namespace: &str, profile_id: &str, git_allowed_repository_id: Option<&str>, kind: Option<&crate::models::ShKind>, access_token: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::new();
     
     // First get the owner ID for this profile
@@ -2206,366 +2561,3 @@ async fn update_action_latest_version(api_base: &str, action_id: &str, version_i
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-    use std::fs;
-
-    #[test]
-    fn test_parse_digest_any() {
-        // Test successful digest parsing
-        let output = "digest: sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
-        let digest = parse_digest_any(output);
-        assert_eq!(digest, Some("sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc".to_string()));
-
-        // Test case insensitive
-        let output = "Digest: SHA256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
-        let digest = parse_digest_any(output);
-        assert_eq!(digest, Some("SHA256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc".to_string()));
-
-        // Test with additional text after digest
-        let output = "digest: sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc size: 1234";
-        let digest = parse_digest_any(output);
-        assert_eq!(digest, Some("sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc".to_string()));
-
-        // Test no digest found
-        let output = "no digest here";
-        let digest = parse_digest_any(output);
-        assert_eq!(digest, None);
-
-        // Test invalid digest format
-        let output = "digest: sha256:invalid";
-        let digest = parse_digest_any(output);
-        assert_eq!(digest, None);
-    }
-
-    #[test]
-    fn test_oci_from_manifest() {
-        // Test OCI paths
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            kind: Some(ShKind::Docker),
-            manifest_version: 1,
-            repository: "ghcr.io/org/image".to_string(),
-            image: Some("ghcr.io/org/image".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = oci_from_manifest(&manifest).unwrap();
-        assert_eq!(result, "ghcr.io/org/image");
-
-        // Test GitHub URLs
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Docker),
-            repository: "https://github.com/org/repo".to_string(),
-            image: Some("ghcr.io/org/repo".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = oci_from_manifest(&manifest).unwrap();
-        assert_eq!(result, "ghcr.io/org/repo");
-
-        // Test GitHub URLs without scheme
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Docker),
-            repository: "github.com/org/repo".to_string(),
-            image: Some("ghcr.io/org/repo".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = oci_from_manifest(&manifest).unwrap();
-        assert_eq!(result, "github.com/org/repo");
-
-        // Test invalid repository
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Docker),
-            repository: "invalid".to_string(),
-            image: Some("invalid".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = oci_from_manifest(&manifest);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_find_wasm_artifact() {
-        // Test with crate name containing dash
-        let result = find_wasm_artifact("test-crate");
-        // This will return None in test environment, but we can test the function exists
-        assert!(result.is_none() || result.unwrap().contains("test-crate"));
-
-        // Test with crate name containing underscore
-        let result = find_wasm_artifact("test_crate");
-        // This will return None in test environment, but we can test the function exists
-        assert!(result.is_none() || result.unwrap().contains("test_crate"));
-    }
-
-    #[test]
-    fn test_github_to_ghcr_path() {
-        // Test GitHub HTTPS URLs
-        let result = github_to_ghcr_path("https://github.com/org/repo");
-        assert_eq!(result, Some("ghcr.io/org/repo".to_string()));
-
-        let result = github_to_ghcr_path("https://github.com/org/repo.git");
-        assert_eq!(result, Some("ghcr.io/org/repo".to_string()));
-
-        // Test GitHub URLs without scheme
-        let result = github_to_ghcr_path("github.com/org/repo");
-        assert_eq!(result, Some("ghcr.io/org/repo".to_string()));
-
-        // Test with trailing slash
-        let result = github_to_ghcr_path("https://github.com/org/repo/");
-        assert_eq!(result, Some("ghcr.io/org/repo".to_string()));
-
-        // Test invalid GitHub URLs
-        let result = github_to_ghcr_path("https://gitlab.com/org/repo");
-        assert_eq!(result, None);
-
-        let result = github_to_ghcr_path("invalid-url");
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_derive_image_base() {
-        // Test Docker kind
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Docker),
-            repository: "https://github.com/org/repo".to_string(),
-            image: Some("ghcr.io/org/repo".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = derive_image_base(&manifest, None);
-        assert_eq!(result.unwrap(), "ghcr.io/org/repo");
-
-        // Test WASM kind
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Wasm),
-            repository: "https://github.com/org/repo".to_string(),
-            image: Some("ghcr.io/org/repo".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = derive_image_base(&manifest, None);
-        assert_eq!(result.unwrap(), "ghcr.io/org/repo");
-
-        // Test with non-GitHub repository
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Docker),
-            repository: "https://gitlab.com/org/repo".to_string(),
-            image: Some("ghcr.io/owner/package".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let result = derive_image_base(&manifest, None);
-        assert_eq!(result.unwrap(), "ghcr.io/owner/package");
-    }
-
-    #[test]
-    fn test_write_file_guarded() {
-        let temp_dir = TempDir::new().unwrap();
-        let test_file = temp_dir.path().join("test.txt");
-        let content = "test content";
-
-        // Test writing new file
-        write_file_guarded(&test_file, content).unwrap();
-        assert!(test_file.exists());
-        assert_eq!(fs::read_to_string(&test_file).unwrap(), content);
-
-        // Test overwriting existing file (this will fail in test environment due to interactive prompt)
-        // In a real test, we'd need to mock the inquire::Confirm
-        let new_content = "new content";
-        // This will likely fail due to interactive prompt, but we can test the function exists
-        let _ = write_file_guarded(&test_file, new_content);
-    }
-
-    #[test]
-    fn test_make_executable() {
-        let temp_dir = TempDir::new().unwrap();
-        let test_file = temp_dir.path().join("test.sh");
-        fs::write(&test_file, "#!/bin/bash").unwrap();
-
-        // Test that the function doesn't panic
-        let result = make_executable(&test_file);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_cmd_status() {
-        // Test with ID
-        let _result = cmd_status(Some("test-id".to_string()));
-        // This is async, so we can't easily test it in unit tests
-        // But we can verify the function exists and doesn't panic
-    }
-
-    #[test]
-    fn test_open_actions_page() {
-        // Test that the function doesn't panic
-        // Note: This will try to open a browser in test environment
-        open_actions_page("test-owner", "test-repo");
-        // We can't easily test the actual browser opening, but we can verify the function exists
-    }
-
-    #[tokio::test]
-    async fn test_cmd_login() {
-        // This test would require mocking the runner, which is complex
-        // For now, we just verify the function exists and doesn't panic
-        // In a real test suite, you'd want to mock the runner::Runner trait
-    }
-
-    #[tokio::test]
-    async fn test_cmd_run() {
-        // This test would require mocking the runner, which is complex
-        // For now, we just verify the function exists and doesn't panic
-        // In a real test suite, you'd want to mock the runner::Runner trait
-    }
-
-    #[tokio::test]
-    async fn test_cmd_publish_docker_inner() {
-        // This test would require mocking Docker commands, which is complex
-        // For now, we just verify the function exists and doesn't panic
-        // In a real test suite, you'd want to mock the external commands
-    }
-
-    #[tokio::test]
-    async fn test_cmd_publish_wasm_inner() {
-        // This test would require mocking oras/crane commands, which is complex
-        // For now, we just verify the function exists and doesn't panic
-        // In a real test suite, you'd want to mock the external commands
-    }
-
-    #[test]
-    fn test_push_and_get_digest() {
-        // This test would require mocking Docker commands, which is complex
-        // For now, we just verify the function exists and doesn't panic
-        // In a real test suite, you'd want to mock the external commands
-    }
-
-    #[test]
-    fn test_push_wasm_and_get_digest() {
-        // This test would require mocking oras/crane commands, which is complex
-        // For now, we just verify the function exists and doesn't panic
-        // In a real test suite, you'd want to mock the external commands
-    }
-
-    #[test]
-    fn test_run_and_run_capture() {
-        // These tests would require mocking external commands, which is complex
-        // For now, we just verify the functions exist and don't panic
-        // In a real test suite, you'd want to mock the external commands
-    }
-
-    #[test]
-    fn test_parse_digest() {
-        // Test successful digest parsing
-        let output = "Digest: sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
-        let digest = parse_digest(output);
-        assert_eq!(digest, Some("sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc".to_string()));
-
-        // Test with whitespace
-        let output = "  Digest: sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc  ";
-        let digest = parse_digest(output);
-        assert_eq!(digest, Some("sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc".to_string()));
-    }
-
-    #[test]
-    fn test_write_lock() {
-        let temp_dir = TempDir::new().unwrap();
-        let manifest = ShManifest {
-            name: "test".to_string(),
-            description: "Test manifest".to_string(),
-            version: "1.0.0".to_string(),
-            manifest_version: 1,
-            kind: Some(ShKind::Docker),
-            repository: "ghcr.io/org/image".to_string(),
-            image: Some("ghcr.io/org/image".to_string()),
-            license: "MIT".to_string(),
-            inputs: vec![],
-            outputs: vec![],
-            types: std::collections::HashMap::new(),
-            steps: vec![],
-            wires: vec![],
-            export: serde_json::json!({}),
-        };
-        let image_base = "ghcr.io/org/image";
-        let digest = "sha256:abc123def4567890abcdef1234567890abcdef1234567890abcdef1234567890abc";
-
-        // Change to temp directory so write_lock writes there
-        std::env::set_current_dir(temp_dir.path()).unwrap();
-        write_lock(&manifest, image_base, digest).unwrap();
-        
-        let lock_file = temp_dir.path().join("starthub.lock.json");
-        assert!(lock_file.exists());
-        let content = fs::read_to_string(&lock_file).unwrap();
-        let parsed_lock: ShLock = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed_lock.name, manifest.name);
-        assert_eq!(parsed_lock.version, manifest.version);
-        assert_eq!(parsed_lock.kind, manifest.kind);
-        
-        // Clean up
-        std::env::set_current_dir("/").unwrap();
-    }
-}

@@ -128,8 +128,6 @@ pub async fn get_user(access_token: &str) -> Result<GhUser> {
 
 #[derive(Deserialize)]
 struct InstallationsPage {
-    #[allow(dead_code)]
-    total_count: u32,
     installations: Vec<Installation>,
 }
 
@@ -213,20 +211,6 @@ impl StoredCredentials {
         }
     }
 
-    /// Optional: check refresh token expiry if you plan to refresh
-    #[allow(dead_code)]
-    pub fn refresh_is_expired(&self) -> bool {
-        match self.refresh_token_expires_at_epoch {
-            None => false,
-            Some(t) => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                now + 120 >= t
-            }
-        }
-    }
 }
 
 pub fn save_token_for(provider: &str, token: &TokenResp) -> Result<()> {
