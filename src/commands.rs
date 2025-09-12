@@ -412,7 +412,7 @@ fn build_step_inputs(
 /// Execute a simple WASM action
 async fn execute_simple_wasm_action(
     action_ref: &str,
-    inputs: &std::collections::HashMap<String, serde_json::Value>,
+    inputs: &Vec<serde_json::Value>,
     artifacts_dir: &std::path::Path
 ) -> Result<serde_json::Value> {
     println!("🚀 Executing simple WASM action: {}", action_ref);
@@ -448,23 +448,24 @@ async fn execute_single_step(
         return Err(anyhow::anyhow!("WASM artifact not found: {}", artifact_path.display()));
     }
     
+    // Convert HashMap to Vec for execute_wasm_file
+    let inputs_vec: Vec<serde_json::Value> = inputs.iter()
+        .map(|(key, value)| json!({key: value}))
+        .collect();
+    
     // Execute the WASM file
-    execute_wasm_file(&artifact_path, inputs).await
+    execute_wasm_file(&artifact_path, &inputs_vec).await
 }
 
 /// Execute a WASM file using wasmtime command line
 async fn execute_wasm_file(
     wasm_path: &std::path::Path,
-    inputs: &std::collections::HashMap<String, serde_json::Value>
+    inputs: &Vec<serde_json::Value>
 ) -> Result<serde_json::Value> {
     println!("🔧 Executing WASM file: {}", wasm_path.display());
     
-    // Convert inputs to the format expected by the WASM module
-    // The WASM expects: {"params": {"url": "...", "headers": {...}}}
-    let wasm_input = json!({
-        "params": inputs
-    });
-    let inputs_json = serde_json::to_string(&wasm_input)?;
+    // Inputs are already in array format, use them directly
+    let inputs_json = serde_json::to_string(inputs)?;
     println!("📥 Inputs: {}", inputs_json);
     
     // Use wasmtime command line with HTTP support
@@ -501,11 +502,11 @@ async fn execute_wasm_file(
         
         // Parse the output to extract the result
         // The WASM outputs in format: ::starthub:state::{json}
-        let mut final_output = json!({
-            "status": "success",
-            "message": "WASM executed successfully",
-            "inputs": inputs
-        });
+        let mut final_output = json!([
+            {"status": "success"},
+            {"message": "WASM executed successfully"},
+            {"inputs": inputs}
+        ]);
         
         // Try to extract the starthub state output
         for line in stdout.lines() {
@@ -1604,14 +1605,14 @@ async fn handle_run(
     
     // Extract action and inputs from payload
     let action = payload.get("action").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-    let default_inputs = json!({});
+    let default_inputs = json!([]);
     let inputs_value = payload.get("inputs").unwrap_or(&default_inputs);
     
-    // Convert inputs to HashMap
-    let inputs: std::collections::HashMap<String, serde_json::Value> = if let Some(inputs_obj) = inputs_value.as_object() {
-        inputs_obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    // Convert inputs array to Vec<Value> for direct use
+    let inputs: Vec<serde_json::Value> = if let Some(inputs_array) = inputs_value.as_array() {
+        inputs_array.clone()
     } else {
-        std::collections::HashMap::new()
+        Vec::new()
     };
     
     println!("📋 Action: {}", action);
@@ -1708,7 +1709,18 @@ async fn handle_run(
             let execution_result = if let Some(execution_order) = state.get_execution_order(&action) {
                 println!("🔄 Found execution order for composite action: {:?}", execution_order);
                 
-                match execute_ordered_steps(&action, &execution_order, &inputs, &artifacts_dir, &state).await {
+                // Convert Vec back to HashMap for composite actions
+                let inputs_map: std::collections::HashMap<String, serde_json::Value> = inputs.iter()
+                    .filter_map(|item| {
+                        if let Some(obj) = item.as_object() {
+                            obj.iter().next().map(|(k, v)| (k.clone(), v.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                        .collect();
+                    
+                match execute_ordered_steps(&action, &execution_order, &inputs_map, &artifacts_dir, &state).await {
                     Ok(outputs) => {
                         println!("✅ Composite action execution completed successfully");
                         Some(outputs)
