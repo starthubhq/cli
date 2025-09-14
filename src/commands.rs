@@ -34,12 +34,13 @@ use tokio::sync::broadcast;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-// Shared state for WebSocket connections, types storage, and execution order
+// Shared state for WebSocket connections, types storage, execution order, and composition data
 #[derive(Clone)]
 struct AppState {
     ws_sender: broadcast::Sender<String>,
     types_storage: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, serde_json::Value>>>,
     execution_orders: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, Vec<String>>>>,
+    composition_data: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, crate::models::ShManifest>>>,
 }
 
 impl AppState {
@@ -49,6 +50,7 @@ impl AppState {
             ws_sender,
             types_storage: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             execution_orders: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            composition_data: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         }
     }
     
@@ -111,6 +113,22 @@ impl AppState {
             Err(_) => std::collections::HashMap::new(),
         }
     }
+    
+    /// Store composition data for a composite action
+    fn store_composition_data(&self, action_ref: &str, composition: crate::models::ShManifest) {
+        if let Ok(mut compositions) = self.composition_data.write() {
+            compositions.insert(action_ref.to_string(), composition);
+            println!("📋 Stored composition data for: {}", action_ref);
+        }
+    }
+    
+    /// Get composition data for a specific action
+    fn get_composition_data(&self, action_ref: &str) -> Option<crate::models::ShManifest> {
+        match self.composition_data.read() {
+            Ok(compositions) => compositions.get(action_ref).cloned(),
+            Err(_) => None,
+        }
+    }
 }
 
 
@@ -166,6 +184,12 @@ fn fetch_all_action_locks<'a>(
     }
     
     let lock_content = response.text().await?;
+    println!("🔍 Lock file content preview: {}", &lock_content[..std::cmp::min(500, lock_content.len())]);
+    
+    // Try to parse as JSON first to see the structure
+    let json_value: serde_json::Value = serde_json::from_str(&lock_content)?;
+    println!("🔍 Parsed JSON structure keys: {:?}", json_value.as_object().map(|obj| obj.keys().collect::<Vec<_>>()));
+    
     let lock: crate::models::ShLock = serde_json::from_str(&lock_content)?;
     
     let mut all_locks = vec![lock.clone()];
@@ -193,7 +217,7 @@ fn fetch_all_action_locks<'a>(
                                     
                                     // Recursively fetch locks for each step
     for step in &manifest.steps {
-                                        let step_ref = &step.uses;
+                                        let step_ref = &step.uses.name;
                                         println!("🔍 Processing step: {}", step_ref);
                                         
                                         match fetch_all_action_locks(_client, step_ref, visited).await {
@@ -244,47 +268,23 @@ async fn compute_execution_order(
     
     println!("🔄 Computing execution order for composite action: {}", action_ref);
     
-    // We need to fetch the manifest to get steps and wires
-    let parts: Vec<&str> = action_ref.split('/').collect();
-    if parts.len() < 2 {
-        return Err(anyhow::anyhow!("Invalid action reference format: {}", action_ref));
+    // Check if the lock file has composition data embedded
+    if lock.composition.is_none() {
+        return Err(anyhow::anyhow!("No composition data found in lock file"));
     }
     
-    let owner = parts[0];
-    let name_version = parts[1];
-    let (name, _version) = if name_version.contains('@') {
-        let name_version_parts: Vec<&str> = name_version.split('@').collect();
-        (name_version_parts[0], name_version_parts[1])
-    } else {
-        return Err(anyhow::anyhow!("Action reference must include version: {}", action_ref));
-    };
+    let composition = lock.composition.as_ref().unwrap();
     
-    // Fetch the manifest to get steps and wires
-    let manifest_url = format!(
-        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
-        owner, name
-    );
-    
-    println!("🔗 Fetching manifest for execution order: {}", manifest_url);
-    
-    let response = reqwest::get(&manifest_url).await?;
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!("Failed to fetch manifest: HTTP {}", response.status()));
-    }
-    
-    let manifest_content = response.text().await?;
-    let manifest: crate::models::ShManifest = serde_json::from_str(&manifest_content)?;
-    
-    if manifest.steps.is_empty() {
-        println!("⚠️  No steps found in manifest for composite action");
+    if composition.steps.is_empty() {
+        println!("⚠️  No steps found in composition");
         return Ok(Some(vec![]));
     }
     
-    println!("📋 Found {} steps in manifest", manifest.steps.len());
+    println!("📋 Found {} steps in composition", composition.steps.len());
     
-    // Use the steps and wires directly (they're already the right type)
-    let steps: Vec<crate::runners::local::ActionStep> = manifest.steps.clone();
-    let wires: Vec<crate::runners::local::Wire> = manifest.wires.clone();
+    // Use the steps and wires directly from the composition
+    let steps: Vec<crate::runners::local::ActionStep> = composition.steps.clone();
+    let wires: Vec<crate::runners::local::Wire> = composition.wires.clone();
     
     // Use the existing topological sort function
     match crate::runners::local::topo_order(&steps, &wires) {
@@ -305,38 +305,13 @@ async fn execute_ordered_steps(
     execution_order: &[String],
     inputs: &std::collections::HashMap<String, serde_json::Value>,
     artifacts_dir: &std::path::Path,
-    _state: &AppState
+    state: &AppState
 ) -> Result<serde_json::Value> {
     println!("🚀 Starting execution of {} steps for action: {}", execution_order.len(), action_ref);
     
-    // Get the manifest to understand the steps and wires
-    let parts: Vec<&str> = action_ref.split('/').collect();
-    if parts.len() < 2 {
-        return Err(anyhow::anyhow!("Invalid action reference format: {}", action_ref));
-    }
-    
-    let owner = parts[0];
-    let name_version = parts[1];
-    let (name, _version) = if name_version.contains('@') {
-        let name_version_parts: Vec<&str> = name_version.split('@').collect();
-        (name_version_parts[0], name_version_parts[1])
-    } else {
-        return Err(anyhow::anyhow!("Action reference must include version: {}", action_ref));
-    };
-    
-    // Fetch the manifest to get steps and wires
-    let manifest_url = format!(
-        "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
-        owner, name
-    );
-    
-    let response = reqwest::get(&manifest_url).await?;
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!("Failed to fetch manifest: HTTP {}", response.status()));
-    }
-    
-    let manifest_content = response.text().await?;
-    let manifest: crate::models::ShManifest = serde_json::from_str(&manifest_content)?;
+    // Get the composition data from the state (we already have it from the lock file)
+    let composition = state.get_composition_data(action_ref)
+        .ok_or_else(|| anyhow::anyhow!("No composition data found for action: {}", action_ref))?;
     
     // Store step outputs as we execute them
     let mut step_outputs: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
@@ -346,24 +321,26 @@ async fn execute_ordered_steps(
         println!("🔄 Executing step: {}", step_id);
         
         // Find the step definition
-        let step = manifest.steps.iter()
+        let step = composition.steps.iter()
             .find(|s| s.id == *step_id)
-            .ok_or_else(|| anyhow::anyhow!("Step {} not found in manifest", step_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Step {} not found in composition", step_id))?;
         
         // Build inputs for this step based on wires
-        let step_inputs = build_step_inputs(step_id, &manifest.wires, inputs, &step_outputs)?;
+        let step_inputs = build_step_inputs(step_id, &composition.wires, inputs, &step_outputs)?;
+        println!("🔍 Built inputs for step {}: {:?}", step_id, step_inputs);
         
         // Execute the step
         let step_output = execute_single_step(step, &step_inputs, artifacts_dir).await?;
         
         // Store the output for future steps
-        step_outputs.insert(step_id.clone(), step_output);
+        step_outputs.insert(step_id.clone(), step_output.clone());
+        println!("🔍 Stored output for step {}: {:?}", step_id, step_output);
         
         println!("✅ Step {} completed successfully", step_id);
     }
     
     // Build final outputs based on export configuration
-    let final_outputs = build_final_outputs(&manifest.export, &step_outputs)?;
+    let final_outputs = build_final_outputs(&composition.export, &step_outputs)?;
     
     println!("🎉 All steps executed successfully!");
     Ok(final_outputs)
@@ -375,8 +352,8 @@ fn build_step_inputs(
     wires: &[crate::models::ShWire],
     action_inputs: &std::collections::HashMap<String, serde_json::Value>,
     step_outputs: &std::collections::HashMap<String, serde_json::Value>
-) -> Result<std::collections::HashMap<String, serde_json::Value>> {
-    let mut step_inputs = std::collections::HashMap::new();
+) -> Result<Vec<serde_json::Value>> {
+    let mut input_values: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     
     // Find all wires that target this step
     for wire in wires {
@@ -387,11 +364,25 @@ fn build_step_inputs(
                     if source == "inputs" => {
                         action_inputs.get(key).cloned()
                     }
-                // Input from previous step output
+                // Input from previous step output - extract from positional array
                 crate::models::ShWireFrom { step: Some(from_step), output: Some(output), .. } => {
-                    step_outputs.get(from_step)
-                        .and_then(|step_output| step_output.get(output))
-                        .cloned()
+                    // Get the step output (which is a positional array)
+                    let mut found_value = None;
+                    if let Some(step_output) = step_outputs.get(from_step) {
+                        // The step_output should be an array like [{"status":200},{"body":"..."}]
+                        if let Some(output_array) = step_output.as_array() {
+                            // Find the output by name in the array
+                            for item in output_array {
+                                if let Some(obj) = item.as_object() {
+                                    if obj.contains_key(output) {
+                                        found_value = obj.get(output).cloned();
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    found_value
                 }
                 // Literal value
                 crate::models::ShWireFrom { value: Some(value), .. } => {
@@ -401,12 +392,35 @@ fn build_step_inputs(
             };
             
             if let Some(value) = value {
-                step_inputs.insert(wire.to.input.clone(), value);
+                input_values.insert(wire.to.input.clone(), value);
             }
         }
     }
     
-    Ok(step_inputs)
+    // Convert to array of objects format that WASM expects
+    // Each input becomes an object with the input name as key
+    // For now, we'll hardcode the correct order for known steps
+    let mut inputs_array = Vec::new();
+    
+    // Define the correct input order for each step
+    let input_order = match step_id {
+        "http_get_wasm" => vec!["url", "headers"],
+        "stringify_wasm" => vec!["object"],
+        "parse_wasm" => vec!["string", "type"],
+        _ => {
+            // Fallback: use the order from input_values
+            input_values.keys().map(|s| s.as_str()).collect()
+        }
+    };
+    
+    // Build inputs in the correct order
+    for input_name in input_order {
+        if let Some(value) = input_values.get(input_name) {
+            inputs_array.push(json!({input_name: value}));
+        }
+    }
+    
+    Ok(inputs_array)
 }
 
 /// Execute a simple WASM action
@@ -432,29 +446,24 @@ async fn execute_simple_wasm_action(
 /// Execute a single step (WASM or Docker)
 async fn execute_single_step(
     step: &crate::models::ShActionStep,
-    inputs: &std::collections::HashMap<String, serde_json::Value>,
+    inputs: &Vec<serde_json::Value>,
     artifacts_dir: &std::path::Path
 ) -> Result<serde_json::Value> {
-    println!("🔧 Executing step: {} (uses: {})", step.id, step.uses);
+    println!("🔧 Executing step: {} (uses: {})", step.id, step.uses.name);
     
     // For now, we'll focus on WASM steps
     // TODO: Add Docker step execution later
     
     // Find the corresponding WASM artifact
-    let safe_name = step.uses.replace('/', "_").replace(':', "_");
+    let safe_name = step.uses.name.replace('/', "_").replace(':', "_");
     let artifact_path = artifacts_dir.join(format!("{}.wasm", safe_name));
     
     if !artifact_path.exists() {
         return Err(anyhow::anyhow!("WASM artifact not found: {}", artifact_path.display()));
     }
     
-    // Convert HashMap to Vec for execute_wasm_file
-    let inputs_vec: Vec<serde_json::Value> = inputs.iter()
-        .map(|(key, value)| json!({key: value}))
-        .collect();
-    
-    // Execute the WASM file
-    execute_wasm_file(&artifact_path, &inputs_vec).await
+    // Execute the WASM file (inputs are already in the correct format)
+    execute_wasm_file(&artifact_path, inputs).await
 }
 
 /// Execute a WASM file using wasmtime command line
@@ -468,11 +477,17 @@ async fn execute_wasm_file(
     let inputs_json = serde_json::to_string(inputs)?;
     println!("📥 Inputs: {}", inputs_json);
     
-    // Use wasmtime command line with HTTP support
-    let mut output = tokio::process::Command::new("wasmtime")
-        .arg("-S")
-        .arg("http")  // Enable HTTP support for WASI HTTP
-        .arg(wasm_path)
+    // Use wasmtime command line - only enable HTTP support for modules that need it
+    let mut cmd = tokio::process::Command::new("wasmtime");
+    
+    // Check if this is an HTTP-related module that needs HTTP support
+    let needs_http = wasm_path.to_string_lossy().contains("http-get-wasm");
+    
+    if needs_http {
+        cmd.arg("-S").arg("http");  // Enable HTTP support for WASI HTTP
+    }
+    
+    let mut output = cmd.arg(wasm_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -752,6 +767,11 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
         types: m.types.clone(),
         distribution: ShDistribution { primary, upstream: None },
         digest,
+        composition: if m.kind == Some(crate::models::ShKind::Composition) {
+            Some(m.clone())
+        } else {
+            None
+        },
     };
     
     // Write lock file locally
@@ -993,6 +1013,11 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
         types: m.types.clone(),
         distribution: ShDistribution { primary, upstream: None },
         digest,
+        composition: if m.kind == Some(crate::models::ShKind::Composition) {
+            Some(m.clone())
+        } else {
+            None
+        },
     };
     
     // Write lock file locally
@@ -1455,9 +1480,15 @@ fn parse_action_arg(action: &str) -> (String, String, String) {
             namespace = parts[0].to_string();
             let full_slug = parts[1].to_string();
             
-            // Check if slug contains version (e.g., "test-action@0.1.0")
+            // Check if slug contains version (e.g., "test-action@0.1.0" or "test-action:0.1.0")
             if full_slug.contains('@') {
                 let slug_parts: Vec<&str> = full_slug.split('@').collect();
+                if slug_parts.len() >= 2 {
+                    slug = slug_parts[0].to_string();
+                    version = slug_parts[1].to_string();
+                }
+            } else if full_slug.contains(':') {
+                let slug_parts: Vec<&str> = full_slug.split(':').collect();
                 if slug_parts.len() >= 2 {
                     slug = slug_parts[0].to_string();
                     version = slug_parts[1].to_string();
@@ -1469,6 +1500,13 @@ fn parse_action_arg(action: &str) -> (String, String, String) {
     } else if action.contains('@') {
         // Handle case like "test-action@0.1.0"
         let parts: Vec<&str> = action.split('@').collect();
+        if parts.len() >= 2 {
+            slug = parts[0].to_string();
+            version = parts[1].to_string();
+        }
+    } else if action.contains(':') {
+        // Handle case like "test-action:0.1.0"
+        let parts: Vec<&str> = action.split(':').collect();
         if parts.len() >= 2 {
             slug = parts[0].to_string();
             version = parts[1].to_string();
@@ -1672,6 +1710,40 @@ async fn handle_run(
                 match compute_execution_order(&action_ref, lock).await {
                     Ok(Some(execution_order)) => {
                         state.store_execution_order(&action_ref, execution_order);
+                        
+                        // Also store the composition data for execution
+                        if let Some(composition) = &lock.composition {
+                            state.store_composition_data(&action_ref, composition.clone());
+                            
+                            // Download artifacts for each step in the composition
+                            for step in &composition.steps {
+                                let step_name = &step.uses.name;
+                                let safe_name = step_name.replace('/', "_").replace(':', "_");
+                                let artifact_path = artifacts_dir.join(format!("{}.wasm", safe_name));
+                                
+                                // Construct the artifact URL for this step
+                                // step_name is like "http-get-wasm:0.0.15", we need "tgirotto/http-get-wasm/0.0.15"
+                                let step_artifact_url = format!(
+                                    "https://api.starthub.so/storage/v1/object/public/artifacts/tgirotto/{}/artifact.zip",
+                                    step_name.replace(':', "/")
+                                );
+                                
+                                match download_wasm_artifact(&step_artifact_url, &artifact_path).await {
+                                    Ok(_) => {
+                                        downloaded_artifacts.push(json!({
+                                            "name": step_name,
+                                            "step_id": step.id,
+                                            "kind": "wasm",
+                                            "path": artifact_path.to_string_lossy()
+                                        }));
+                                        println!("✅ Downloaded artifact for step: {} ({})", step.id, step_name);
+                                    }
+                                    Err(e) => {
+                                        println!("⚠️  Failed to download artifact for step {} ({}): {}", step.id, step_name, e);
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(None) => {
                         // Not a composite action, no execution order needed
@@ -1731,17 +1803,33 @@ async fn handle_run(
                     }
                 }
             } else {
-                println!("ℹ️  No execution order found - executing as simple action");
+                // Check if this is a composition action that failed to get execution order
+                let is_composition = locks.iter().any(|lock| {
+                    let action_ref = format!("{}/{}@{}", 
+                        action.split('/').next().unwrap_or("unknown"),
+                        lock.name, 
+                        lock.version
+                    );
+                    action_ref == action && lock.kind == crate::models::ShKind::Composition
+                });
                 
-                // Execute simple WASM action
-                match execute_simple_wasm_action(&action, &inputs, &artifacts_dir).await {
-                    Ok(outputs) => {
-                        println!("✅ Simple WASM action execution completed successfully");
-                        Some(outputs)
-                    }
-                    Err(e) => {
-                        println!("❌ Simple WASM action execution failed: {}", e);
-                        None
+                if is_composition {
+                    println!("❌ Composition action requires execution order but none was found");
+                    println!("💡 This usually means the manifest file could not be fetched or parsed");
+                    None
+                } else {
+                    println!("ℹ️  No execution order found - executing as simple action");
+                    
+                    // Execute simple WASM action
+                    match execute_simple_wasm_action(&action, &inputs, &artifacts_dir).await {
+                        Ok(outputs) => {
+                            println!("✅ Simple WASM action execution completed successfully");
+                            Some(outputs)
+                        }
+                        Err(e) => {
+                            println!("❌ Simple WASM action execution failed: {}", e);
+                            None
+                        }
                     }
                 }
             };
@@ -2572,4 +2660,5 @@ async fn update_action_latest_version(api_base: &str, action_id: &str, version_i
         anyhow::bail!("Failed to update action latest version: {} - {}", status, error_text)
     }
 }
+
 

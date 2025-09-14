@@ -656,7 +656,7 @@ async fn fetch_all_action_manifests(
     
     // Recursively fetch manifests for all steps
     for step in &manifest.steps {
-        if let Ok(step_manifests) = Box::pin(fetch_all_action_manifests(client, &step.uses, visited)).await {
+        if let Ok(step_manifests) = Box::pin(fetch_all_action_manifests(client, &step.uses.name, visited)).await {
             all_manifests.extend(step_manifests);
         }
     }

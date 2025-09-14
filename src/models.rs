@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShManifest {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     pub version: String,
     pub kind: Option<ShKind>,
@@ -35,17 +36,48 @@ fn is_default_export(export: &serde_json::Value) -> bool {
     export == &serde_json::json!({})
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ShKind { 
     Wasm, 
     Docker,
     Composition
 }
 
+// Custom serializer to output lowercase
+impl serde::Serialize for ShKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = match self {
+            ShKind::Wasm => "wasm",
+            ShKind::Docker => "docker",
+            ShKind::Composition => "composition",
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+// Custom deserializer to handle both uppercase and lowercase values
+impl<'de> serde::Deserialize<'de> for ShKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "wasm" => Ok(ShKind::Wasm),
+            "docker" => Ok(ShKind::Docker),
+            "composition" => Ok(ShKind::Composition),
+            _ => Err(serde::de::Error::unknown_variant(&s, &["wasm", "docker", "composition"])),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShPort {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     #[serde(rename = "type")]
     pub ty: ShType,
@@ -62,6 +94,7 @@ fn default_required() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShLock {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     pub version: String,
     pub kind: ShKind,
@@ -78,6 +111,9 @@ pub struct ShLock {
     pub types: std::collections::HashMap<String, serde_json::Value>,
     pub distribution: ShDistribution,
     pub digest: String,
+    // Composition data for composite actions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composition: Option<ShManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +132,36 @@ pub enum ShType {
     Array,
     Number,
     Custom(String), // For custom types like "HttpHeaders", "HttpResponse", etc.
+}
+
+// Custom serializer for ShType
+impl serde::Serialize for ShType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = match self {
+            ShType::String => "string",
+            ShType::Integer => "integer",
+            ShType::Boolean => "boolean",
+            ShType::Object => "object",
+            ShType::Array => "array",
+            ShType::Number => "number",
+            ShType::Custom(custom) => custom,
+        };
+        serializer.serialize_str(s)
+    }
+}
+
+// Custom deserializer for ShType
+impl<'de> serde::Deserialize<'de> for ShType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(ShType::from_str(&s))
+    }
 }
 
 impl ShType {
@@ -124,24 +190,6 @@ impl ShType {
     }
 }
 
-impl serde::Serialize for ShType {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(&self.to_string())
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for ShType {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        Ok(ShType::from_str(&s))
-    }
-}
 
 // Composite action structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,9 +197,16 @@ pub struct ShActionStep {
     pub id: String,
     #[serde(default)]
     pub kind: Option<String>, // "docker" (default) or "wasm"
-    pub uses: String,
+    pub uses: ShActionUses,
     #[serde(default)]
     pub with: std::collections::HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShActionUses {
+    pub name: String,
+    #[serde(default)]
+    pub types: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
