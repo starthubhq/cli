@@ -406,9 +406,7 @@ StartHub's git-based architecture provides:
 - **Flows in code** - Not stored in vendor databases
 - **Version control** - Standard git workflow
 - **Collaboration** - Code review and branching
-- **Offline capability** - Work without internet
 - **Security** - Verify all changes and sources
 - **Compliance** - Meet regulatory requirements
-- **Risk management** - Test and rollback safely
 
 This makes StartHub more transparent, secure, and developer-friendly than traditional centralized registries or SaaS systems.
