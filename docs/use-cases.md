@@ -1,475 +1,678 @@
-# StartHub Use Cases
+# StartHub Use Cases: Deploy Entire Cloud Systems
 
-StartHub can orchestrate across virtually any platform or execution environment, enabling powerful workflows that combine simple API calls with complex processing tasks.
+StartHub enables you to deploy complete cloud systems with a single command, orchestrating complex infrastructure, applications, and workflows across any platform.
 
-## Universal Orchestration
+## Single Command Deployment
 
-### Cross-Platform Execution
+### The Power of One Command
 
-StartHub can orchestrate between different execution environments:
+Instead of manually configuring dozens of services, StartHub lets you deploy entire systems:
 
-- **WASM modules** - Fast, lightweight processing
-- **Docker containers** - Full system access and complex dependencies
-- **Cloud functions** - Serverless execution
-- **Edge computing** - Distributed processing
-- **On-premises** - Local infrastructure
-- **Hybrid cloud** - Mixed environments
+```bash
+starthub deploy production-system
+```
 
-### Platform Integration
+This single command can:
+- **Provision infrastructure** - VMs, databases, load balancers
+- **Deploy applications** - Microservices, APIs, frontends
+- **Configure networking** - VPCs, subnets, security groups
+- **Set up monitoring** - Logs, metrics, alerts
+- **Configure CI/CD** - Build pipelines, deployment automation
+- **Establish security** - Authentication, authorization, encryption
 
-StartHub integrates with virtually any platform:
+## Complete System Deployment Examples
 
-- **APIs** - REST, GraphQL, gRPC
-- **Databases** - SQL, NoSQL, Time-series
-- **Message queues** - Kafka, RabbitMQ, AWS SQS
-- **Cloud services** - AWS, Azure, GCP
-- **SaaS platforms** - Salesforce, HubSpot, Slack
-- **IoT devices** - Sensors, actuators, edge devices
-- **Blockchain** - Smart contracts, DeFi protocols
+### 1. E-commerce Platform
 
-## Use Case Categories
+**Single Command Deployment:**
+```bash
+starthub deploy ecommerce-platform
+```
 
-### 1. Simple API Call Sequences
-
-**Lightweight workflows** using WASM modules for fast, efficient processing.
-
-#### E-commerce Order Processing
+**What Gets Deployed:**
 ```json
 {
-  "name": "order-processing",
-  "steps": [
+  "name": "ecommerce-platform",
+  "infrastructure": [
     {
-      "id": "validate_order",
-      "uses": "starthubhq/order-validator:0.0.5"  // WASM
+      "id": "web_tier",
+      "uses": "starthubhq/aws-ec2-cluster:2.0.0",
+      "config": {
+        "instance_type": "t3.medium",
+        "count": 3,
+        "auto_scaling": true
+      }
     },
     {
-      "id": "check_inventory",
-      "uses": "starthubhq/inventory-checker:0.0.3"  // WASM
+      "id": "database_tier",
+      "uses": "starthubhq/aws-rds-cluster:1.5.0",
+      "config": {
+        "engine": "postgresql",
+        "instance_class": "db.t3.large",
+        "multi_az": true
+      }
     },
     {
-      "id": "calculate_shipping",
-      "uses": "starthubhq/shipping-calculator:0.0.2"  // WASM
+      "id": "cache_tier",
+      "uses": "starthubhq/aws-elasticache:1.0.0",
+      "config": {
+        "node_type": "cache.t3.micro",
+        "num_cache_nodes": 2
+      }
     },
     {
-      "id": "send_confirmation",
-      "uses": "starthubhq/email-sender:0.0.4"  // WASM
+      "id": "cdn_tier",
+      "uses": "starthubhq/aws-cloudfront:1.2.0",
+      "config": {
+        "origins": ["web_tier"],
+        "caching_behavior": "optimized"
+      }
+    }
+  ],
+  "applications": [
+    {
+      "id": "frontend",
+      "uses": "starthubhq/react-app:3.0.0",
+      "deploy_to": "web_tier"
+    },
+    {
+      "id": "api_gateway",
+      "uses": "starthubhq/api-gateway:2.1.0",
+      "deploy_to": "web_tier"
+    },
+    {
+      "id": "user_service",
+      "uses": "starthubhq/user-service:1.5.0",
+      "deploy_to": "web_tier"
+    },
+    {
+      "id": "product_service",
+      "uses": "starthubhq/product-service:2.0.0",
+      "deploy_to": "web_tier"
+    },
+    {
+      "id": "order_service",
+      "uses": "starthubhq/order-service:1.8.0",
+      "deploy_to": "web_tier"
+    }
+  ],
+  "monitoring": [
+    {
+      "id": "cloudwatch",
+      "uses": "starthubhq/aws-cloudwatch:1.0.0",
+      "config": {
+        "monitor": ["web_tier", "database_tier", "cache_tier"],
+        "alerts": ["cpu_high", "memory_high", "disk_full"]
+      }
+    }
+  ],
+  "security": [
+    {
+      "id": "waf",
+      "uses": "starthubhq/aws-waf:1.0.0",
+      "config": {
+        "rules": ["sql_injection", "xss", "rate_limiting"]
+      }
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Order validation** - Check order data format
-- **Inventory checking** - Verify product availability
-- **Shipping calculation** - Calculate delivery costs
-- **Email notifications** - Send order confirmations
+**Result:** Complete e-commerce platform with web tier, database, caching, CDN, monitoring, and security.
 
-#### Financial Data Processing
+### 2. Machine Learning Platform
+
+**Single Command Deployment:**
+```bash
+starthub deploy ml-platform
+```
+
+**What Gets Deployed:**
 ```json
 {
-  "name": "financial-data-pipeline",
-  "steps": [
+  "name": "ml-platform",
+  "infrastructure": [
     {
-      "id": "fetch_rates",
-      "uses": "starthubhq/currency-fetcher:0.0.6"  // WASM
+      "id": "gpu_cluster",
+      "uses": "starthubhq/aws-eks-cluster:2.0.0",
+      "config": {
+        "node_type": "p3.2xlarge",
+        "min_nodes": 2,
+        "max_nodes": 10,
+        "gpu_enabled": true
+      }
     },
     {
-      "id": "validate_data",
-      "uses": "starthubhq/data-validator:0.0.3"  // WASM
+      "id": "data_lake",
+      "uses": "starthubhq/aws-s3:1.0.0",
+      "config": {
+        "versioning": true,
+        "encryption": "AES256"
+      }
     },
     {
-      "id": "calculate_metrics",
-      "uses": "starthubhq/financial-calculator:0.0.4"  // WASM
+      "id": "feature_store",
+      "uses": "starthubhq/aws-dynamodb:1.5.0",
+      "config": {
+        "billing_mode": "PAY_PER_REQUEST"
+      }
+    }
+  ],
+  "applications": [
+    {
+      "id": "jupyter_hub",
+      "uses": "starthubhq/jupyter-hub:3.0.0",
+      "deploy_to": "gpu_cluster"
     },
     {
-      "id": "store_results",
-      "uses": "starthubhq/database-writer:0.0.2"  // WASM
+      "id": "mlflow_server",
+      "uses": "starthubhq/mlflow:2.1.0",
+      "deploy_to": "gpu_cluster"
+    },
+    {
+      "id": "model_serving",
+      "uses": "starthubhq/tensorflow-serving:1.8.0",
+      "deploy_to": "gpu_cluster"
+    },
+    {
+      "id": "data_pipeline",
+      "uses": "starthubhq/apache-airflow:2.0.0",
+      "deploy_to": "gpu_cluster"
+    }
+  ],
+  "monitoring": [
+    {
+      "id": "prometheus",
+      "uses": "starthubhq/prometheus:1.0.0",
+      "deploy_to": "gpu_cluster"
+    },
+    {
+      "id": "grafana",
+      "uses": "starthubhq/grafana:1.5.0",
+      "deploy_to": "gpu_cluster"
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Currency conversion** - Fetch exchange rates
-- **Data validation** - Verify financial data
-- **Metric calculation** - Compute financial metrics
-- **Database storage** - Store processed data
+**Result:** Complete ML platform with GPU cluster, data lake, feature store, Jupyter, MLflow, model serving, and monitoring.
 
-#### Content Management
+### 3. Microservices Architecture
+
+**Single Command Deployment:**
+```bash
+starthub deploy microservices-system
+```
+
+**What Gets Deployed:**
 ```json
 {
-  "name": "content-pipeline",
-  "steps": [
+  "name": "microservices-system",
+  "infrastructure": [
     {
-      "id": "fetch_content",
-      "uses": "starthubhq/content-fetcher:0.0.3"  // WASM
+      "id": "kubernetes_cluster",
+      "uses": "starthubhq/aws-eks:2.0.0",
+      "config": {
+        "node_type": "t3.medium",
+        "min_nodes": 3,
+        "max_nodes": 20
+      }
     },
     {
-      "id": "process_markdown",
-      "uses": "starthubhq/markdown-processor:0.0.2"  // WASM
+      "id": "service_mesh",
+      "uses": "starthubhq/istio:1.0.0",
+      "deploy_to": "kubernetes_cluster"
     },
     {
-      "id": "generate_metadata",
-      "uses": "starthubhq/metadata-generator:0.0.1"  // WASM
+      "id": "api_gateway",
+      "uses": "starthubhq/kong:2.0.0",
+      "deploy_to": "kubernetes_cluster"
+    }
+  ],
+  "applications": [
+    {
+      "id": "user_service",
+      "uses": "starthubhq/user-service:1.0.0",
+      "deploy_to": "kubernetes_cluster"
     },
     {
-      "id": "publish_content",
-      "uses": "starthubhq/cms-publisher:0.0.4"  // WASM
+      "id": "product_service",
+      "uses": "starthubhq/product-service:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "order_service",
+      "uses": "starthubhq/order-service:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "payment_service",
+      "uses": "starthubhq/payment-service:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "notification_service",
+      "uses": "starthubhq/notification-service:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    }
+  ],
+  "databases": [
+    {
+      "id": "user_db",
+      "uses": "starthubhq/postgresql:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "product_db",
+      "uses": "starthubhq/mongodb:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "order_db",
+      "uses": "starthubhq/postgresql:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    }
+  ],
+  "monitoring": [
+    {
+      "id": "prometheus",
+      "uses": "starthubhq/prometheus:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "grafana",
+      "uses": "starthubhq/grafana:1.0.0",
+      "deploy_to": "kubernetes_cluster"
+    },
+    {
+      "id": "jaeger",
+      "uses": "starthubhq/jaeger:1.0.0",
+      "deploy_to": "kubernetes_cluster"
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Content fetching** - Retrieve content from APIs
-- **Markdown processing** - Convert markdown to HTML
-- **Metadata generation** - Extract and generate metadata
-- **CMS publishing** - Publish to content management systems
+**Result:** Complete microservices system with Kubernetes, service mesh, API gateway, multiple services, databases, and monitoring.
 
-### 2. Complex Docker-Based Action Chains
+## Infrastructure as Code
 
-**Heavy-duty workflows** using Docker modules for complex processing and system integration.
+### Complete Infrastructure Definition
 
-#### Machine Learning Pipeline
+StartHub treats entire systems as code:
+
 ```json
 {
-  "name": "ml-pipeline",
-  "steps": [
+  "name": "production-system",
+  "version": "1.0.0",
+  "infrastructure": {
+    "compute": [
+      {
+        "id": "web_servers",
+        "uses": "starthubhq/aws-ec2:2.0.0",
+        "config": {
+          "instance_type": "t3.large",
+          "count": 5,
+          "auto_scaling": {
+            "min": 3,
+            "max": 10,
+            "target_cpu": 70
+          }
+        }
+      },
+      {
+        "id": "app_servers",
+        "uses": "starthubhq/aws-ec2:2.0.0",
+        "config": {
+          "instance_type": "t3.xlarge",
+          "count": 3,
+          "auto_scaling": {
+            "min": 2,
+            "max": 8,
+            "target_cpu": 80
+          }
+        }
+      }
+    ],
+    "storage": [
+      {
+        "id": "primary_db",
+        "uses": "starthubhq/aws-rds:1.5.0",
+        "config": {
+          "engine": "postgresql",
+          "instance_class": "db.r5.large",
+          "multi_az": true,
+          "backup_retention": 7
+        }
+      },
+      {
+        "id": "cache_cluster",
+        "uses": "starthubhq/aws-elasticache:1.0.0",
+        "config": {
+          "node_type": "cache.r5.large",
+          "num_cache_nodes": 3
+        }
+      },
+      {
+        "id": "file_storage",
+        "uses": "starthubhq/aws-s3:1.0.0",
+        "config": {
+          "versioning": true,
+          "encryption": "AES256",
+          "lifecycle_rules": true
+        }
+      }
+    ],
+    "networking": [
+      {
+        "id": "vpc",
+        "uses": "starthubhq/aws-vpc:1.0.0",
+        "config": {
+          "cidr": "10.0.0.0/16",
+          "availability_zones": ["us-west-2a", "us-west-2b", "us-west-2c"]
+        }
+      },
+      {
+        "id": "load_balancer",
+        "uses": "starthubhq/aws-alb:1.0.0",
+        "config": {
+          "scheme": "internet-facing",
+          "type": "application"
+        }
+      }
+    ],
+    "security": [
+      {
+        "id": "security_groups",
+        "uses": "starthubhq/aws-security-groups:1.0.0",
+        "config": {
+          "web_sg": {
+            "ingress": [
+              {"port": 80, "protocol": "tcp", "source": "0.0.0.0/0"},
+              {"port": 443, "protocol": "tcp", "source": "0.0.0.0/0"}
+            ]
+          },
+          "app_sg": {
+            "ingress": [
+              {"port": 8080, "protocol": "tcp", "source": "web_sg"}
+            ]
+          }
+        }
+      }
+    ]
+  }
+}
+```
+
+## Application Deployment
+
+### Complete Application Stack
+
+Deploy entire application stacks with dependencies:
+
+```json
+{
+  "name": "full-stack-app",
+  "applications": [
     {
-      "id": "data_collection",
-      "uses": "starthubhq/data-collector:1.2.0"  // Docker
+      "id": "frontend",
+      "uses": "starthubhq/react-app:3.0.0",
+      "deploy_to": "web_servers",
+      "config": {
+        "build_command": "npm run build",
+        "serve_command": "npm run serve"
+      }
     },
     {
-      "id": "data_preprocessing",
-      "uses": "starthubhq/data-preprocessor:2.1.0"  // Docker
+      "id": "backend_api",
+      "uses": "starthubhq/node-api:2.0.0",
+      "deploy_to": "app_servers",
+      "config": {
+        "port": 8080,
+        "database_url": "primary_db",
+        "cache_url": "cache_cluster"
+      }
     },
     {
-      "id": "model_training",
-      "uses": "starthubhq/ml-trainer:3.0.0"  // Docker
-    },
+      "id": "worker_processes",
+      "uses": "starthubhq/python-workers:1.5.0",
+      "deploy_to": "app_servers",
+      "config": {
+        "queue_url": "sqs_queue",
+        "worker_count": 5
+      }
+    }
+  ],
+  "databases": [
     {
-      "id": "model_evaluation",
-      "uses": "starthubhq/model-evaluator:1.5.0"  // Docker
-    },
+      "id": "user_database",
+      "uses": "starthubhq/postgresql:1.0.0",
+      "deploy_to": "primary_db",
+      "config": {
+        "database_name": "users",
+        "migrations": true
+      }
+    }
+  ],
+  "queues": [
     {
-      "id": "model_deployment",
-      "uses": "starthubhq/model-deployer:2.0.0"  // Docker
+      "id": "task_queue",
+      "uses": "starthubhq/aws-sqs:1.0.0",
+      "config": {
+        "visibility_timeout": 300,
+        "message_retention": 1209600
+      }
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Data collection** - Gather data from multiple sources
-- **Data preprocessing** - Clean and transform data
-- **Model training** - Train machine learning models
-- **Model evaluation** - Assess model performance
-- **Model deployment** - Deploy models to production
+## Monitoring and Observability
 
-#### DevOps Automation
+### Complete Monitoring Stack
+
+Deploy comprehensive monitoring with one command:
+
 ```json
 {
-  "name": "devops-pipeline",
-  "steps": [
+  "name": "monitoring-stack",
+  "monitoring": [
     {
-      "id": "code_analysis",
-      "uses": "starthubhq/code-analyzer:1.0.0"  // Docker
+      "id": "metrics_collection",
+      "uses": "starthubhq/prometheus:1.0.0",
+      "config": {
+        "retention": "30d",
+        "scrape_interval": "15s"
+      }
     },
     {
-      "id": "security_scan",
-      "uses": "starthubhq/security-scanner:2.1.0"  // Docker
+      "id": "visualization",
+      "uses": "starthubhq/grafana:1.0.0",
+      "config": {
+        "dashboards": ["system", "application", "business"],
+        "alerting": true
+      }
     },
     {
-      "id": "build_artifacts",
-      "uses": "starthubhq/artifact-builder:1.5.0"  // Docker
+      "id": "logging",
+      "uses": "starthubhq/elasticsearch:1.0.0",
+      "config": {
+        "cluster_size": 3,
+        "storage_size": "100GB"
+      }
     },
     {
-      "id": "deploy_infrastructure",
-      "uses": "starthubhq/infrastructure-deployer:3.0.0"  // Docker
+      "id": "log_analysis",
+      "uses": "starthubhq/kibana:1.0.0",
+      "config": {
+        "elasticsearch_url": "logging"
+      }
     },
     {
-      "id": "run_tests",
-      "uses": "starthubhq/test-runner:2.2.0"  // Docker
+      "id": "tracing",
+      "uses": "starthubhq/jaeger:1.0.0",
+      "config": {
+        "storage": "elasticsearch",
+        "sampling_rate": 0.1
+      }
+    }
+  ],
+  "alerts": [
+    {
+      "id": "high_cpu",
+      "uses": "starthubhq/alert-manager:1.0.0",
+      "config": {
+        "condition": "cpu_usage > 80%",
+        "duration": "5m",
+        "notification": "slack"
+      }
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Code analysis** - Static code analysis
-- **Security scanning** - Vulnerability assessment
-- **Artifact building** - Build applications and containers
-- **Infrastructure deployment** - Deploy cloud resources
-- **Test execution** - Run comprehensive test suites
+## Security and Compliance
 
-#### Data Engineering Pipeline
+### Complete Security Stack
+
+Deploy comprehensive security with one command:
+
 ```json
 {
-  "name": "data-engineering-pipeline",
-  "steps": [
+  "name": "security-stack",
+  "security": [
     {
-      "id": "extract_data",
-      "uses": "starthubhq/data-extractor:2.0.0"  // Docker
+      "id": "waf",
+      "uses": "starthubhq/aws-waf:1.0.0",
+      "config": {
+        "rules": ["sql_injection", "xss", "rate_limiting"],
+        "blocked_ips": ["malicious_ips"]
+      }
     },
     {
-      "id": "transform_data",
-      "uses": "starthubhq/data-transformer:3.1.0"  // Docker
+      "id": "ssl_certificates",
+      "uses": "starthubhq/aws-acm:1.0.0",
+      "config": {
+        "domain": "example.com",
+        "auto_renewal": true
+      }
     },
     {
-      "id": "load_data",
-      "uses": "starthubhq/data-loader:1.8.0"  // Docker
+      "id": "secrets_management",
+      "uses": "starthubhq/aws-secrets-manager:1.0.0",
+      "config": {
+        "rotation": true,
+        "encryption": "KMS"
+      }
     },
     {
-      "id": "generate_reports",
-      "uses": "starthubhq/report-generator:2.3.0"  // Docker
+      "id": "vulnerability_scanning",
+      "uses": "starthubhq/aws-inspector:1.0.0",
+      "config": {
+        "schedule": "daily",
+        "targets": ["web_servers", "app_servers"]
+      }
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Data extraction** - Extract data from various sources
-- **Data transformation** - Transform and clean data
-- **Data loading** - Load data into data warehouses
-- **Report generation** - Generate business reports
+## CI/CD Pipeline
 
-### 3. Hybrid Workflows
+### Complete DevOps Stack
 
-**Combining WASM and Docker modules** for optimal performance and capability.
+Deploy entire CI/CD pipeline with one command:
 
-#### E-commerce Analytics
 ```json
 {
-  "name": "ecommerce-analytics",
-  "steps": [
+  "name": "cicd-pipeline",
+  "pipeline": [
     {
-      "id": "fetch_orders",
-      "uses": "starthubhq/order-fetcher:0.0.3"  // WASM - Simple API call
+      "id": "source_control",
+      "uses": "starthubhq/gitlab:1.0.0",
+      "config": {
+        "repositories": ["frontend", "backend", "infrastructure"],
+        "branch_protection": true
+      }
     },
     {
-      "id": "process_orders",
-      "uses": "starthubhq/order-processor:1.2.0"  // Docker - Complex processing
+      "id": "build_system",
+      "uses": "starthubhq/jenkins:2.0.0",
+      "config": {
+        "pipeline": "multibranch",
+        "triggers": ["webhook", "schedule"]
+      }
     },
     {
-      "id": "calculate_metrics",
-      "uses": "starthubhq/metrics-calculator:0.0.4"  // WASM - Fast calculations
+      "id": "artifact_registry",
+      "uses": "starthubhq/aws-ecr:1.0.0",
+      "config": {
+        "repositories": ["frontend", "backend"],
+        "scanning": true
+      }
     },
     {
-      "id": "generate_insights",
-      "uses": "starthubhq/insights-generator:2.0.0"  // Docker - ML processing
-    },
-    {
-      "id": "send_dashboard",
-      "uses": "starthubhq/dashboard-sender:0.0.2"  // WASM - Simple notification
+      "id": "deployment",
+      "uses": "starthubhq/aws-codedeploy:1.0.0",
+      "config": {
+        "strategy": "blue_green",
+        "rollback": true
+      }
     }
   ]
 }
 ```
 
-**Use Cases:**
-- **Order fetching** - Simple API calls to e-commerce platforms
-- **Order processing** - Complex data processing and analysis
-- **Metrics calculation** - Fast mathematical computations
-- **Insights generation** - Machine learning and AI processing
-- **Dashboard updates** - Simple notifications and updates
+## Benefits of Single Command Deployment
 
-#### IoT Data Processing
-```json
-{
-  "name": "iot-data-pipeline",
-  "steps": [
-    {
-      "id": "collect_sensor_data",
-      "uses": "starthubhq/sensor-collector:0.0.5"  // WASM - Lightweight collection
-    },
-    {
-      "id": "validate_data",
-      "uses": "starthubhq/data-validator:0.0.3"  // WASM - Fast validation
-    },
-    {
-      "id": "process_signals",
-      "uses": "starthubhq/signal-processor:1.5.0"  // Docker - Complex signal processing
-    },
-    {
-      "id": "detect_anomalies",
-      "uses": "starthubhq/anomaly-detector:2.1.0"  // Docker - ML-based detection
-    },
-    {
-      "id": "send_alerts",
-      "uses": "starthubhq/alert-sender:0.0.2"  // WASM - Simple notifications
-    }
-  ]
-}
+### 1. Speed
+- **Deploy in minutes** - Not hours or days
+- **Consistent deployments** - Same result every time
+- **Parallel execution** - Deploy multiple components simultaneously
+
+### 2. Reliability
+- **Infrastructure as code** - Version controlled and auditable
+- **Rollback capability** - Easy to revert changes
+- **Testing** - Deploy to staging before production
+
+### 3. Cost Efficiency
+- **Right-sizing** - Deploy only what you need
+- **Auto-scaling** - Scale based on demand
+- **Resource optimization** - Efficient resource utilization
+
+### 4. Security
+- **Security by design** - Security built into the deployment
+- **Compliance** - Meet regulatory requirements
+- **Audit trail** - Complete deployment history
+
+## Real-World Examples
+
+### Startup MVP
+```bash
+starthub deploy startup-mvp
 ```
+Deploys: Frontend, API, Database, CDN, Monitoring, CI/CD
 
-**Use Cases:**
-- **Sensor data collection** - Lightweight data gathering
-- **Data validation** - Fast validation of sensor data
-- **Signal processing** - Complex signal analysis
-- **Anomaly detection** - Machine learning-based detection
-- **Alert sending** - Simple notification delivery
-
-## Platform-Specific Use Cases
-
-### Cloud Platforms
-
-#### AWS Integration
-```json
-{
-  "name": "aws-workflow",
-  "steps": [
-    {
-      "id": "s3_upload",
-      "uses": "starthubhq/s3-uploader:0.0.3"  // WASM
-    },
-    {
-      "id": "lambda_trigger",
-      "uses": "starthubhq/lambda-trigger:0.0.2"  // WASM
-    },
-    {
-      "id": "ec2_processing",
-      "uses": "starthubhq/ec2-processor:1.0.0"  // Docker
-    }
-  ]
-}
+### Enterprise Platform
+```bash
+starthub deploy enterprise-platform
 ```
+Deploys: Microservices, Kubernetes, Service Mesh, Databases, Monitoring, Security, CI/CD
 
-#### Azure Integration
-```json
-{
-  "name": "azure-workflow",
-  "steps": [
-    {
-      "id": "blob_storage",
-      "uses": "starthubhq/blob-storage:0.0.4"  // WASM
-    },
-    {
-      "id": "function_app",
-      "uses": "starthubhq/function-app:0.0.3"  // WASM
-    },
-    {
-      "id": "vm_processing",
-      "uses": "starthubhq/vm-processor:1.2.0"  // Docker
-    }
-  ]
-}
+### Data Science Platform
+```bash
+starthub deploy data-science-platform
 ```
-
-### Database Systems
-
-#### SQL Database Workflow
-```json
-{
-  "name": "sql-workflow",
-  "steps": [
-    {
-      "id": "query_database",
-      "uses": "starthubhq/sql-query:0.0.3"  // WASM
-    },
-    {
-      "id": "process_results",
-      "uses": "starthubhq/data-processor:1.0.0"  // Docker
-    },
-    {
-      "id": "update_database",
-      "uses": "starthubhq/sql-updater:0.0.2"  // WASM
-    }
-  ]
-}
-```
-
-#### NoSQL Database Workflow
-```json
-{
-  "name": "nosql-workflow",
-  "steps": [
-    {
-      "id": "mongo_query",
-      "uses": "starthubhq/mongo-query:0.0.4"  // WASM
-    },
-    {
-      "id": "document_processing",
-      "uses": "starthubhq/document-processor:2.0.0"  // Docker
-    },
-    {
-      "id": "elasticsearch_index",
-      "uses": "starthubhq/elasticsearch-indexer:1.5.0"  // Docker
-    }
-  ]
-}
-```
-
-### SaaS Platform Integration
-
-#### Salesforce Integration
-```json
-{
-  "name": "salesforce-workflow",
-  "steps": [
-    {
-      "id": "fetch_leads",
-      "uses": "starthubhq/salesforce-fetcher:0.0.3"  // WASM
-    },
-    {
-      "id": "process_leads",
-      "uses": "starthubhq/lead-processor:1.0.0"  // Docker
-    },
-    {
-      "id": "update_salesforce",
-      "uses": "starthubhq/salesforce-updater:0.0.2"  // WASM
-    }
-  ]
-}
-```
-
-#### Slack Integration
-```json
-{
-  "name": "slack-workflow",
-  "steps": [
-    {
-      "id": "monitor_messages",
-      "uses": "starthubhq/slack-monitor:0.0.4"  // WASM
-    },
-    {
-      "id": "analyze_sentiment",
-      "uses": "starthubhq/sentiment-analyzer:2.1.0"  // Docker
-    },
-    {
-      "id": "send_notifications",
-      "uses": "starthubhq/slack-notifier:0.0.3"  // WASM
-    }
-  ]
-}
-```
-
-## Performance Considerations
-
-### WASM Modules
-- **Startup time**: < 1ms
-- **Memory usage**: 1-10MB
-- **Use for**: Simple API calls, data validation, calculations
-- **Best for**: High-frequency, lightweight operations
-
-### Docker Modules
-- **Startup time**: 100-1000ms
-- **Memory usage**: 50-500MB
-- **Use for**: Complex processing, ML, system integration
-- **Best for**: Heavy-duty, resource-intensive operations
-
-### Hybrid Approach
-- **Use WASM for**: Simple operations, API calls, validations
-- **Use Docker for**: Complex processing, ML, system integration
-- **Optimize for**: Performance, cost, and capability
+Deploys: Jupyter, MLflow, GPU cluster, Data lake, Feature store, Monitoring
 
 ## Summary
 
-StartHub enables powerful orchestration across any platform or execution environment:
+StartHub enables you to deploy entire cloud systems with a single command:
 
-- **Simple API sequences** - Fast, efficient WASM-based workflows
-- **Complex processing chains** - Heavy-duty Docker-based workflows
-- **Hybrid approaches** - Optimal combination of both
-- **Universal integration** - Works with any platform or service
-- **Flexible deployment** - Cloud, edge, on-premises, or hybrid
+- **Complete infrastructure** - Compute, storage, networking, security
+- **Full application stacks** - Frontend, backend, databases, queues
+- **Comprehensive monitoring** - Metrics, logs, traces, alerts
+- **Security and compliance** - WAF, SSL, secrets, scanning
+- **CI/CD pipelines** - Source control, build, test, deploy
 
-This makes StartHub suitable for everything from simple automation to complex enterprise workflows, providing the flexibility to choose the right tool for each task.
+This makes StartHub the most powerful tool for deploying complex cloud systems, reducing deployment time from days to minutes while ensuring consistency, reliability, and security.
