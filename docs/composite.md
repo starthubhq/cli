@@ -119,7 +119,7 @@ Here's a complete example of a composite action specification that demonstrates 
 
 ```json
 {
-  "name": "composition",
+  "name": "an-example-composition",
   "description": "Saved from editor",
   "version": "0.0.2",
   "kind": "composition",
@@ -134,7 +134,7 @@ Here's a complete example of a composite action specification that demonstrates 
     },
     {
       "name": "PORT_1",
-      "type": "httpheaders",
+      "type": "starthubhq/http-get-wasm:0.0.16/HttpHeaders",
       "required": false
     },
     {
@@ -163,7 +163,7 @@ Here's a complete example of a composite action specification that demonstrates 
     {
       "id": "http_get_wasm",
       "uses": {
-        "name": "http-get-wasm:0.0.16",
+        "name": "starthubhq/http-get-wasm:0.0.16",
         "types": {
           "HttpHeaders": {
             "Accept": "string",
