@@ -129,7 +129,7 @@ Here's a complete example of a composite action specification that demonstrates 
   "inputs": [
     {
       "name": "some-input",
-      "type": "5bc083b2-a488-4601-9ccf-ca1b1936fc7c",
+      "type": "string",
       "required": false
     },
     {
