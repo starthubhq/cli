@@ -113,164 +113,73 @@ Export mappings define how step outputs become composition outputs:
 }
 ```
 
-## Example Composition
+## Example WASM Module
 
-Here's a complete example that demonstrates the format:
+Here's a complete example of a WASM module specification that demonstrates the format:
 
 ```json
 {
-  "name": "composition",
-  "description": "Saved from editor",
-  "version": "0.0.2",
-  "kind": "composition",
+  "name": "http-get-wasm",
+  "description": "HTTP GET request module for fetching data from web APIs",
+  "version": "0.0.12",
+  "kind": "wasm",
   "manifest_version": 1,
-  "repository": "",
+  "repository": "github.com/starthubhq/http-get-wasm",
   "license": "MIT",
   "inputs": [
     {
-      "name": "some-input",
-      "type": "5bc083b2-a488-4601-9ccf-ca1b1936fc7c",
-      "required": false
+      "name": "url",
+      "type": "string",
+      "required": true,
+      "description": "The URL to fetch data from"
     },
     {
-      "name": "PORT_1",
-      "type": "httpheaders",
-      "required": false
-    },
-    {
-      "name": "PORT_2",
-      "type": "type<t>",
-      "default": "User",
-      "required": false
+      "name": "headers",
+      "type": "HttpHeaders",
+      "required": false,
+      "description": "Optional HTTP headers to send with the request"
     }
   ],
   "outputs": [
     {
-      "name": "PORT_1",
-      "type": "t",
-      "required": false
+      "name": "body",
+      "type": "HttpResponse",
+      "required": true,
+      "description": "Response"
     }
   ],
   "types": {
-    "User": {
-      "id": "string",
-      "name": "string",
-      "email": "string",
-      "createdAt": "Date"
-    }
-  },
-  "steps": [
-    {
-      "id": "http_get_wasm",
-      "uses": {
-        "name": "http-get-wasm:0.0.16",
-        "types": {
-          "HttpHeaders": {
-            "Accept": "string",
-            "X-API-Key": "string",
-            "User-Agent": "string",
-            "Content-Type": "string",
-            "Authorization": "string"
-          },
-          "HttpResponse": {
-            "body": "string",
-            "status": "number"
-          }
-        }
-      },
-      "with": {}
+    "HttpHeaders": {
+      "Content-Type": "string",
+      "Authorization": "string",
+      "User-Agent": "string",
+      "Accept": "string",
+      "X-API-Key": "string"
     },
-    {
-      "id": "stringify_wasm",
-      "uses": {
-        "name": "stringify-wasm:0.0.5",
-        "types": {}
-      },
-      "with": {}
-    },
-    {
-      "id": "parse_wasm",
-      "uses": {
-        "name": "parse-wasm:0.0.10",
-        "types": {}
-      },
-      "with": {}
-    }
-  ],
-  "wires": [
-    {
-      "from": {
-        "source": "inputs",
-        "key": "some-input"
-      },
-      "to": {
-        "step": "http_get_wasm",
-        "input": "url"
-      }
-    },
-    {
-      "from": {
-        "source": "inputs",
-        "key": "PORT_1"
-      },
-      "to": {
-        "step": "http_get_wasm",
-        "input": "headers"
-      }
-    },
-    {
-      "from": {
-        "step": "http_get_wasm",
-        "output": "body"
-      },
-      "to": {
-        "step": "stringify_wasm",
-        "input": "object"
-      }
-    },
-    {
-      "from": {
-        "source": "inputs",
-        "key": "PORT_2"
-      },
-      "to": {
-        "step": "parse_wasm",
-        "input": "type"
-      }
-    },
-    {
-      "from": {
-        "step": "stringify_wasm",
-        "output": "string"
-      },
-      "to": {
-        "step": "parse_wasm",
-        "input": "string"
-      }
-    }
-  ],
-  "export": {
-    "PORT_1": {
-      "from": {
-        "step": "parse_wasm",
-        "output": "response"
-      }
+    "HttpResponse": {
+      "status": "number",
+      "body": "string"
     }
   }
 }
 ```
 
-## Data Flow in the Example
+## Module Functionality
 
-This example composition:
+This example WASM module:
 
-1. **Takes inputs**: `some-input` (URL), `PORT_1` (HTTP headers), and `PORT_2` (type specification)
-2. **Makes HTTP request**: Uses `http-get-wasm` to fetch data from the URL with headers
-3. **Stringifies response**: Converts the HTTP response body to a string using `stringify-wasm`
-4. **Parses data**: Uses `parse-wasm` to parse the stringified data according to the specified type
-5. **Exports result**: Returns the parsed response as `PORT_1`
+1. **Takes inputs**: 
+   - `url` (required string): The URL to fetch data from
+   - `headers` (optional HttpHeaders): HTTP headers to send with the request
 
-The composition demonstrates a common pattern: HTTP request → stringify → parse → export, which is useful for API data processing workflows.
+2. **Produces output**: 
+   - `body` (HttpResponse): The HTTP response containing status code and response body
+
+3. **Defines types**:
+   - `HttpHeaders`: Common HTTP header fields like Content-Type, Authorization, etc.
+   - `HttpResponse`: Response structure with status code and body
+
+The module demonstrates a typical HTTP client pattern that can be used in compositions for fetching data from web APIs.
 
 ## Type System
 
