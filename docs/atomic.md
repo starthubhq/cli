@@ -1,6 +1,6 @@
 # Action Format Specification
 
-This document describes the JSON format used for defining actions in the StartHub platform. An action is a reusable module that performs a specific task, typically implemented as a WASM module.
+This document describes the JSON format used for defining actions in the StartHub platform. An action is a reusable module that performs a specific task, typically implemented as a WASM/Docker module.
 
 ## Overview
 
