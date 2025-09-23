@@ -71,7 +71,6 @@ The system checks:
 - Step module references are valid
 - Input/output type compatibility
 - Type definitions match module specifications
-- Generic type constraints are satisfied
 
 ### Wire Type Validation
 
@@ -96,7 +95,6 @@ The system validates:
 - Source and target types are compatible
 - Wire connections reference valid inputs/outputs
 - Type coercion rules are followed
-- Generic type parameters are properly resolved
 
 ## Runtime Type Checking
 
@@ -170,27 +168,6 @@ function coerceType(value: any, fromType: string, toType: string): any {
 
 The type system is built on TypeScript principles:
 
-### Generic Types
-
-```json
-{
-  "inputs": [
-    {
-      "name": "data",
-      "type": "type<T>",
-      "default": "User"
-    }
-  ],
-  "types": {
-    "User": {
-      "id": "string",
-      "name": "string"
-    }
-  }
-}
-```
-
-Generic types are resolved at runtime based on the default value or explicit type parameters.
 
 ### Union Types
 
@@ -248,7 +225,7 @@ Error: Property "body" should be string, got number
 
 ## Best Practices
 
-1. **Use specific types**: Prefer concrete types over generic ones when possible
+1. **Use specific types**: Prefer concrete types when possible
 2. **Validate early**: Catch type errors at save time rather than runtime
 3. **Document types**: Provide clear descriptions for custom types
 4. **Test edge cases**: Verify type coercion behavior with various inputs
@@ -259,7 +236,6 @@ Error: Property "body" should be string, got number
 - **Static analysis**: Catch errors before execution
 - **Runtime validation**: Ensure data integrity during execution
 - **Type coercion**: Automatic conversion between compatible types
-- **Generic support**: Flexible type parameters
 - **Union types**: Multiple possible types for a single value
 - **Optional properties**: Flexible object structures
 - **Custom types**: User-defined type definitions

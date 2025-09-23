@@ -139,7 +139,7 @@ Here's a complete example of a composite action specification that demonstrates 
     },
     {
       "name": "PORT_2",
-      "type": "type<t>",
+      "type": "User",
       "default": "User",
       "required": false
     }
@@ -147,7 +147,7 @@ Here's a complete example of a composite action specification that demonstrates 
   "outputs": [
     {
       "name": "PORT_1",
-      "type": "t",
+      "type": "User",
       "required": false
     }
   ],
@@ -277,7 +277,6 @@ The composite action demonstrates a common pattern: HTTP request â†’ stringify â
 The format supports:
 - **Built-in types**: `string`, `number`, `boolean`, `Date`, etc.
 - **Custom types**: Defined in the `types` section
-- **Generic types**: Using angle bracket notation like `type<t>`
 - **Step-specific types**: Defined in each step's `uses.types`
 
 ## Validation Rules

@@ -121,7 +121,6 @@ The action demonstrates a typical HTTP client pattern that can be used in workfl
 The format supports:
 - **Built-in types**: `string`, `number`, `boolean`, `Date`, etc.
 - **Custom types**: Defined in the `types` section
-- **Generic types**: Using angle bracket notation like `type<t>`
 
 ## Validation Rules
 
