@@ -1,0 +1,289 @@
+# Composition Format Specification
+
+This document describes the JSON format used for defining compositions in the StartHub platform. A composition is a workflow that orchestrates multiple steps to process data through a series of transformations.
+
+## Overview
+
+A composition is a declarative specification that defines:
+- Input and output interfaces
+- Processing steps (using WASM modules)
+- Data flow between steps
+- Type definitions
+- Export mappings
+
+## Format Structure
+
+### Top-Level Properties
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `name` | string | Yes | Human-readable name of the composition |
+| `description` | string | Yes | Description of what the composition does |
+| `version` | string | Yes | Semantic version of the composition |
+| `kind` | string | Yes | Always "composition" for compositions |
+| `manifest_version` | number | Yes | Version of the format specification (currently 1) |
+| `repository` | string | No | URL to the source repository |
+| `license` | string | No | License identifier (e.g., "MIT") |
+| `inputs` | array | Yes | Array of input definitions |
+| `outputs` | array | Yes | Array of output definitions |
+| `types` | object | No | Custom type definitions |
+| `steps` | array | Yes | Array of processing steps |
+| `wires` | array | Yes | Array of data flow connections |
+| `export` | object | No | Output export mappings |
+
+### Input/Output Definitions
+
+Each input and output has the following structure:
+
+```json
+{
+  "name": "input-name",
+  "type": "type-identifier",
+  "required": false,
+  "default": "default-value"
+}
+```
+
+- `name`: Unique identifier for the input/output
+- `type`: Type identifier (can be a custom type or built-in type)
+- `required`: Whether this input/output is mandatory
+- `default`: Default value (optional, for inputs only)
+
+### Steps
+
+Each step represents a processing unit (a WASM/Docker module):
+
+```json
+{
+  "id": "step-identifier",
+  "uses": {
+    "name": "module-name:version",
+    "types": {
+      "CustomType": {
+        "field1": "string",
+        "field2": "number"
+      }
+    }
+  },
+  "with": {
+    "parameter": "value"
+  }
+}
+```
+
+- `id`: Unique identifier for the step
+- `uses.name`: Module name and version to use
+- `uses.types`: Type definitions specific to this step
+- `with`: Configuration parameters for the step
+
+### Wires (Data Flow)
+
+Wires define how data flows between inputs, steps, and outputs:
+
+```json
+{
+  "from": {
+    "source": "inputs|step-id",
+    "key": "input-name|output-name"
+  },
+  "to": {
+    "step": "step-id",
+    "input": "input-name"
+  }
+}
+```
+
+- `from.source`: Either "inputs" for composition inputs or a step ID
+- `from.key`: The specific input/output name
+- `to.step`: Target step ID
+- `to.input`: Target input name
+
+### Export Mappings
+
+Export mappings define how step outputs become composition outputs:
+
+```json
+{
+  "output-name": {
+    "from": {
+      "step": "step-id",
+      "output": "output-name"
+    }
+  }
+}
+```
+
+## Example Composition
+
+Here's a complete example that demonstrates the format:
+
+```json
+{
+  "name": "composition",
+  "description": "Saved from editor",
+  "version": "0.0.2",
+  "kind": "composition",
+  "manifest_version": 1,
+  "repository": "",
+  "license": "MIT",
+  "inputs": [
+    {
+      "name": "some-input",
+      "type": "5bc083b2-a488-4601-9ccf-ca1b1936fc7c",
+      "required": false
+    },
+    {
+      "name": "PORT_1",
+      "type": "httpheaders",
+      "required": false
+    },
+    {
+      "name": "PORT_2",
+      "type": "type<t>",
+      "default": "User",
+      "required": false
+    }
+  ],
+  "outputs": [
+    {
+      "name": "PORT_1",
+      "type": "t",
+      "required": false
+    }
+  ],
+  "types": {
+    "User": {
+      "id": "string",
+      "name": "string",
+      "email": "string",
+      "createdAt": "Date"
+    }
+  },
+  "steps": [
+    {
+      "id": "http_get_wasm",
+      "uses": {
+        "name": "http-get-wasm:0.0.16",
+        "types": {
+          "HttpHeaders": {
+            "Accept": "string",
+            "X-API-Key": "string",
+            "User-Agent": "string",
+            "Content-Type": "string",
+            "Authorization": "string"
+          },
+          "HttpResponse": {
+            "body": "string",
+            "status": "number"
+          }
+        }
+      },
+      "with": {}
+    },
+    {
+      "id": "stringify_wasm",
+      "uses": {
+        "name": "stringify-wasm:0.0.5",
+        "types": {}
+      },
+      "with": {}
+    },
+    {
+      "id": "parse_wasm",
+      "uses": {
+        "name": "parse-wasm:0.0.10",
+        "types": {}
+      },
+      "with": {}
+    }
+  ],
+  "wires": [
+    {
+      "from": {
+        "source": "inputs",
+        "key": "some-input"
+      },
+      "to": {
+        "step": "http_get_wasm",
+        "input": "url"
+      }
+    },
+    {
+      "from": {
+        "source": "inputs",
+        "key": "PORT_1"
+      },
+      "to": {
+        "step": "http_get_wasm",
+        "input": "headers"
+      }
+    },
+    {
+      "from": {
+        "step": "http_get_wasm",
+        "output": "body"
+      },
+      "to": {
+        "step": "stringify_wasm",
+        "input": "object"
+      }
+    },
+    {
+      "from": {
+        "source": "inputs",
+        "key": "PORT_2"
+      },
+      "to": {
+        "step": "parse_wasm",
+        "input": "type"
+      }
+    },
+    {
+      "from": {
+        "step": "stringify_wasm",
+        "output": "string"
+      },
+      "to": {
+        "step": "parse_wasm",
+        "input": "string"
+      }
+    }
+  ],
+  "export": {
+    "PORT_1": {
+      "from": {
+        "step": "parse_wasm",
+        "output": "response"
+      }
+    }
+  }
+}
+```
+
+## Data Flow in the Example
+
+This example composition:
+
+1. **Takes inputs**: `some-input` (URL), `PORT_1` (HTTP headers), and `PORT_2` (type specification)
+2. **Makes HTTP request**: Uses `http-get-wasm` to fetch data from the URL with headers
+3. **Stringifies response**: Converts the HTTP response body to a string using `stringify-wasm`
+4. **Parses data**: Uses `parse-wasm` to parse the stringified data according to the specified type
+5. **Exports result**: Returns the parsed response as `PORT_1`
+
+The composition demonstrates a common pattern: HTTP request → stringify → parse → export, which is useful for API data processing workflows.
+
+## Type System
+
+The format supports:
+- **Built-in types**: `string`, `number`, `boolean`, `Date`, etc.
+- **Custom types**: Defined in the `types` section
+- **Generic types**: Using angle bracket notation like `type<t>`
+- **Step-specific types**: Defined in each step's `uses.types`
+
+## Validation Rules
+
+- All step IDs must be unique
+- All wire connections must reference valid sources and targets
+- Input/output names must be unique within their scope
+- Export mappings must reference valid step outputs
+- Type references must be resolvable
