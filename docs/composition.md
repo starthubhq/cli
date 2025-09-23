@@ -1,15 +1,14 @@
-# Composition Format Specification
+# Action Format Specification
 
-This document describes the JSON format used for defining compositions in the StartHub platform. A composition is a workflow that orchestrates multiple steps to process data through a series of transformations.
+This document describes the JSON format used for defining actions in the StartHub platform. An action is a reusable module that performs a specific task, typically implemented as a WASM module.
 
 ## Overview
 
-A composition is a declarative specification that defines:
+An action is a declarative specification that defines:
 - Input and output interfaces
-- Processing steps (using WASM modules)
-- Data flow between steps
 - Type definitions
-- Export mappings
+- Module metadata
+- Repository and licensing information
 
 ## Format Structure
 
@@ -17,10 +16,10 @@ A composition is a declarative specification that defines:
 
 | Property | Type | Required | Description |
 |----------|------|----------|-------------|
-| `name` | string | Yes | Human-readable name of the composition |
-| `description` | string | Yes | Description of what the composition does |
-| `version` | string | Yes | Semantic version of the composition |
-| `kind` | string | Yes | Always "composition" for compositions |
+| `name` | string | Yes | Human-readable name of the action |
+| `description` | string | Yes | Description of what the action does |
+| `version` | string | Yes | Semantic version of the action |
+| `kind` | string | Yes | Type of action (e.g., "wasm", "docker") |
 | `manifest_version` | number | Yes | Version of the format specification (currently 1) |
 | `repository` | string | No | URL to the source repository |
 | `license` | string | No | License identifier (e.g., "MIT") |
@@ -40,82 +39,18 @@ Each input and output has the following structure:
   "name": "input-name",
   "type": "type-identifier",
   "required": false,
-  "default": "default-value"
+  "description": "Description of the input"
 }
 ```
 
 - `name`: Unique identifier for the input/output
 - `type`: Type identifier (can be a custom type or built-in type)
 - `required`: Whether this input/output is mandatory
-- `default`: Default value (optional, for inputs only)
+- `description`: Human-readable description of the input/output
 
-### Steps
+## Example Action
 
-Each step represents a processing unit (a WASM/Docker module):
-
-```json
-{
-  "id": "step-identifier",
-  "uses": {
-    "name": "module-name:version",
-    "types": {
-      "CustomType": {
-        "field1": "string",
-        "field2": "number"
-      }
-    }
-  },
-  "with": {
-    "parameter": "value"
-  }
-}
-```
-
-- `id`: Unique identifier for the step
-- `uses.name`: Module name and version to use
-- `uses.types`: Type definitions specific to this step
-- `with`: Configuration parameters for the step
-
-### Wires (Data Flow)
-
-Wires define how data flows between inputs, steps, and outputs:
-
-```json
-{
-  "from": {
-    "source": "inputs|step-id",
-    "key": "input-name|output-name"
-  },
-  "to": {
-    "step": "step-id",
-    "input": "input-name"
-  }
-}
-```
-
-- `from.source`: Either "inputs" for composition inputs or a step ID
-- `from.key`: The specific input/output name
-- `to.step`: Target step ID
-- `to.input`: Target input name
-
-### Export Mappings
-
-Export mappings define how step outputs become composition outputs:
-
-```json
-{
-  "output-name": {
-    "from": {
-      "step": "step-id",
-      "output": "output-name"
-    }
-  }
-}
-```
-
-## Example WASM Module
-
-Here's a complete example of a WASM module specification that demonstrates the format:
+Here's a complete example of an action specification that demonstrates the format:
 
 ```json
 {
@@ -164,9 +99,9 @@ Here's a complete example of a WASM module specification that demonstrates the f
 }
 ```
 
-## Module Functionality
+## Action Functionality
 
-This example WASM module:
+This example action:
 
 1. **Takes inputs**: 
    - `url` (required string): The URL to fetch data from
@@ -179,7 +114,7 @@ This example WASM module:
    - `HttpHeaders`: Common HTTP header fields like Content-Type, Authorization, etc.
    - `HttpResponse`: Response structure with status code and body
 
-The module demonstrates a typical HTTP client pattern that can be used in compositions for fetching data from web APIs.
+The action demonstrates a typical HTTP client pattern that can be used in workflows for fetching data from web APIs.
 
 ## Type System
 
@@ -187,12 +122,10 @@ The format supports:
 - **Built-in types**: `string`, `number`, `boolean`, `Date`, etc.
 - **Custom types**: Defined in the `types` section
 - **Generic types**: Using angle bracket notation like `type<t>`
-- **Step-specific types**: Defined in each step's `uses.types`
 
 ## Validation Rules
 
-- All step IDs must be unique
-- All wire connections must reference valid sources and targets
 - Input/output names must be unique within their scope
-- Export mappings must reference valid step outputs
 - Type references must be resolvable
+- Required inputs must be provided when the action is invoked
+- All type definitions must be valid JSON schema
