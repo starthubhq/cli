@@ -33,10 +33,6 @@ impl ExecutionEngine {
     pub async fn execute_action(&self, action_ref: &str, inputs: HashMap<String, Value>) -> Result<Value> {
         println!("🚀 Starting execution of action: {}", action_ref);
         
-        // Fetch action metadata
-        let metadata = self.client.fetch_action_metadata(action_ref).await?;
-        println!("✓ Fetched action details: {}", metadata.name);
-        
         // Try to download composite action definition
         let manifests = self.fetch_all_action_manifests(action_ref).await?;
         if manifests.is_empty() {
@@ -69,21 +65,14 @@ impl ExecutionEngine {
         }
         visited.insert(action_ref.to_string());
         
-        // Get action metadata
-        let metadata = match self.client.fetch_action_metadata(action_ref).await {
-            Ok(m) => m,
-            Err(_) => return Ok(vec![]),
-        };
-        
-        // Construct storage URL for starthub.json
+        // Construct storage URL for starthub-lock.json (hardcoded pattern)
         let storage_url = format!(
-            "https://api.starthub.so/storage/v1/object/public/git/{}/{}/starthub.json",
-            action_ref.split('@').next().unwrap_or(""),
-            metadata.commit_sha
+            "https://api.starthub.so/storage/v1/object/public/artifacts/{}/starthub-lock.json",
+            action_ref
         );
         
-        // Download and parse starthub.json
-        let manifest = self.client.download_starthub_json(&storage_url).await?;
+        // Download and parse starthub-lock.json
+        let manifest = self.client.download_starthub_lock(&storage_url).await?;
         let mut all_manifests = vec![manifest.clone()];
         
         // Recursively fetch manifests for all steps

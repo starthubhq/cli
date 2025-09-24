@@ -204,42 +204,13 @@ pub struct ActionPlan {
 }
 
 // API Client for StartHub
-pub struct HubClient {
-    base_url: String,
-    token: Option<String>,
-}
+pub struct HubClient;
 
 impl HubClient {
-    pub fn new(base_url: String, token: Option<String>) -> Self {
-        Self { base_url, token }
+    pub fn new(_base_url: String, _token: Option<String>) -> Self {
+        Self
     }
 
-    pub async fn fetch_action_metadata(&self, action_ref: &str) -> anyhow::Result<ActionMetadata> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/rest/v1/actions", self.base_url);
-        
-        let mut request = client.get(&url);
-        if let Some(token) = &self.token {
-            request = request.header("Authorization", format!("Bearer {}", token));
-            request = request.header("apikey", token);
-        }
-        
-        let response = request
-            .query(&[("name", "eq"), ("name", action_ref)])
-            .send()
-            .await?;
-            
-        if response.status().is_success() {
-            let actions: Vec<ActionMetadata> = response.json().await?;
-            if let Some(action) = actions.first() {
-                Ok(action.clone())
-            } else {
-                Err(anyhow::anyhow!("Action not found: {}", action_ref))
-            }
-        } else {
-            Err(anyhow::anyhow!("Failed to fetch action metadata: {}", response.status()))
-        }
-    }
 
     pub async fn download_wasm(&self, action_ref: &str, cache_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
         // Implementation for downloading WASM modules
@@ -253,7 +224,7 @@ impl HubClient {
         Err(anyhow::anyhow!("WASM download not implemented yet"))
     }
 
-    pub async fn download_starthub_json(&self, storage_url: &str) -> anyhow::Result<ShManifest> {
+    pub async fn download_starthub_lock(&self, storage_url: &str) -> anyhow::Result<ShManifest> {
         let client = reqwest::Client::new();
         let response = client.get(storage_url).send().await?;
         
@@ -261,26 +232,7 @@ impl HubClient {
             let manifest: ShManifest = response.json().await?;
             Ok(manifest)
         } else {
-            Err(anyhow::anyhow!("Failed to download starthub.json: {}", response.status()))
+            Err(anyhow::anyhow!("Failed to download starthub-lock.json: {}", response.status()))
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionMetadata {
-    pub name: String,
-    pub version_number: String,
-    pub description: String,
-    pub commit_sha: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inputs: Option<Vec<ActionPort>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub outputs: Option<Vec<ActionPort>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ActionPort {
-    pub name: String,
-    pub action_port_type: String,
-    pub action_port_direction: String,
 }
