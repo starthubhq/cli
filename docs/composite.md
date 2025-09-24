@@ -7,9 +7,9 @@ This document describes the JSON format used for defining composite actions (com
 A composite action is a declarative specification that defines:
 - Input and output interfaces
 - Processing steps (using WASM/Docker modules)
-- Data flow between steps
+- Data flow between steps using template interpolation
 - Type definitions
-- Export mappings
+- Output transformations
 
 ## Format Structure
 
@@ -25,29 +25,29 @@ A composite action is a declarative specification that defines:
 | `repository` | string | No | URL to the source repository |
 | `license` | string | No | License identifier (e.g., "MIT") |
 | `inputs` | array | Yes | Array of input definitions |
-| `outputs` | array | Yes | Array of output definitions |
+| `outputs` | array | Yes | Array of output definitions with transformations |
 | `types` | object | No | Custom type definitions |
 | `steps` | array | Yes | Array of processing steps |
-| `wires` | array | Yes | Array of data flow connections |
-| `export` | object | No | Output export mappings |
 
-### Input/Output Definitions
+### Input Definitions
 
-Each input and output has the following structure:
+Each input has the following structure:
 
 ```json
 {
   "name": "input-name",
+  "description": "Description of the input",
   "type": "type-identifier",
-  "required": false,
-  "default": "default-value"
+  "required": true,
+  "default": null
 }
 ```
 
-- `name`: Unique identifier for the input/output
+- `name`: Unique identifier for the input
+- `description`: Human-readable description
 - `type`: Type identifier (can be a custom type or built-in type)
-- `required`: Whether this input/output is mandatory
-- `default`: Default value (optional, for inputs only)
+- `required`: Whether this input is mandatory
+- `default`: Default value (optional)
 
 ### Steps
 
@@ -56,206 +56,170 @@ Each step represents a processing unit (typically a WASM/Docker module):
 ```json
 {
   "id": "step-identifier",
-  "uses": {
-    "name": "module-name:version",
-    "types": {
-      "CustomType": {
-        "field1": "string",
-        "field2": "number"
-      }
+  "uses": "module-name:version",
+  "types": {
+    "CustomType": {
+      "field1": "string",
+      "field2": "number"
     }
   },
-  "with": {
-    "parameter": "value"
-  }
+  "inputs": [
+    {
+      "type": "InputType",
+      "value": "{{template.interpolation}}"
+    }
+  ],
+  "outputs": [
+    "OutputType"
+  ]
 }
 ```
 
 - `id`: Unique identifier for the step
-- `uses.name`: Module name and version to use
-- `uses.types`: Type definitions specific to this step
-- `with`: Configuration parameters for the step
+- `uses`: Module name and version to use
+- `types`: Type definitions specific to this step
+- `inputs`: Array of input values with types and template interpolation
+- `outputs`: Array of output type names
 
-### Wires (Data Flow)
+### Template Interpolation
 
-Wires define how data flows between inputs, steps, and outputs:
+The format supports template interpolation using `{{}}` syntax:
+
+- `{{inputs.input_name}}`: Reference to composite action inputs
+- `{{step_id.output_field}}`: Reference to step outputs
+- `{{step_id.body[0].field}}`: Access to nested JSON properties
+
+### Output Transformations
+
+Outputs can transform and restructure data using template interpolation:
 
 ```json
 {
-  "from": {
-    "source": "inputs|step-id",
-    "key": "input-name|output-name"
-  },
-  "to": {
-    "step": "step-id",
-    "input": "input-name"
+  "name": "{{inputs.location_name}}",
+  "type": "GeocodingResponse",
+  "value": {
+    "lat": "{{get_geocoding_response.body[0].lat}}",
+    "lon": "{{get_geocoding_response.body[0].lon}}",
+    "country": "{{get_geocoding_response.body[0].country}}"
   }
 }
 ```
 
-- `from.source`: Either "inputs" for composite action inputs or a step ID
-- `from.key`: The specific input/output name
-- `to.step`: Target step ID
-- `to.input`: Target input name
-
-### Export Mappings
-
-Export mappings define how step outputs become composite action outputs:
-
-```json
-{
-  "output-name": {
-    "from": {
-      "step": "step-id",
-      "output": "output-name"
-    }
-  }
-}
-```
+- `name`: Can use template interpolation for dynamic naming
+- `type`: The type of the output data
+- `value`: Object structure with template interpolation for data transformation
 
 ## Example Composite Action
 
-Here's a complete example of a composite action specification that demonstrates the format:
+Here's a complete example of a composite action that fetches coordinates from the OpenWeather geocoding API:
 
 ```json
 {
-  "name": "an-example-composition",
-  "description": "Saved from editor",
-  "version": "0.0.2",
+  "name": "coordinates-by-location-name",
+  "description": "Get coordinates by location name",
+  "version": "0.0.1",
   "kind": "composition",
   "manifest_version": 1,
-  "repository": "",
+  "repository": "github.com/tgirotto/coordinates-by-location-name",
   "license": "MIT",
   "inputs": [
     {
-      "name": "some-input",
+      "name": "location_name",
+      "description": "The name of the location to get weather for",
       "type": "string",
-      "required": false
+      "required": true,
+      "default": null
     },
     {
-      "name": "PORT_1",
-      "type": "starthubhq/http-get-wasm:0.0.16/HttpHeaders",
-      "required": false
-    },
+      "name": "open_weather_api_key",
+      "description": "OpenWeatherMap API key",
+      "type": "string",
+      "required": true,
+      "default": null
+    }
+  ],
+  "steps": [
     {
-      "name": "PORT_2",
-      "type": "User",
-      "default": "User",
-      "required": false
+      "id": "get_geocoding_response",
+      "uses": "starthubhq/http-get-wasm:0.0.16",
+      "types": {
+        "HttpHeaders": {
+          "Content-Type": "string",
+          "Authorization": "string"
+        },
+        "HttpResponse": {
+          "status": "number",
+          "body": "string"
+        }
+      },
+      "inputs": [
+        {
+          "type": "HttpHeaders",
+          "value": {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer {{inputs.open_weather_api_key}}"
+          }
+        },
+        {
+          "type": "string",
+          "value": "https://api.openweathermap.org/geo/1.0/direct?q={{inputs.location_name}}&limit=1&appid={{inputs.open_weather_api_key}}"
+        }
+      ],
+      "outputs": [
+        "HttpResponse"
+      ]
     }
   ],
   "outputs": [
     {
-      "name": "PORT_1",
-      "type": "User",
-      "required": false
+      "name": "{{inputs.location_name}}",
+      "type": "GeocodingResponse",
+      "value": {
+        "local_names": {
+          "en": "{{get_geocoding_response.body[0].local_names.en}}",
+          "it": "{{get_geocoding_response.body[0].local_names.it}}",
+          "fr": "{{get_geocoding_response.body[0].local_names.fr}}",
+          "de": "{{get_geocoding_response.body[0].local_names.de}}",
+          "es": "{{get_geocoding_response.body[0].local_names.es}}",
+          "pt": "{{get_geocoding_response.body[0].local_names.pt}}",
+          "ru": "{{get_geocoding_response.body[0].local_names.ru}}",
+          "zh": "{{get_geocoding_response.body[0].local_names.zh}}",
+          "ja": "{{get_geocoding_response.body[0].local_names.ja}}",
+          "ko": "{{get_geocoding_response.body[0].local_names.ko}}",
+          "ar": "{{get_geocoding_response.body[0].local_names.ar}}",
+          "hi": "{{get_geocoding_response.body[0].local_names.hi}}"
+        },
+        "lat": "{{get_geocoding_response.body[0].lat}}",
+        "lon": "{{get_geocoding_response.body[0].lon}}",
+        "country": "{{get_geocoding_response.body[0].country}}",
+        "state": "{{get_geocoding_response.body[0].state}}"
+      }
     }
   ],
   "types": {
-    "User": {
-      "id": "string",
-      "name": "string",
-      "email": "string",
-      "createdAt": "Date"
-    }
-  },
-  "steps": [
-    {
-      "id": "http_get_wasm",
-      "uses": {
-        "name": "starthubhq/http-get-wasm:0.0.16",
-        "types": {
-          "HttpHeaders": {
-            "Accept": "string",
-            "X-API-Key": "string",
-            "User-Agent": "string",
-            "Content-Type": "string",
-            "Authorization": "string"
-          },
-          "HttpResponse": {
-            "body": "string",
-            "status": "number"
-          }
-        }
-      },
-      "with": {}
-    },
-    {
-      "id": "stringify_wasm",
-      "uses": {
-        "name": "stringify-wasm:0.0.5",
-        "types": {}
-      },
-      "with": {}
-    },
-    {
-      "id": "parse_wasm",
-      "uses": {
-        "name": "parse-wasm:0.0.10",
-        "types": {}
-      },
-      "with": {}
-    }
-  ],
-  "wires": [
-    {
-      "from": {
-        "source": "inputs",
-        "key": "some-input"
-      },
-      "to": {
-        "step": "http_get_wasm",
-        "input": "url"
+    "GeocodingResponse": [
+      {
+        "name": "string",
+        "local_names": {
+          "en": "string",
+          "it": "string",
+          "fr": "string",
+          "de": "string",
+          "es": "string",
+          "pt": "string",
+          "ru": "string",
+          "zh": "string",
+          "ja": "string",
+          "ko": "string",
+          "ar": "string",
+          "hi": "string"
+        },
+        "lat": "number",
+        "lon": "number",
+        "country": "string",
+        "state": "string"
       }
-    },
-    {
-      "from": {
-        "source": "inputs",
-        "key": "PORT_1"
-      },
-      "to": {
-        "step": "http_get_wasm",
-        "input": "headers"
-      }
-    },
-    {
-      "from": {
-        "step": "http_get_wasm",
-        "output": "body"
-      },
-      "to": {
-        "step": "stringify_wasm",
-        "input": "object"
-      }
-    },
-    {
-      "from": {
-        "source": "inputs",
-        "key": "PORT_2"
-      },
-      "to": {
-        "step": "parse_wasm",
-        "input": "type"
-      }
-    },
-    {
-      "from": {
-        "step": "stringify_wasm",
-        "output": "string"
-      },
-      "to": {
-        "step": "parse_wasm",
-        "input": "string"
-      }
-    }
-  ],
-  "export": {
-    "PORT_1": {
-      "from": {
-        "step": "parse_wasm",
-        "output": "response"
-      }
-    }
+    ]
   }
 }
 ```
@@ -264,25 +228,43 @@ Here's a complete example of a composite action specification that demonstrates 
 
 This example composite action:
 
-1. **Takes inputs**: `some-input` (URL), `PORT_1` (HTTP headers), and `PORT_2` (type specification)
-2. **Makes HTTP request**: Uses `http-get-wasm` to fetch data from the URL with headers
-3. **Stringifies response**: Converts the HTTP response body to a string using `stringify-wasm`
-4. **Parses data**: Uses `parse-wasm` to parse the stringified data according to the specified type
-5. **Exports result**: Returns the parsed response as `PORT_1`
+1. **Takes inputs**: `location_name` (string) and `open_weather_api_key` (string)
+2. **Makes HTTP request**: Uses `http-get-wasm` to fetch geocoding data from OpenWeather API
+3. **Transforms output**: Converts the raw HTTP response into structured `GeocodingResponse` data
+4. **Returns structured data**: Provides coordinates, local names, and location metadata
 
-The composite action demonstrates a common pattern: HTTP request → stringify → parse → export, which is useful for API data processing workflows.
+The composite action demonstrates the power of template interpolation for data transformation, converting raw HTTP responses into clean, typed data structures.
 
 ## Type System
 
 The format supports:
 - **Built-in types**: `string`, `number`, `boolean`, `Date`, etc.
 - **Custom types**: Defined in the `types` section
-- **Step-specific types**: Defined in each step's `uses.types`
+- **Step-specific types**: Defined in each step's `types` section
+- **Template interpolation**: Automatic JSON parsing for nested property access
+
+## Template Interpolation Features
+
+- **Input references**: `{{inputs.input_name}}`
+- **Step output references**: `{{step_id.output_field}}`
+- **Nested property access**: `{{step_id.body[0].field}}`
+- **Dynamic naming**: Output names can use template interpolation
+- **Type safety**: Template interpolation is validated against type definitions
 
 ## Validation Rules
 
 - All step IDs must be unique
-- All wire connections must reference valid sources and targets
+- Template interpolation must reference valid sources
 - Input/output names must be unique within their scope
-- Export mappings must reference valid step outputs
 - Type references must be resolvable
+- Template interpolation must produce compatible types
+- Step inputs must match expected types
+- Output transformations must produce valid types
+
+## Benefits of This Format
+
+1. **Readability**: Data flow is clear and co-located
+2. **Type Safety**: Complete type checking for all operations
+3. **Flexibility**: Rich template interpolation for data transformation
+4. **Maintainability**: No scattered wire definitions
+5. **Developer Experience**: Intuitive syntax with full IDE support
