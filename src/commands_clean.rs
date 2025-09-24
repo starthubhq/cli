@@ -1,13 +1,16 @@
 use anyhow::Result;
-use std::{fs, path::Path, io::Write};
+use std::{fs, path::Path};
 use std::process::Command as PCommand;
-use inquire::{Text, Select};
+use inquire::{Text, Select, Confirm};
 use tokio::time::{sleep, Duration};
 use webbrowser;
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::{config::Region, Client as S3Client};
+use aws_sdk_s3::primitives::ByteStream;
 use reqwest;
 use serde_json::{Value, json};
 
-use crate::models::{ShManifest, ShKind, ShPort, ShType};
+use crate::models::{ShManifest, ShKind, ShPort, ShLock, ShDistribution, ShType};
 use crate::templates;
 
 // Global constants for local development server
@@ -20,7 +23,7 @@ use std::os::unix::fs::PermissionsExt;
 pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
     // Implementation for Docker publishing
     println!("🐳 Publishing Docker image for {}", m.name);
-
+    
     if !no_build {
         // Build Docker image
         let dockerfile_path = Path::new("Dockerfile");
@@ -68,7 +71,7 @@ pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow:
 pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
     // Implementation for WASM publishing
     println!("🦀 Publishing WASM module for {}", m.name);
-
+    
     if !no_build {
         // Build WASM module
         let build_cmd = PCommand::new("cargo")
@@ -116,14 +119,8 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         .with_default("0.1.0")
         .prompt()?;
 
-    let kind_options = vec![
-        ("Wasm", ShKind::Wasm),
-        ("Docker", ShKind::Docker),
-        ("Composition", ShKind::Composition),
-    ];
-    let kind_choice = Select::new("Package type:", kind_options.iter().map(|(name, _)| *name).collect())
+    let kind = Select::new("Package type:", vec![ShKind::Wasm, ShKind::Docker, ShKind::Composition])
         .prompt()?;
-    let kind = kind_options.iter().find(|(name, _)| *name == kind_choice).unwrap().1.clone();
 
     // Repository
     let repo_default = match kind {
@@ -139,34 +136,31 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     let manifest = ShManifest {
         name: name.clone(),
         version: version.clone(),
-        kind: Some(kind.clone()),
-        description: "A StartHub package".to_string(),
-        repository,
-        manifest_version: 1,
-        image: None,
-        license: "MIT".to_string(),
-        inputs: vec![
-        ShPort {
+        kind,
+        description: Some("A StartHub package".to_string()),
+        repository: Some(repository),
+        inputs: Some(vec![
+            ShPort {
                 name: "input".to_string(),
-                description: "Input parameter".to_string(),
-                ty: ShType::String,
-            required: true,
-            default: None,
-        }
-        ],
-        outputs: vec![
-        ShPort {
+                action_port_type: ShType::String,
+                action_port_direction: "input".to_string(),
+                required: true,
+            }
+        ]),
+        outputs: Some(vec![
+            ShPort {
                 name: "output".to_string(),
-                description: "Output result".to_string(),
-                ty: ShType::String,
-            required: true,
-            default: None,
-        }
-        ],
-        types: std::collections::HashMap::new(),
+                action_port_type: ShType::String,
+                action_port_direction: "output".to_string(),
+                required: true,
+            }
+        ]),
+        distribution: Some(ShDistribution {
+            docker: None,
+            wasm: None,
+        }),
         steps: vec![],
         wires: vec![],
-        export: serde_json::json!({}),
     };
 
     // Write starthub.json
@@ -177,17 +171,17 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     println!("✅ Created starthub.json in {}", starthub_path.display());
 
     // Create basic files based on type
-    match kind {
+    match manifest.kind {
         ShKind::Wasm => {
             // Create Cargo.toml for WASM
-            let cargo_toml = templates::wasm_cargo_toml_tpl(&name, &version);
+            let cargo_toml = templates::cargo_toml_template(&name);
             let cargo_path = Path::new(&path).join("Cargo.toml");
             fs::write(&cargo_path, cargo_toml)?;
             
             // Create src/main.rs
             let src_dir = Path::new(&path).join("src");
             fs::create_dir_all(&src_dir)?;
-            let main_rs = templates::WASM_MAIN_RS_TPL;
+            let main_rs = templates::wasm_main_template();
             let main_path = src_dir.join("main.rs");
             fs::write(&main_path, main_rs)?;
             
@@ -195,7 +189,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         }
         ShKind::Docker => {
             // Create Dockerfile
-            let dockerfile = templates::DOCKERFILE_TPL;
+            let dockerfile = templates::dockerfile_template();
             let dockerfile_path = Path::new(&path).join("Dockerfile");
             fs::write(&dockerfile_path, dockerfile)?;
             
@@ -203,14 +197,9 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         }
         ShKind::Composition => {
             // Create composition template
-            let composition = serde_json::json!({
-                "name": name,
-                "version": version,
-                "steps": [],
-                "wires": []
-            });
+            let composition = templates::composition_template();
             let composition_path = Path::new(&path).join("composition.json");
-            fs::write(&composition_path, serde_json::to_string_pretty(&composition)?)?;
+            fs::write(&composition_path, composition)?;
             
             println!("✅ Created composition template");
         }
@@ -266,7 +255,7 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
     
     if token_file.exists() {
         println!("✅ Authenticated (token found)");
-            } else {
+    } else {
         println!("❌ Not authenticated (no token found)");
         println!("💡 Run 'starthub login' to authenticate");
     }
@@ -322,11 +311,11 @@ async fn start_server_process() -> Result<Option<tokio::process::Child>> {
             // Try relative to the current binary
             let current_exe = std::env::current_exe()?;
             let current_dir = current_exe.parent().unwrap();
-            Ok::<std::path::PathBuf, anyhow::Error>(current_dir.join(server_binary))
+            Ok(current_dir.join(server_binary))
         })
         .or_else(|_| {
             // Try in the target directory for development
-            Ok::<std::path::PathBuf, anyhow::Error>(std::env::current_dir()?.join("target").join("debug").join(server_binary))
+            Ok(std::env::current_dir()?.join("target").join("debug").join(server_binary))
         })?;
     
     if !server_path.exists() {
@@ -361,13 +350,13 @@ fn parse_action_arg(action: &str) -> (String, String, String) {
         if let Some(slash_pos) = name_part.find('/') {
             namespace = name_part[..slash_pos].to_string();
             slug = name_part[slash_pos + 1..].to_string();
-                } else {
+        } else {
             slug = name_part.to_string();
         }
     } else if let Some(slash_pos) = action.find('/') {
         namespace = action[..slash_pos].to_string();
         slug = action[slash_pos + 1..].to_string();
-                        } else {
+    } else {
         slug = action.to_string();
     }
     
@@ -403,20 +392,20 @@ async fn get_action_id(api_base: &str, action_name: &str, namespace: &str, acces
         .await?;
     
     if owner_response.status().is_success() {
-    let owners: Vec<serde_json::Value> = owner_response.json().await?;
+        let owners: Vec<serde_json::Value> = owner_response.json().await?;
         if let Some(owner) = owners.first() {
             if let Some(owner_id) = owner.get("id").and_then(|v| v.as_str()) {
-    // Now get the action ID
+                // Now get the action ID
                 let action_response = client
                     .get(&format!("{}/rest/v1/actions?select=id&name=eq.{}&owner_id=eq.{}", api_base, action_name, owner_id))
-        .header("Authorization", format!("Bearer {}", access_token))
+                    .header("Authorization", format!("Bearer {}", access_token))
                     .header("apikey", access_token)
-        .send()
-        .await?;
-    
+                    .send()
+                    .await?;
+                
                 if action_response.status().is_success() {
                     let actions: Vec<serde_json::Value> = action_response.json().await?;
-        if let Some(action) = actions.first() {
+                    if let Some(action) = actions.first() {
                         if let Some(action_id) = action.get("id").and_then(|v| v.as_str()) {
                             return Ok(action_id.to_string());
                         }
