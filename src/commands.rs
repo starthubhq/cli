@@ -274,7 +274,7 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn cmd_run(action: String, _runner: crate::RunnerKind) -> Result<()> {
+pub async fn cmd_run(action: String) -> Result<()> {
     // Start the server as a separate process
     let server_process = start_server_process().await?;
     
