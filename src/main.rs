@@ -6,17 +6,11 @@ use clap::{ValueEnum};
 mod starthub_api;
 mod ghapp;
 mod config;
-mod runners;
 mod models;
 mod templates;
 mod commands;
 mod publish;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub enum RunnerKind {
-    Github,
-    Local, // placeholder for future
-}
 
 #[derive(Parser, Debug)]
 #[command(name="starthub", version, about="Starthub CLI")]
@@ -44,9 +38,6 @@ enum Commands {
     Run {
         /// Package slug/name, e.g. "chirpstack"
         action: String,       
-        /// Choose where to run the deployment
-        #[arg(long, value_enum, default_value_t = RunnerKind::Github)]
-        runner: RunnerKind,
     },
     /// Show deployment status
     Status {
@@ -79,7 +70,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init { path } => commands::cmd_init(path).await?,
         Commands::Publish { no_build } => publish::cmd_publish(no_build).await?,
-        Commands::Run { action, runner } => commands::cmd_run(action, runner).await?,
+        Commands::Run { action } => commands::cmd_run(action).await?,
         Commands::Status { id } => commands::cmd_status(id).await?,
         Commands::Login { api_base } => commands::cmd_login_starthub(api_base).await?,
         Commands::Logout => commands::cmd_logout_starthub().await?,
@@ -88,12 +79,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-pub fn make_runner(kind: RunnerKind) -> Box<dyn runners::Runner + Send + Sync> {
-    match kind {
-        RunnerKind::Github => Box::new(runners::github::GithubRunner),
-        RunnerKind::Local  => Box::new(runners::local::LocalRunner),
-    }
-}
 
 #[cfg(test)]
 mod tests {

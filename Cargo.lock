@@ -3807,6 +3807,36 @@ name = "starthub"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "aws-config",
+ "aws-sdk-s3",
+ "base64 0.22.1",
+ "chrono",
+ "clap",
+ "dirs 5.0.1",
+ "inquire",
+ "lazy_static",
+ "mime_guess",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sodiumoxide",
+ "tempfile",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "webbrowser",
+ "which 6.0.3",
+ "zip",
+]
+
+[[package]]
+name = "starthub-server"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -3817,7 +3847,6 @@ dependencies = [
  "dirs 5.0.1",
  "flate2",
  "futures-util",
- "inquire",
  "lazy_static",
  "mime_guess",
  "reqwest",
@@ -3828,7 +3857,6 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
- "tokio-test",
  "tower 0.4.13",
  "tower-http 0.5.2",
  "tracing",
@@ -3836,7 +3864,6 @@ dependencies = [
  "url",
  "wasmtime",
  "wasmtime-wasi",
- "webbrowser",
  "which 6.0.3",
  "zip",
 ]
