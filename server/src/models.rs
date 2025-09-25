@@ -19,10 +19,10 @@ pub struct ShManifest {
     #[serde(default)]
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub types: std::collections::HashMap<String, serde_json::Value>,
-    // Composite action fields
+    // Composite action fields - steps are now an object with step_id as key
     #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<ShActionStep>,
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub steps: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub wires: Vec<ShWire>,
@@ -197,6 +197,7 @@ pub struct StepSpec {
     pub network: Option<String>,
     pub entry: Option<String>,
     pub mounts: Vec<MountSpec>,
+    pub step_definition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,11 +208,6 @@ pub struct MountSpec {
     pub rw: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct ActionPlan {
-    pub steps: Vec<StepSpec>,
-    pub workdir: Option<String>,
-}
 
 // API Client for StartHub
 pub struct HubClient;
@@ -237,7 +233,6 @@ impl HubClient {
         
         // Create action-specific cache directory
         let action_cache_dir = cache_dir.join(action_ref.replace('/', "_").replace(":", "_"));
-        println!("📁 Creating cache directory: {:?}", action_cache_dir);
         
         // Create directory if it doesn't exist
         if let Err(e) = std::fs::create_dir_all(&action_cache_dir) {
@@ -278,18 +273,20 @@ impl HubClient {
         let original_wasm_path = wasm_files[0].path();
         let artifact_path = action_cache_dir.join("artifact.wasm");
         
-        println!("📄 Found WASM file: {:?}", original_wasm_path);
-        println!("📄 Target artifact path: {:?}", artifact_path);
-        
-        // Remove existing artifact.wasm if it exists
-        if artifact_path.exists() {
-            println!("🗑️ Removing existing artifact.wasm");
-            std::fs::remove_file(&artifact_path)?;
+        // Only rename if the paths are different
+        if original_wasm_path != artifact_path {
+            // Remove existing artifact.wasm if it exists
+            if artifact_path.exists() {
+                println!("🗑️ Removing existing artifact.wasm");
+                std::fs::remove_file(&artifact_path)?;
+            }
+            
+            // Rename the found WASM file to artifact.wasm
+            println!("🔄 Renaming WASM file to artifact.wasm");
+            std::fs::rename(&original_wasm_path, &artifact_path)?;
+        } else {
+            println!("✅ WASM file is already named artifact.wasm, no rename needed");
         }
-        
-        // Rename the found WASM file to artifact.wasm
-        println!("🔄 Renaming WASM file to artifact.wasm");
-        std::fs::rename(&original_wasm_path, &artifact_path)?;
         
         // Verify the final file exists and is accessible
         if !artifact_path.exists() {
@@ -301,8 +298,6 @@ impl HubClient {
             return Err(anyhow::anyhow!("Artifact.wasm not accessible at {:?}: {}", artifact_path, e));
         }
         
-        println!("✅ Downloaded and extracted WASM artifacts for {}", action_ref);
-        println!("✅ Final artifact path: {:?}", artifact_path);
         Ok(artifact_path)
     }
 
@@ -312,9 +307,7 @@ impl HubClient {
         
         if response.status().is_success() {
             // Log the response body for debugging
-            let response_text = response.text().await?;
-            println!("📄 Response body: {}", response_text);
-            
+            let response_text = response.text().await?;            
             // Try to parse the JSON
             let manifest: ShManifest = serde_json::from_str(&response_text)
                 .map_err(|e| anyhow::anyhow!("JSON parsing error: {} - Response: {}", e, response_text))?;

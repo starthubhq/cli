@@ -6,10 +6,25 @@ use std::path::Path;
 use std::collections::{HashSet, HashMap};
 use which::which;
 
-use crate::models::{ShManifest, ShKind, HubClient, StepSpec, ActionPlan};
+use crate::models::{ShManifest, ShKind, HubClient, StepSpec};
 
 // Constants
 const ST_MARKER: &str = "::starthub:state::";
+
+// Execution state to track inputs and outputs of each step
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExecutionState {
+    inputs: HashMap<String, Value>,
+    steps: Vec<StepState>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct StepState {
+    id: String,
+    uses: String,
+    inputs: HashMap<String, Value>,
+    outputs: HashMap<String, Value>,
+}
 
 pub struct ExecutionEngine {
     client: HubClient,
@@ -34,7 +49,6 @@ impl ExecutionEngine {
     }
 
     pub async fn execute_action(&self, action_ref: &str, inputs: HashMap<String, Value>) -> Result<Value> {
-        println!("🚀 Starting execution of action: {}", action_ref);
         
         // Ensure cache directory exists before starting execution
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
@@ -48,133 +62,154 @@ impl ExecutionEngine {
         }
         
         let main_manifest = &manifests[0];
-        println!("✓ Main action: {} (version: {})", main_manifest.name, main_manifest.version);
         
-        // For simple actions, create a single step
-        let mut all_steps = Vec::new();
-        
-        if main_manifest.steps.is_empty() {
-            // Simple action - create a single step
-            let step = match main_manifest.kind {
-                Some(crate::models::ShKind::Wasm) => {
-                    StepSpec {
-                        id: "main".to_string(),
-                        kind: "wasm".to_string(),
-                        ref_: action_ref.to_string(),
-                        args: vec![],
-                        env: std::collections::HashMap::new(),
-                        workdir: None,
-                        network: None,
-                        entry: None,
-                        mounts: vec![],
-                    }
-                },
-                Some(crate::models::ShKind::Docker) => {
-                    StepSpec {
-                        id: "main".to_string(),
-                        kind: "docker".to_string(),
-                        ref_: action_ref.to_string(),
-                        args: vec![],
-                        env: std::collections::HashMap::new(),
-                        workdir: None,
-                        network: None,
-                        entry: None,
-                        mounts: vec![],
-                    }
-                },
-                _ => return Err(anyhow::anyhow!("Unsupported action kind: {:?}", main_manifest.kind)),
-            };
-            all_steps.push(step);
-        } else {
-            // Composite action - use existing logic
-        let plan = self.build_execution_plan(main_manifest)?;
-            all_steps = plan.steps;
+        // Handle different action types
+        match main_manifest.kind {
+            Some(crate::models::ShKind::Wasm) | Some(crate::models::ShKind::Docker) => {
+                // Simple action - create a single step
+                let step = StepSpec {
+                    id: "main".to_string(),
+                    kind: match main_manifest.kind {
+                        Some(crate::models::ShKind::Wasm) => "wasm".to_string(),
+                        Some(crate::models::ShKind::Docker) => "docker".to_string(),
+                        _ => unreachable!(),
+                    },
+                    ref_: action_ref.to_string(),
+                    args: vec![],
+                    env: std::collections::HashMap::new(),
+                    workdir: None,
+                    network: None,
+                    entry: None,
+                    mounts: vec![],
+                    step_definition: None,
+                };
+                
+                
+                // Execute the single step
+                self.execute_all_steps(&[step], &inputs).await
+            },
+            Some(crate::models::ShKind::Composition) | None => {
+                // Composite action - process steps
+                
+                // Convert steps to execution format
+                let execution_steps = self.convert_composite_steps_to_execution(main_manifest, &inputs).await?;
+                
+                
+                // Execute all steps in order
+                self.execute_all_steps(&execution_steps, &inputs).await
+            }
         }
-        
-        println!("✓ Total steps resolved: {}", all_steps.len());
-        println!("📋 Execution order: {:?}", all_steps.iter().map(|s| &s.id).collect::<Vec<_>>());
-        
-        // Execute all steps in order
-        self.execute_all_steps(&all_steps, &inputs).await
     }
 
-    
-    fn topological_sort_steps(&self, steps: &[StepSpec]) -> Result<Vec<StepSpec>> {
-        use std::collections::{HashMap, HashSet, VecDeque};
+    async fn convert_composite_steps_to_execution(&self, manifest: &ShManifest, _inputs: &HashMap<String, Value>) -> Result<Vec<StepSpec>> {
+        let mut execution_steps = Vec::new();
         
-        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut dependents: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
-        
-        // Initialize all steps
-        for step in steps {
-            dependencies.insert(step.id.clone(), HashSet::new());
-            dependents.insert(step.id.clone(), HashSet::new());
-            in_degree.insert(step.id.clone(), 0);
-        }
-        
-        // For now, assume no dependencies between steps (they're all base actions)
-        // In a real implementation, we'd analyze step inputs/outputs to build the dependency graph
-        
-        // Kahn's algorithm for topological sort
-        let mut queue = VecDeque::new();
-        let mut result = Vec::new();
-        
-        // Add all steps with zero in-degree to queue
-        for (step_id, &degree) in &in_degree {
-            if degree == 0 {
-                queue.push_back(step_id.clone());
-            }
-        }
-        
-        while let Some(step_id) = queue.pop_front() {
-            result.push(step_id.clone());
+        for (step_id, step_data) in &manifest.steps {
             
-            // Process dependents
-            if let Some(deps) = dependents.get(&step_id) {
-                for dep in deps {
-                    if let Some(degree) = in_degree.get_mut(dep) {
-                        *degree -= 1;
-                        if *degree == 0 {
-                            queue.push_back(dep.clone());
-                        }
-                    }
-                }
-            }
+            // Parse step data
+            let step_obj = step_data.as_object()
+                .ok_or_else(|| anyhow::anyhow!("Step {} is not an object", step_id))?;
+            
+            // Extract the 'uses' field
+            let uses_data = step_obj.get("uses")
+                .ok_or_else(|| anyhow::anyhow!("Step {} missing 'uses' field", step_id))?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Step {} 'uses' field is not a string", step_id))?;
+            
+            // Determine step kind based on the action being used
+            let step_kind = if uses_data.contains("http-get-wasm") {
+                "wasm"
+            } else if uses_data.contains("docker") {
+                "docker"
+            } else {
+                // Default to WASM for now
+                "wasm"
+            };
+            
+            // Create execution step
+            let execution_step = StepSpec {
+                id: step_id.clone(),
+                kind: step_kind.to_string(),
+                ref_: uses_data.to_string(),
+                args: vec![],
+                env: std::collections::HashMap::new(),
+                workdir: None,
+                network: None,
+                entry: None,
+                mounts: vec![],
+                step_definition: Some(step_data.clone()),
+            };
+            
+            execution_steps.push(execution_step);
         }
         
-        // Convert step IDs back to StepSpecs
-        let mut sorted_steps = Vec::new();
-        for step_id in result {
-            if let Some(step) = steps.iter().find(|s| s.id == step_id) {
-                sorted_steps.push(step.clone());
-            }
-        }
-        
-        Ok(sorted_steps)
+        Ok(execution_steps)
     }
     
+    
     async fn execute_all_steps(&self, steps: &[StepSpec], inputs: &HashMap<String, Value>) -> Result<Value> {
-        let mut state = serde_json::Value::Object(inputs.clone().into_iter().collect());
+        // Parse stringified JSON values in inputs
+        let mut parsed_inputs = HashMap::new();
+        for (key, value) in inputs {
+            if let Some(str_value) = value.as_str() {
+                // Try to parse as JSON
+                if let Ok(parsed_json) = serde_json::from_str::<Value>(str_value) {
+                    parsed_inputs.insert(key.clone(), parsed_json);
+                } else {
+                    parsed_inputs.insert(key.clone(), value.clone());
+                }
+            } else {
+                parsed_inputs.insert(key.clone(), value.clone());
+            }
+        }
+        
+        // Initialize execution state with parsed inputs
+        let mut execution_state = ExecutionState {
+            inputs: parsed_inputs,
+            steps: Vec::new(),
+        };
         
         for step in steps {
-            println!("🔧 Executing step: {}", step.id);
+            // Generate UUID for this step
+            let step_id = uuid::Uuid::new_v4().to_string();
             
-            // Build parameters for this step
-            let step_params = self.build_step_parameters(step, &state, inputs)?;
+            // Build parameters for this step using the execution state
+            let step_params = self.build_step_parameters_from_state(step, &execution_state).await?;
             
-            // Execute the step (download/extraction is handled by run_wasm_step/run_docker_step)
+            // Log execution state and step inputs
+            println!("📊 Execution State:");
+            println!("  Inputs: {}", serde_json::to_string_pretty(&execution_state.inputs)?);
+            println!("  Steps completed: {}", execution_state.steps.len());
+            println!("📤 Step '{}' inputs:", step.id);
+            println!("{}", serde_json::to_string_pretty(&step_params)?);
+            
+            // Execute the step
             let result = match step.kind.as_str() {
                 "wasm" => self.run_wasm_step(step, None, &step_params).await?,
                 "docker" => self.run_docker_step(step, None, &step_params).await?,
                 _ => return Err(anyhow::anyhow!("Unknown step kind: {}", step.kind)),
             };
             
-            // Update state with step result
-            self.deep_merge(&mut state, result);
+            // Log step output
+            println!("📥 Step '{}' outputs:", step.id);
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            
+            // Store the step state in execution state
+            let step_state = StepState {
+                id: step_id,
+                uses: step.ref_.clone(),
+                inputs: step_params.as_object().unwrap().clone().into_iter().collect(),
+                outputs: result.as_object().unwrap().clone().into_iter().collect(),
+            };
+            execution_state.steps.push(step_state);
         }
         
-        Ok(state)
+        // Log the final execution state
+        println!("📊 Final Execution State:");
+        println!("{}", serde_json::to_string_pretty(&execution_state)?);
+        
+        // Return the final execution state
+        Ok(serde_json::to_value(execution_state)?)
     }
 
     async fn fetch_all_action_manifests(&self, action_ref: &str) -> Result<Vec<ShManifest>> {
@@ -212,9 +247,13 @@ impl ExecutionEngine {
                 }
                 ShKind::Composition => {
                     // For compositions, recursively process each step
-                    for step in &manifest.steps {
-                        if let Ok(step_manifests) = Box::pin(self.fetch_all_action_manifests_recursive(&step.uses.name, visited)).await {
-                            all_manifests.extend(step_manifests);
+                    for (_step_id, step_data) in &manifest.steps {
+                        if let Some(step_obj) = step_data.as_object() {
+                            if let Some(uses_data) = step_obj.get("uses").and_then(|v| v.as_str()) {
+                                if let Ok(step_manifests) = Box::pin(self.fetch_all_action_manifests_recursive(uses_data, visited)).await {
+                                    all_manifests.extend(step_manifests);
+                                }
+                            }
                         }
                     }
                 }
@@ -236,6 +275,7 @@ impl ExecutionEngine {
         // Create action-specific cache directory
         let action_cache_dir = self.cache_dir.join(action_ref);
         std::fs::create_dir_all(&action_cache_dir)?;
+        println!("📁 Cache directory: {}", action_cache_dir.display());
         
         // Download the artifacts zip file
         let response = reqwest::get(&artifacts_url).await?;
@@ -250,113 +290,67 @@ impl ExecutionEngine {
         let mut archive = zip::ZipArchive::new(cursor)?;
         archive.extract(&action_cache_dir)?;
         
-        println!("Downloaded and extracted artifacts for {}", action_ref);
+        println!("✅ Artifacts extracted to: {}", action_cache_dir.display());
+        
         Ok(())
     }
 
-    fn build_execution_plan(&self, manifest: &ShManifest) -> Result<ActionPlan> {
-        // Build dependency graph and sort steps
-        let sorted_steps = self.resolve_step_dependencies(manifest)?;
+
+
+    async fn build_step_parameters_from_state(&self, step: &StepSpec, execution_state: &ExecutionState) -> Result<Value> {
+        // If we have a step definition, process it to build correct parameters
+        if let Some(step_def) = &step.step_definition {
+            return self.process_step_definition_from_state(step_def, execution_state).await;
+        }
         
-        Ok(ActionPlan {
-            steps: sorted_steps,
-            workdir: None,
-        })
+        // Fallback: for simple actions without step definitions, use initial inputs directly
+        let mut params = Map::new();
+        for (key, value) in &execution_state.inputs {
+            params.insert(key.clone(), value.clone());
+        }
+        
+        Ok(Value::Object(params))
     }
 
-    fn resolve_step_dependencies(&self, manifest: &ShManifest) -> Result<Vec<StepSpec>> {
-        use std::collections::{HashMap, HashSet, VecDeque};
+    async fn process_step_definition_from_state(&self, step_def: &Value, execution_state: &ExecutionState) -> Result<Value> {
+        let step_obj = step_def.as_object()
+            .ok_or_else(|| anyhow::anyhow!("Step definition is not an object"))?;
         
-        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut dependents: HashMap<String, HashSet<String>> = HashMap::new();
-        let mut in_degree: HashMap<String, usize> = HashMap::new();
+        // Get the target module reference
+        let uses_ref = step_obj.get("uses")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Step definition missing 'uses' field"))?;
         
-        // Initialize all steps
-        for step in &manifest.steps {
-            dependencies.insert(step.id.clone(), HashSet::new());
-            dependents.insert(step.id.clone(), HashSet::new());
-            in_degree.insert(step.id.clone(), 0);
-        }
+        // Fetch the target module's manifest to understand its input structure
+        let target_manifests = self.fetch_all_action_manifests(uses_ref).await?;
+        let target_manifest = target_manifests.first()
+            .ok_or_else(|| anyhow::anyhow!("No manifest found for target module: {}", uses_ref))?;
         
-        // Build dependency graph by analyzing step inputs
-        for step in &manifest.steps {
-            let step_deps = self.extract_step_dependencies(step, &manifest.steps);
-            dependencies.insert(step.id.clone(), step_deps.clone());
-            
-            // Update in-degree and dependents
-            for dep in &step_deps {
-                if let Some(dep_set) = dependents.get_mut(dep) {
-                    dep_set.insert(step.id.clone());
-                }
-                *in_degree.get_mut(&step.id).unwrap() += 1;
-            }
-        }
+        // Get the inputs array from the step definition
+        let inputs_array = step_obj.get("inputs")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Step definition missing 'inputs' array"))?;
         
-        // Topological sort using Kahn's algorithm
-        let mut queue: VecDeque<String> = VecDeque::new();
-        let mut result: Vec<StepSpec> = Vec::new();
+        let mut module_params = Map::new();
         
-        // Find steps with no dependencies
-        for (step_id, degree) in &in_degree {
-            if *degree == 0 {
-                queue.push_back(step_id.clone());
-            }
-        }
+        // Get the target module's input field names from its manifest
+        let target_inputs = &target_manifest.inputs;
         
-        while let Some(current_step_id) = queue.pop_front() {
-            // Find the step definition
-            let step = manifest.steps.iter()
-                .find(|s| s.id == current_step_id)
-                .ok_or_else(|| anyhow::anyhow!("Step {} not found", current_step_id))?;
-            
-            // Create StepSpec
-            let step_spec = StepSpec {
-                id: step.id.clone(),
-                kind: self.determine_step_kind(step)?,
-                ref_: step.uses.name.clone(),
-                args: vec![],
-                env: step.env.clone(),
-                workdir: None,
-                network: None,
-                entry: None,
-                mounts: vec![],
-            };
-            result.push(step_spec);
-            
-            // Update in-degree for dependents
-            if let Some(dep_set) = dependents.get(&current_step_id) {
-                for dependent in dep_set {
-                    if let Some(degree) = in_degree.get_mut(dependent) {
-                        *degree -= 1;
-                        if *degree == 0 {
-                            queue.push_back(dependent.clone());
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Check for circular dependencies
-        if result.len() != manifest.steps.len() {
-            return Err(anyhow::anyhow!("Circular dependency detected in step graph"));
-        }
-        
-        println!("📋 Execution order: {:?}", result.iter().map(|s| &s.id).collect::<Vec<_>>());
-        Ok(result)
-    }
-
-    fn extract_step_dependencies(&self, step: &crate::models::ShActionStep, all_steps: &[crate::models::ShActionStep]) -> HashSet<String> {
-        let mut dependencies = HashSet::new();
-        
-        // Check step inputs for references to other steps
-        for input in &step.inputs {
-            if let Some(input_obj) = input.as_object() {
-                if let Some(value) = input_obj.get("value") {
-                    if let Some(value_str) = value.as_str() {
-                        // Look for patterns like {{step_id.field}} or {{step_id.body[0].field}}
-                        for other_step in all_steps {
-                            if value_str.contains(&format!("{{{{{}.", other_step.id)) {
-                                dependencies.insert(other_step.id.clone());
+                // Process each input in the array and map to target module's expected field names by type
+        for input_item in inputs_array.iter() {
+            if let Some(input_obj) = input_item.as_object() {
+                // Get the type and value
+                if let (Some(input_type), Some(input_value)) = (input_obj.get("type"), input_obj.get("value")) {
+                    let processed_value = self.process_template_variable_from_state(input_value, execution_state)?;
+                    
+                    // Find the field in target manifest that matches this input type
+                    if let Some(input_type_str) = input_type.as_str() {
+                        for (field_name, field_def) in target_inputs {
+                            if let Some(field_type) = field_def.get("type").and_then(|t| t.as_str()) {
+                                if field_type == input_type_str {
+                                    module_params.insert(field_name.clone(), processed_value);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -364,130 +358,100 @@ impl ExecutionEngine {
             }
         }
         
-        dependencies
+        Ok(Value::Object(module_params))
     }
 
-    fn determine_step_kind(&self, step: &crate::models::ShActionStep) -> Result<String> {
-        // For now, determine based on the action reference
-        // This could be enhanced to check the actual manifest of the referenced action
-        if step.uses.name.contains("http-get-wasm") {
-            Ok("wasm".to_string())
-        } else if step.uses.name.contains("docker") {
-            Ok("docker".to_string())
-        } else {
-            // Default to WASM for now
-            Ok("wasm".to_string())
-        }
-    }
-
-    async fn execute_plan(&self, plan: &ActionPlan, inputs: &HashMap<String, Value>) -> Result<Value> {
-        // Prefetch all artifacts
-        self.prefetch_all(plan).await?;
-        
-        // Execute with accumulated state
-        let mut state = json!({});
-        
-        for step in &plan.steps {
-            // Build step parameters based on the step's input requirements
-            let step_params = self.build_step_parameters(step, &state, inputs)?;
-            
-            let patch = match step.kind.as_str() {
-                "docker" => self.run_docker_step(step, plan.workdir.as_deref(), &step_params).await?,
-                "wasm" => self.run_wasm_step(step, plan.workdir.as_deref(), &step_params).await?,
-                other => bail!("unknown step.kind '{}'", other),
-            };
-            if !patch.is_null() {
-                self.deep_merge(&mut state, patch);
-            }
-        }
-        
-        println!("=== final state ===\n{}", serde_json::to_string_pretty(&state)?);
-        Ok(state)
-    }
-
-    fn build_step_parameters(&self, step: &StepSpec, state: &Value, inputs: &HashMap<String, Value>) -> Result<Value> {
-        // For WASM modules, use simple key-value object format
-        if step.kind == "wasm" {
-            // Convert inputs to simple object format expected by WASM modules
-            let mut input_obj = Map::new();
-            
-            for (key, value) in inputs {
-                input_obj.insert(key.clone(), value.clone());
-            }
-            
-            return Ok(Value::Object(input_obj));
-        }
-        
-        // For Docker modules, use the complex object structure
-        let mut params = Map::new();
-        
-        // Add environment variables as parameters
-        for (k, v) in &step.env {
-            params.insert(k.clone(), Value::String(v.clone()));
-        }
-        
-        // Add state and inputs
-        params.insert("state".to_string(), state.clone());
-        params.insert("inputs".to_string(), Value::Object(inputs.clone().into_iter().collect()));
-        
-        Ok(Value::Object(params))
-    }
-
-    async fn prefetch_all(&self, plan: &ActionPlan) -> Result<()> {
-        std::fs::create_dir_all(&self.cache_dir)?;
-        for step in &plan.steps {
-            match step.kind.as_str() {
-                "docker" => { 
-                    // For Docker, download and extract artifacts, then load the image
-                    self.download_and_extract_artifacts(&step.ref_).await?;
-                    self.load_docker_image(&step.ref_).await?;
+    fn process_template_variable_from_state(&self, template: &Value, execution_state: &ExecutionState) -> Result<Value> {
+        match template {
+            Value::String(template_str) => {
+                // Process template string like "{{inputs.open_weather_config.location_name}}"
+                let mut result = template_str.clone();
+                
+                // Replace {{inputs.*}} patterns
+                let input_pattern = regex::Regex::new(r"\{\{inputs\.([^}]+)\}\}")?;
+                result = input_pattern.replace_all(&result, |caps: &regex::Captures| {
+                    let path = &caps[1];
+                    if let Some(value) = self.get_nested_value(&execution_state.inputs, path) {
+                        match value {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
+                        }
+                    } else {
+                        caps[0].to_string()
+                    }
+                }).to_string();
+                
+                // Replace {{step_name.inputs.*}} and {{step_name.outputs.*}} patterns
+                let step_pattern = regex::Regex::new(r"\{\{([^.]+)\.(inputs|outputs)\.([^}]+)\}\}")?;
+                result = step_pattern.replace_all(&result, |caps: &regex::Captures| {
+                    let step_name = &caps[1];
+                    let section = &caps[2];
+                    let path = &caps[3];
+                    
+                    // Find step by name (could be step ID or uses reference)
+                    let step_state = execution_state.steps.iter()
+                        .find(|step| step.id == step_name || step.uses == step_name);
+                    
+                    if let Some(step_state) = step_state {
+                        let target_map = match section {
+                            "inputs" => &step_state.inputs,
+                            "outputs" => &step_state.outputs,
+                            _ => return caps[0].to_string(),
+                        };
+                        if let Some(value) = self.get_nested_value(target_map, path) {
+                            match value {
+                                Value::String(s) => s.clone(),
+                                Value::Number(n) => n.to_string(),
+                                Value::Bool(b) => b.to_string(),
+                                _ => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
+                            }
+                        } else {
+                            caps[0].to_string()
+                        }
+                    } else {
+                        caps[0].to_string()
+                    }
+                }).to_string();
+                
+                Ok(Value::String(result))
+            },
+            Value::Object(obj) => {
+                // Process object templates recursively
+                let mut processed_obj = Map::new();
+                for (key, value) in obj {
+                    processed_obj.insert(key.clone(), self.process_template_variable_from_state(value, execution_state)?);
                 }
-                "wasm" => { let _ = self.client.download_wasm(&step.ref_, &self.cache_dir).await; }
-                _ => {}
-            }
+                Ok(Value::Object(processed_obj))
+            },
+            Value::Array(arr) => {
+                // Process array templates recursively
+                let mut processed_arr = Vec::new();
+                for item in arr {
+                    processed_arr.push(self.process_template_variable_from_state(item, execution_state)?);
+                }
+                Ok(Value::Array(processed_arr))
+            },
+            other => Ok(other.clone()),
         }
-        Ok(())
     }
 
-    async fn load_docker_image(&self, action_ref: &str) -> Result<()> {
-        if which("docker").is_err() {
-            bail!("docker not found on PATH");
-        }
-        
-        // Convert action_ref to cache directory path
-        let action_cache_dir = self.cache_dir.join(action_ref.replace('/', "_").replace(":", "_"));
-        
-        // Look for Docker image files in the extracted artifacts
-        let image_files = ["image.tar", "docker-image.tar", "image.tar.gz"];
-        let mut image_path = None;
-        
-        for file_name in &image_files {
-            let path = action_cache_dir.join(file_name);
-            if path.exists() {
-                image_path = Some(path);
-                break;
-            }
-        }
-        
-        if let Some(image_path) = image_path {
-            println!("Loading Docker image from: {}", image_path.display());
-            let status = Command::new("docker")
-                .arg("load")
-                .arg("-i")
-                .arg(&image_path)
-                .status()
-                .await?;
-            
-            if !status.success() {
-                bail!("Failed to load Docker image from {}", image_path.display());
-            }
-        } else {
-            bail!("No Docker image file found in artifacts for {}", action_ref);
-        }
-        
-        Ok(())
-    }
 
+    fn get_nested_value(&self, inputs: &HashMap<String, Value>, path: &str) -> Option<Value> {
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut current = inputs.get(parts[0])?.clone();
+        
+        for part in parts.iter().skip(1) {
+            if let Some(obj) = current.as_object() {
+                current = obj.get(*part)?.clone();
+            } else {
+                return None;
+            }
+        }
+        
+        Some(current)
+    }
 
     async fn run_docker_step(
         &self,
@@ -563,37 +527,20 @@ impl ExecutionEngine {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
 
-        let tag_out = format!("[{}][stdout] ", step.id);
-        let tag_err = format!("[{}][stderr] ", step.id);
-
-        let tag_out_for_out = tag_out.clone();
-        let tag_err_for_out = tag_err.clone();
-        let quiet_logs = false;
-
         let pump_out = tokio::spawn(async move {
             while let Ok(Some(line)) = out_reader.next_line().await {
                 if let Some(idx) = line.find(ST_MARKER) {
                     let json_part = &line[idx + ST_MARKER.len()..];
                     if let Ok(v) = serde_json::from_str::<Value>(json_part) {
                         let _ = tx.send(v);
-                    } else if !quiet_logs {
-                        eprintln!("{}[marker-parse-error] {}", tag_err_for_out, line);
                     }
-                    if !quiet_logs {
-                        println!("{}{}", tag_out_for_out, line);
-                    }
-                } else if !quiet_logs {
-                    println!("{}{}", tag_out_for_out, line);
                 }
             }
         });
 
-        let tag_err_for_err = tag_err;
         let pump_err = tokio::spawn(async move {
-            while let Ok(Some(line)) = err_reader.next_line().await {
-                if !quiet_logs {
-                    eprintln!("{}{}", tag_err_for_err, line);
-                }
+            while let Ok(Some(_line)) = err_reader.next_line().await {
+                // Just consume stderr without logging
             }
         });
 
@@ -605,12 +552,14 @@ impl ExecutionEngine {
             bail!("step '{}' failed with {}", step.id, status);
         }
 
-        // Merge all patches emitted by the action
-        let mut patch = json!({});
+        // Collect all results from the action
+        let mut results = Vec::new();
         while let Ok(v) = rx.try_recv() {
-            self.deep_merge(&mut patch, v);
+            results.push(v);
         }
-        Ok(patch)
+        
+        // Return the last result or an empty object if no results
+        Ok(results.last().cloned().unwrap_or_else(|| json!({})))
     }
 
     async fn run_wasm_step(
@@ -622,25 +571,9 @@ impl ExecutionEngine {
         if which("wasmtime").is_err() {
             bail!("`wasmtime` not found on PATH.");
         }
-        
-        // Test wasmtime availability
-        println!("🔍 Testing wasmtime availability...");
-        let test_result = Command::new("wasmtime").arg("--version").output().await;
-        match test_result {
-            Ok(output) => {
-                let version = String::from_utf8_lossy(&output.stdout);
-                println!("✅ wasmtime version: {}", version.trim());
-            },
-            Err(e) => {
-                println!("❌ wasmtime test failed: {}", e);
-                return Err(anyhow::anyhow!("wasmtime is not working properly: {}", e));
-            }
-        }
 
         // ensure we have the .wasm component locally
-        println!("📥 Downloading WASM module for: {}", step.ref_);
         let module_path = self.client.download_wasm(&step.ref_, &self.cache_dir).await?;
-        println!("📁 WASM module path: {:?}", module_path);
         
         // Verify the WASM file exists and is readable
         if !module_path.exists() {
@@ -651,19 +584,14 @@ impl ExecutionEngine {
         if let Err(e) = std::fs::metadata(&module_path) {
             return Err(anyhow::anyhow!("WASM file not accessible at {:?}: {}", module_path, e));
         }
-        
-        println!("✅ WASM module verified and ready for execution");
 
         // build stdin payload - use the pre-built parameters
         let input_json = serde_json::to_string(state_in)?;
-        println!("📤 Input JSON: {}", input_json);
 
         // Construct command
         let mut cmd = Command::new("wasmtime");
         cmd.arg("-S").arg("http");
         cmd.arg(&module_path);
-        
-        println!("🚀 Executing command: wasmtime -S http {:?}", module_path);
 
         // optional: pass extra args defined in step.args
         for a in &step.args { cmd.arg(a); }
@@ -677,22 +605,12 @@ impl ExecutionEngine {
         }
 
         // spawn with piped stdio
-        println!("🔄 Spawning wasmtime process...");
-        let mut child = match cmd
+        let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-        {
-            Ok(child) => {
-                println!("✅ wasmtime process spawned successfully");
-                child
-            },
-            Err(e) => {
-                println!("❌ Failed to spawn wasmtime process: {}", e);
-                return Err(anyhow::anyhow!("Failed to spawn wasmtime for step {}: {}", step.id, e));
-            }
-        };
+            .map_err(|e| anyhow::anyhow!("Failed to spawn wasmtime for step {}: {}", step.id, e))?;
 
         // feed stdin JSON
         if let Some(stdin) = child.stdin.as_mut() {
@@ -706,33 +624,20 @@ impl ExecutionEngine {
         let mut out_reader = BufReader::new(stdout).lines();
         let mut err_reader = BufReader::new(stderr).lines();
 
-        let tag_out = format!("[{}][stdout] ", step.id);
-        let tag_err = format!("[{}][stderr] ", step.id);
         let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-        let quiet_logs = false;
 
-        let tag_err_for_out = tag_err.clone();
-        let tag_out_for_out = tag_out.clone();
         let pump_out = tokio::spawn(async move {
             while let Ok(Some(line)) = out_reader.next_line().await {
-                if let Some(idx) = line.find(ST_MARKER) {
-                    let json_part = &line[idx + ST_MARKER.len()..];
-                    if let Ok(v) = serde_json::from_str::<Value>(json_part) {
+                // Try to parse the line directly as JSON
+                if let Ok(v) = serde_json::from_str::<Value>(&line) {
                         let _ = tx.send(v);
-                    } else if !quiet_logs {
-                        eprintln!("{}[marker-parse-error] {}", tag_err_for_out, line);
-                    }
-                    if !quiet_logs { println!("{}{}", tag_out_for_out, line); }
-                } else if !quiet_logs {
-                    println!("{}{}", tag_out_for_out, line);
                 }
             }
         });
 
-        let tag_err_for_err = tag_err;
         let pump_err = tokio::spawn(async move {
-            while let Ok(Some(line)) = err_reader.next_line().await {
-                if !quiet_logs { eprintln!("{}{}", tag_err_for_err, line); }
+            while let Ok(Some(_line)) = err_reader.next_line().await {
+                // Just consume stderr without logging
             }
         });
 
@@ -744,12 +649,14 @@ impl ExecutionEngine {
             bail!("step '{}' failed with {}", step.id, status);
         }
 
-        // merge all patches
-        let mut patch = json!({});
+        // Collect all results from the action
+        let mut results = Vec::new();
         while let Ok(v) = rx.try_recv() { 
-            self.deep_merge(&mut patch, v); 
+            results.push(v);
         }
-        Ok(patch)
+        
+        // Return the last result or an empty object if no results
+        Ok(results.last().cloned().unwrap_or_else(|| json!({})))
     }
 
     fn absolutize(&self, p: &str, base: Option<&str>) -> Result<String> {
@@ -765,14 +672,4 @@ impl ExecutionEngine {
         Ok(abs.canonicalize()?.to_string_lossy().to_string())
     }
 
-    fn deep_merge(&self, a: &mut Value, b: Value) {
-        match (a, b) {
-            (Value::Object(ao), Value::Object(bo)) => {
-                for (k, v) in bo { 
-                    self.deep_merge(ao.entry(k).or_insert(Value::Null), v); 
-                }
-            }
-            (a_slot, b_val) => { *a_slot = b_val; }
-        }
-    }
 }

@@ -119,8 +119,6 @@ async fn handle_run(
     Json(payload): Json<Value>
 ) -> Json<Value> {
     // Handle the /api/run endpoint that InputsComponent expects
-    println!("📥 Run request: {:?}", payload);
-    
     // Extract action and inputs from payload
     let action = payload.get("action")
         .and_then(|v| v.as_str())
@@ -131,9 +129,6 @@ async fn handle_run(
         .cloned()
         .unwrap_or_default();
     
-    println!("📥 Action: {}", action);
-    println!("📥 Inputs: {:?}", inputs);
-    
     // Convert inputs to HashMap<String, Value>
     let mut input_map = HashMap::new();
     for (key, value) in inputs {
@@ -143,8 +138,6 @@ async fn handle_run(
     // Execute the action
     match state.execution_engine.execute_action(action, input_map).await {
         Ok(result) => {
-            println!("✅ Execution completed successfully");
-            
             // Send execution result via WebSocket
             let result_msg = json!({
                 "type": "execution_complete",
@@ -165,8 +158,6 @@ async fn handle_run(
             }))
         }
         Err(e) => {
-            println!("❌ Execution failed: {}", e);
-            
             // Send error via WebSocket
             let error_msg = json!({
                 "type": "execution_error",
