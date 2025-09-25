@@ -13,8 +13,8 @@ pub struct ShManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     pub license: String,
-    pub inputs: Vec<ShPort>,
-    pub outputs: Vec<ShPort>,
+    pub inputs: std::collections::HashMap<String, serde_json::Value>,
+    pub outputs: std::collections::HashMap<String, serde_json::Value>,
     // Custom type definitions
     #[serde(default)]
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -97,6 +97,8 @@ pub enum ShType {
     Boolean,
     Object,
     Array,
+    // Custom types are allowed
+    Custom(String),
 }
 
 impl serde::Serialize for ShType {
@@ -110,6 +112,7 @@ impl serde::Serialize for ShType {
             ShType::Boolean => "boolean",
             ShType::Object => "object",
             ShType::Array => "array",
+            ShType::Custom(custom_type) => custom_type,
         };
         serializer.serialize_str(s)
     }
@@ -127,7 +130,7 @@ impl<'de> serde::Deserialize<'de> for ShType {
             "boolean" => Ok(ShType::Boolean),
             "object" => Ok(ShType::Object),
             "array" => Ok(ShType::Array),
-            _ => Err(serde::de::Error::unknown_variant(&s, &["string", "number", "boolean", "object", "array"])),
+            custom_type => Ok(ShType::Custom(custom_type.to_string())),
         }
     }
 }
@@ -140,6 +143,13 @@ pub struct ShActionStep {
     pub with: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    // Additional fields for composition steps
+    #[serde(default)]
+    pub types: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(default)]
+    pub inputs: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub outputs: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,15 +223,87 @@ impl HubClient {
 
 
     pub async fn download_wasm(&self, action_ref: &str, cache_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
-        // Implementation for downloading WASM modules
-        // This would download and cache the WASM module
-        let wasm_path = cache_dir.join(format!("{}.wasm", action_ref.replace('/', "_")));
-        if wasm_path.exists() {
-            return Ok(wasm_path);
+        // Ensure base cache directory exists
+        if let Err(e) = std::fs::create_dir_all(cache_dir) {
+            return Err(anyhow::anyhow!("Failed to create base cache directory {:?}: {}", cache_dir, e));
         }
         
-        // TODO: Implement actual download logic
-        Err(anyhow::anyhow!("WASM download not implemented yet"))
+        // Convert action_ref from "org/name:version" to "org/name/version" format
+        let url_path = action_ref.replace(":", "/");
+        let artifacts_url = format!(
+            "https://api.starthub.so/storage/v1/object/public/artifacts/{}/artifact.zip",
+            url_path
+        );
+        
+        // Create action-specific cache directory
+        let action_cache_dir = cache_dir.join(action_ref.replace('/', "_").replace(":", "_"));
+        println!("📁 Creating cache directory: {:?}", action_cache_dir);
+        
+        // Create directory if it doesn't exist
+        if let Err(e) = std::fs::create_dir_all(&action_cache_dir) {
+            return Err(anyhow::anyhow!("Failed to create cache directory {:?}: {}", action_cache_dir, e));
+        }
+        
+        // Download the artifacts zip file
+        let response = reqwest::get(&artifacts_url).await?;
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("Failed to download artifacts from {}", artifacts_url));
+        }
+        
+        let zip_data = response.bytes().await?;
+        
+        // Extract the zip file
+        let cursor = std::io::Cursor::new(zip_data);
+        let mut archive = zip::ZipArchive::new(cursor)?;
+        archive.extract(&action_cache_dir)?;
+        
+        // Find the WASM file (could be main.wasm, or named after the action)
+        let wasm_files: Vec<_> = std::fs::read_dir(&action_cache_dir)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                if let Some(path) = entry.path().file_name() {
+                    if let Some(name) = path.to_str() {
+                        return name.ends_with(".wasm");
+                    }
+                }
+                false
+            })
+            .collect();
+        
+        if wasm_files.is_empty() {
+            return Err(anyhow::anyhow!("No WASM file found in extracted artifacts"));
+        }
+        
+        // Rename the WASM file to "artifact.wasm" for consistency
+        let original_wasm_path = wasm_files[0].path();
+        let artifact_path = action_cache_dir.join("artifact.wasm");
+        
+        println!("📄 Found WASM file: {:?}", original_wasm_path);
+        println!("📄 Target artifact path: {:?}", artifact_path);
+        
+        // Remove existing artifact.wasm if it exists
+        if artifact_path.exists() {
+            println!("🗑️ Removing existing artifact.wasm");
+            std::fs::remove_file(&artifact_path)?;
+        }
+        
+        // Rename the found WASM file to artifact.wasm
+        println!("🔄 Renaming WASM file to artifact.wasm");
+        std::fs::rename(&original_wasm_path, &artifact_path)?;
+        
+        // Verify the final file exists and is accessible
+        if !artifact_path.exists() {
+            return Err(anyhow::anyhow!("Failed to create artifact.wasm at {:?}", artifact_path));
+        }
+        
+        // Check file permissions
+        if let Err(e) = std::fs::metadata(&artifact_path) {
+            return Err(anyhow::anyhow!("Artifact.wasm not accessible at {:?}: {}", artifact_path, e));
+        }
+        
+        println!("✅ Downloaded and extracted WASM artifacts for {}", action_ref);
+        println!("✅ Final artifact path: {:?}", artifact_path);
+        Ok(artifact_path)
     }
 
     pub async fn download_starthub_lock(&self, storage_url: &str) -> anyhow::Result<ShManifest> {
@@ -229,7 +311,13 @@ impl HubClient {
         let response = client.get(storage_url).send().await?;
         
         if response.status().is_success() {
-            let manifest: ShManifest = response.json().await?;
+            // Log the response body for debugging
+            let response_text = response.text().await?;
+            println!("📄 Response body: {}", response_text);
+            
+            // Try to parse the JSON
+            let manifest: ShManifest = serde_json::from_str(&response_text)
+                .map_err(|e| anyhow::anyhow!("JSON parsing error: {} - Response: {}", e, response_text))?;
             Ok(manifest)
         } else {
             Err(anyhow::anyhow!("Failed to download starthub-lock.json: {}", response.status()))

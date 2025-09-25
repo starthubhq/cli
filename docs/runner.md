@@ -24,6 +24,12 @@ The runner follows a **recursive dependency resolution** pattern:
 │   Execute Plan  │◀───│ Build Execution │◀───│ Resolve Dependencies │
 │  (WASM/Docker)  │    │      Plan       │    │   (recursive)   │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
+                                                         │
+                                                         ▼
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ Download & Extract │───▶│   Ready for     │    │   Composition   │
+│   artifacts.zip  │    │   Execution     │    │   (recursive)   │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
 
 ## Core Components
@@ -35,10 +41,11 @@ The main orchestrator that coordinates the entire execution process. It manages 
 Recursively resolves all dependencies by following this algorithm:
 
 1. **Check for circular dependencies** - Prevent infinite recursion
-2. **Download action metadata** - Get basic information about the action
-3. **Construct storage URL** - Build the path to the starthub-lock.json file in the artifacts folder
-4. **Download and parse starthub-lock.json** - Get the action lock file
-5. **Recursively resolve each step** - Continue until all dependencies are atomic
+2. **Construct storage URL** - Build the path to the starthub-lock.json file in the artifacts folder
+3. **Download and parse starthub-lock.json** - Get the action lock file
+4. **Handle action type**:
+   - **WASM/Docker actions**: Download and extract artifacts.zip from the same location
+   - **Composition actions**: Recursively process each step until all dependencies are atomic
 
 ### 3. Execution Plan
 Represents the resolved dependency graph ready for execution. It contains an ordered list of execution steps and working directory configuration.
