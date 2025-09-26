@@ -220,17 +220,22 @@ impl HubClient {
 
 
     pub async fn download_wasm(&self, action_ref: &str, cache_dir: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+        
         // Ensure base cache directory exists
         if let Err(e) = std::fs::create_dir_all(cache_dir) {
             return Err(anyhow::anyhow!("Failed to create base cache directory {:?}: {}", cache_dir, e));
         }
         
         // Convert action_ref from "org/name:version" to "org/name/version" format
-        let url_path = action_ref.replace(":", "/");
+        // Also strip "github.com/" prefix if present
+        let url_path = action_ref
+            .replace("github.com/", "")
+            .replace(":", "/");
         let artifacts_url = format!(
             "https://api.starthub.so/storage/v1/object/public/artifacts/{}/artifact.zip",
             url_path
         );
+        
         
         // Create action-specific cache directory
         let action_cache_dir = cache_dir.join(action_ref.replace('/', "_").replace(":", "_"));
@@ -265,6 +270,7 @@ impl HubClient {
                 false
             })
             .collect();
+        
         
         if wasm_files.is_empty() {
             return Err(anyhow::anyhow!("No WASM file found in extracted artifacts"));
