@@ -198,6 +198,7 @@ pub struct StepSpec {
     pub entry: Option<String>,
     pub mounts: Vec<MountSpec>,
     pub step_definition: Option<serde_json::Value>,
+    pub calling_step_definition: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,15 +278,11 @@ impl HubClient {
         if original_wasm_path != artifact_path {
             // Remove existing artifact.wasm if it exists
             if artifact_path.exists() {
-                println!("🗑️ Removing existing artifact.wasm");
                 std::fs::remove_file(&artifact_path)?;
             }
             
             // Rename the found WASM file to artifact.wasm
-            println!("🔄 Renaming WASM file to artifact.wasm");
             std::fs::rename(&original_wasm_path, &artifact_path)?;
-        } else {
-            println!("✅ WASM file is already named artifact.wasm, no rename needed");
         }
         
         // Verify the final file exists and is accessible

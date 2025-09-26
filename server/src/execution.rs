@@ -11,17 +11,31 @@ use crate::models::{ShManifest, ShKind, HubClient, StepSpec};
 // Constants
 const ST_MARKER: &str = "::starthub:state::";
 
+// Data flow edge representing a variable dependency between steps
+#[derive(Debug, Clone, serde::Serialize)]
+struct DataFlowEdge {
+    from_step: String,      // Source step name (or "inputs" for initial inputs)
+    to_step: String,        // Destination step name
+    variable_name: String,  // The variable name being passed
+    source_path: String,    // Path in source (e.g., "outputs.lat" or "open_weather_config.location_name")
+    target_path: String,    // Path in target (e.g., "lat" or "location_name")
+}
+
 // Execution state to track inputs and outputs of each step
 #[derive(Debug, Clone, serde::Serialize)]
 struct ExecutionState {
     inputs: HashMap<String, Value>,
     steps: Vec<StepState>,
+    data_flow: Vec<DataFlowEdge>, // Global data flow mapping
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct StepState {
     id: String,
+    original_name: String, // Original step name from the composition
     uses: String,
+    kind: String,
+    ref_: String,
     inputs: HashMap<String, Value>,
     outputs: HashMap<String, Value>,
 }
@@ -49,13 +63,12 @@ impl ExecutionEngine {
     }
 
     pub async fn execute_action(&self, action_ref: &str, inputs: HashMap<String, Value>) -> Result<Value> {
-        
         // Ensure cache directory exists before starting execution
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
             return Err(anyhow::anyhow!("Failed to create cache directory: {}", e));
         }
         
-        // Recursively resolve all manifests and their dependencies
+        // 1. Download the manifest of the action
         let manifests = self.fetch_all_action_manifests(action_ref).await?;
         if manifests.is_empty() {
             return Err(anyhow::anyhow!("No action definition found for: {}", action_ref));
@@ -63,17 +76,36 @@ impl ExecutionEngine {
         
         let main_manifest = &manifests[0];
         
-        // Handle different action types
-        match main_manifest.kind {
-            Some(crate::models::ShKind::Wasm) | Some(crate::models::ShKind::Docker) => {
-                // Simple action - create a single step
+        // 2. Apply topological sorting to composition steps BEFORE flattening
+        let sorted_composition_steps = self.topological_sort_composition_steps(main_manifest).await?;
+        
+        // 3. Flatten the topologically sorted composition steps into atomic steps
+        let execution_steps = self.flatten_sorted_steps_to_atomic(sorted_composition_steps, &inputs, action_ref).await?;
+    
+        // 4. Prepare steps and store them in state
+        let mut execution_state = self.prepare_atomic_steps(&execution_steps, &inputs).await?;
+        
+        // Print the execution steps
+        println!("Execution state: {:#?}", execution_state);
+        
+        // 5. Execute the prepared steps
+        self.execute_prepared_steps(&mut execution_state).await
+    }
+
+    async fn convert_composite_steps_to_execution(&self, manifest: &ShManifest, _inputs: &HashMap<String, Value>, action_ref: &str) -> Result<Vec<StepSpec>> {
+        let mut execution_steps = Vec::new();
+        
+        // If this is a simple action (WASM/Docker) with no steps, create a single step
+        if manifest.steps.is_empty() {
+            let step_kind = match manifest.kind {
+                Some(crate::models::ShKind::Wasm) => "wasm",
+                Some(crate::models::ShKind::Docker) => "docker",
+                _ => "wasm", // Default fallback
+            };
+            
                 let step = StepSpec {
                     id: "main".to_string(),
-                    kind: match main_manifest.kind {
-                        Some(crate::models::ShKind::Wasm) => "wasm".to_string(),
-                        Some(crate::models::ShKind::Docker) => "docker".to_string(),
-                        _ => unreachable!(),
-                    },
+                kind: step_kind.to_string(),
                     ref_: action_ref.to_string(),
                     args: vec![],
                     env: std::collections::HashMap::new(),
@@ -81,29 +113,15 @@ impl ExecutionEngine {
                     network: None,
                     entry: None,
                     mounts: vec![],
-                    step_definition: None,
-                };
-                
-                
-                // Execute the single step
-                self.execute_all_steps(&[step], &inputs).await
-            },
-            Some(crate::models::ShKind::Composition) | None => {
-                // Composite action - process steps
-                
-                // Convert steps to execution format
-                let execution_steps = self.convert_composite_steps_to_execution(main_manifest, &inputs).await?;
-                
-                
-                // Execute all steps in order
-                self.execute_all_steps(&execution_steps, &inputs).await
-            }
+                step_definition: None,
+                calling_step_definition: None,
+            };
+            
+            execution_steps.push(step);
+            return Ok(execution_steps);
         }
-    }
-
-    async fn convert_composite_steps_to_execution(&self, manifest: &ShManifest, _inputs: &HashMap<String, Value>) -> Result<Vec<StepSpec>> {
-        let mut execution_steps = Vec::new();
         
+        // Process composite action steps
         for (step_id, step_data) in &manifest.steps {
             
             // Parse step data
@@ -116,17 +134,26 @@ impl ExecutionEngine {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Step {} 'uses' field is not a string", step_id))?;
             
-            // Determine step kind based on the action being used
-            let step_kind = if uses_data.contains("http-get-wasm") {
-                "wasm"
-            } else if uses_data.contains("docker") {
-                "docker"
-            } else {
-                // Default to WASM for now
-                "wasm"
-            };
+            // Fetch the step's manifest to determine its actual kind
+            let step_manifests = self.fetch_all_action_manifests(uses_data).await?;
+            let step_manifest = step_manifests.first()
+                .ok_or_else(|| anyhow::anyhow!("No manifest found for step: {}", uses_data))?;
             
-            // Create execution step
+            // Check if this is a composition step that needs to be expanded
+            match step_manifest.kind {
+                Some(crate::models::ShKind::Composition) => {
+                    // Recursively expand composition steps into their atomic steps
+                    let expanded_steps = Box::pin(self.convert_composite_steps_to_execution(step_manifest, _inputs, uses_data)).await?;
+                    execution_steps.extend(expanded_steps);
+                },
+                _ => {
+                    // Create atomic step (WASM/Docker)
+                    let step_kind = match step_manifest.kind {
+                        Some(crate::models::ShKind::Wasm) => "wasm",
+                        Some(crate::models::ShKind::Docker) => "docker",
+                        _ => "wasm", // Default fallback
+                    };
+                    
             let execution_step = StepSpec {
                 id: step_id.clone(),
                 kind: step_kind.to_string(),
@@ -137,17 +164,199 @@ impl ExecutionEngine {
                 network: None,
                 entry: None,
                 mounts: vec![],
-                step_definition: Some(step_data.clone()),
+                        step_definition: Some(step_data.clone()),
+                        calling_step_definition: Some(step_data.clone()),
             };
             
             execution_steps.push(execution_step);
+        }
+            }
+        }
+        
+        
+        Ok(execution_steps)
+    }
+    
+    async fn topological_sort_composition_steps(&self, manifest: &ShManifest) -> Result<Vec<(String, serde_json::Value)>> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+        
+        // Build dependency graph by analyzing template variables in composition steps
+        let mut dependencies: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut in_degree: HashMap<String, usize> = HashMap::new();
+        
+        // Initialize all composition steps
+        for (step_id, _) in &manifest.steps {
+            dependencies.insert(step_id.clone(), HashSet::new());
+            in_degree.insert(step_id.clone(), 0);
+        }
+        
+        // Analyze dependencies by looking at template variables in step definitions
+        for (step_id, step_data) in &manifest.steps {
+            let step_deps = self.extract_composition_step_dependencies(step_data)?;
+            for dep in step_deps {
+                if dependencies.contains_key(&dep) {
+                    dependencies.get_mut(&dep).unwrap().insert(step_id.clone());
+                    *in_degree.get_mut(step_id).unwrap() += 1;
+                }
+            }
+        }
+        
+        // Topological sort using Kahn's algorithm
+        let mut queue: VecDeque<String> = in_degree.iter()
+            .filter(|(_, &count)| count == 0)
+            .map(|(step_id, _)| step_id.clone())
+            .collect();
+        
+        let mut sorted_steps = Vec::new();
+        let mut iterations = 0;
+        
+        while let Some(current_step) = queue.pop_front() {
+            iterations += 1;
+            
+            // Add the step to sorted list
+            if let Some(step_data) = manifest.steps.get(&current_step) {
+                sorted_steps.push((current_step.clone(), step_data.clone()));
+            }
+            
+            // Update in-degree for dependent steps
+            if let Some(deps) = dependencies.get(&current_step) {
+                for dependent_step in deps {
+                    if let Some(count) = in_degree.get_mut(dependent_step) {
+                        *count -= 1;
+                        if *count == 0 {
+                            queue.push_back(dependent_step.clone());
+                        }
+                    }
+                }
+            }
+            
+            // Safety check to prevent infinite loops
+            if iterations > 100 {
+                return Err(anyhow::anyhow!("Topological sort exceeded maximum iterations"));
+            }
+        }
+        
+        
+        // Check for cycles
+        if sorted_steps.len() != manifest.steps.len() {
+            return Err(anyhow::anyhow!("Circular dependency detected in composition steps"));
+        }
+        
+        Ok(sorted_steps)
+    }
+    
+    fn extract_composition_step_dependencies(&self, step_data: &serde_json::Value) -> Result<Vec<String>> {
+        let mut dependencies = Vec::new();
+        
+        // Recursively search for template variables like {{step_name.field}}
+        self.find_template_dependencies(step_data, &mut dependencies)?;
+        
+        Ok(dependencies)
+    }
+    
+    async fn flatten_sorted_steps_to_atomic(&self, sorted_steps: Vec<(String, serde_json::Value)>, _inputs: &HashMap<String, Value>, _action_ref: &str) -> Result<Vec<StepSpec>> {
+        let mut execution_steps = Vec::new();
+        
+        for (step_id, step_data) in sorted_steps {
+            // Parse step data
+            let step_obj = step_data.as_object()
+                .ok_or_else(|| anyhow::anyhow!("Step {} is not an object", step_id))?;
+            
+            // Extract the 'uses' field
+            let uses_data = step_obj.get("uses")
+                .ok_or_else(|| anyhow::anyhow!("Step {} missing 'uses' field", step_id))?
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Step {} 'uses' field is not a string", step_id))?;
+            
+            // Fetch the step's manifest to determine its actual kind
+            let step_manifests = self.fetch_all_action_manifests(uses_data).await?;
+            let step_manifest = step_manifests.first()
+                .ok_or_else(|| anyhow::anyhow!("No manifest found for step: {}", uses_data))?;
+            
+            // Check if this is a composition step that needs to be expanded
+            match step_manifest.kind {
+                Some(crate::models::ShKind::Composition) => {
+                    // Recursively expand composition steps into their atomic steps
+                    let expanded_steps = Box::pin(self.convert_composite_steps_to_execution(step_manifest, _inputs, uses_data)).await?;
+                    execution_steps.extend(expanded_steps);
+                },
+                _ => {
+                    // Create atomic step (WASM/Docker)
+                    let step_kind = match step_manifest.kind {
+                        Some(crate::models::ShKind::Wasm) => "wasm",
+                        Some(crate::models::ShKind::Docker) => "docker",
+                        _ => "wasm", // Default fallback
+                    };
+                    
+                    
+                    // Fetch the target action's step definition
+                    let target_step_definition = if let Some(target_step) = step_manifest.steps.get(&step_id) {
+                        Some(target_step.clone())
+                    } else {
+                        None
+                    };
+                    
+                    let execution_step = StepSpec {
+                        id: step_id.clone(),
+                        kind: step_kind.to_string(),
+                        ref_: uses_data.to_string(),
+                        args: vec![],
+                        env: std::collections::HashMap::new(),
+                        workdir: None,
+                        network: None,
+                        entry: None,
+                        mounts: vec![],
+                        step_definition: target_step_definition,
+                        calling_step_definition: Some(step_data.clone()), // This should be the composition step definition
+                    };
+                    
+                    execution_steps.push(execution_step);
+                }
+            }
         }
         
         Ok(execution_steps)
     }
     
     
-    async fn execute_all_steps(&self, steps: &[StepSpec], inputs: &HashMap<String, Value>) -> Result<Value> {
+    fn find_template_dependencies(&self, value: &Value, deps: &mut Vec<String>) -> Result<()> {
+        match value {
+            Value::String(s) => {
+                // Look for patterns like {{step_name.field}} (but not {{inputs.field}})
+                let re = regex::Regex::new(r"\{\{([^}]+)\}\}")?;
+                for cap in re.captures_iter(s) {
+                    if let Some(match_str) = cap.get(1) {
+                        let template = match_str.as_str();
+                        // Only extract step dependencies, not input dependencies
+                        if !template.starts_with("inputs.") {
+                            // Extract step name from template (e.g., "get_coordinates.coordinates.lat" -> "get_coordinates")
+                            if let Some(dot_pos) = template.find('.') {
+                                let step_name = &template[..dot_pos];
+                                if !deps.contains(&step_name.to_string()) {
+                                    deps.push(step_name.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            Value::Object(obj) => {
+                for (_, v) in obj {
+                    self.find_template_dependencies(v, deps)?;
+                }
+            },
+            Value::Array(arr) => {
+                for item in arr {
+                    self.find_template_dependencies(item, deps)?;
+                }
+            },
+            _ => {}
+        }
+        
+        Ok(())
+    }
+    
+    async fn prepare_atomic_steps(&self, steps: &[StepSpec], inputs: &HashMap<String, Value>) -> Result<ExecutionState> {
         // Parse stringified JSON values in inputs
         let mut parsed_inputs = HashMap::new();
         for (key, value) in inputs {
@@ -167,46 +376,185 @@ impl ExecutionEngine {
         let mut execution_state = ExecutionState {
             inputs: parsed_inputs,
             steps: Vec::new(),
+            data_flow: Vec::new(),
         };
         
-        for step in steps {
+        // Prepare steps without executing them
+        for step in steps.iter() {
             // Generate UUID for this step
             let step_id = uuid::Uuid::new_v4().to_string();
             
             // Build parameters for this step using the execution state
             let step_params = self.build_step_parameters_from_state(step, &execution_state).await?;
             
-            // Log execution state and step inputs
-            println!("📊 Execution State:");
-            println!("  Inputs: {}", serde_json::to_string_pretty(&execution_state.inputs)?);
-            println!("  Steps completed: {}", execution_state.steps.len());
-            println!("📤 Step '{}' inputs:", step.id);
-            println!("{}", serde_json::to_string_pretty(&step_params)?);
+            // Analyze template variables to build data flow edges
+            let data_flow_edges = self.analyze_data_flow_edges(step, &step.id)?;
+            execution_state.data_flow.extend(data_flow_edges);
             
-            // Execute the step
-            let result = match step.kind.as_str() {
-                "wasm" => self.run_wasm_step(step, None, &step_params).await?,
-                "docker" => self.run_docker_step(step, None, &step_params).await?,
-                _ => return Err(anyhow::anyhow!("Unknown step kind: {}", step.kind)),
-            };
-            
-            // Log step output
-            println!("📥 Step '{}' outputs:", step.id);
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            
-            // Store the step state in execution state
+            // Store the step state in execution state (without outputs yet)
             let step_state = StepState {
                 id: step_id,
+                original_name: step.id.clone(), // Use the original step name from the composition
                 uses: step.ref_.clone(),
+                kind: step.kind.clone(),
+                ref_: step.ref_.clone(),
                 inputs: step_params.as_object().unwrap().clone().into_iter().collect(),
-                outputs: result.as_object().unwrap().clone().into_iter().collect(),
+                outputs: HashMap::new(), // Empty outputs initially
             };
             execution_state.steps.push(step_state);
         }
         
-        // Log the final execution state
-        println!("📊 Final Execution State:");
-        println!("{}", serde_json::to_string_pretty(&execution_state)?);
+        Ok(execution_state)
+    }
+    
+    fn analyze_data_flow_edges(&self, step: &StepSpec, step_name: &str) -> Result<Vec<DataFlowEdge>> {
+        let mut data_flow_edges = Vec::new();
+        
+        // Analyze the calling step definition to find template variables
+        if let Some(calling_step_def) = &step.calling_step_definition {
+            // Focus on the 'inputs' field of the step definition
+            if let Some(inputs_obj) = calling_step_def.get("inputs").and_then(|v| v.as_object()) {
+                for (input_key, input_value) in inputs_obj {
+                    self.analyze_template_variables_for_data_flow(input_value, step_name, input_key, &mut data_flow_edges)?;
+                }
+            }
+        }
+        
+        Ok(data_flow_edges)
+    }
+    
+    fn analyze_template_variables_for_data_flow(&self, value: &Value, target_step: &str, input_key: &str, data_flow_edges: &mut Vec<DataFlowEdge>) -> Result<()> {
+        self.analyze_template_variables_for_data_flow_recursive(value, target_step, input_key, data_flow_edges)
+    }
+    
+    fn analyze_template_variables_for_data_flow_recursive(&self, value: &Value, target_step: &str, current_path: &str, data_flow_edges: &mut Vec<DataFlowEdge>) -> Result<()> {
+        match value {
+            Value::String(s) => {
+                // Check if this string contains template variables
+                if s.contains("{{") {
+                    // Extract all template variables in this string
+                    let re = regex::Regex::new(r"\{\{([^}]+)\}\}")?;
+                    let mut has_inputs = false;
+                    let mut step_dependencies = Vec::new();
+                    
+                    for cap in re.captures_iter(s) {
+                        if let Some(match_str) = cap.get(1) {
+                            let template = match_str.as_str();
+                            
+                            if template.starts_with("inputs.") {
+                                has_inputs = true;
+                            } else if let Some(dot_pos) = template.find('.') {
+                                let step_name = &template[..dot_pos];
+                                if !step_dependencies.contains(&step_name.to_string()) {
+                                    step_dependencies.push(step_name.to_string());
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Create edges based on what we found
+                    if has_inputs {
+                        data_flow_edges.push(DataFlowEdge {
+                            from_step: "inputs".to_string(),
+                            to_step: target_step.to_string(),
+                            variable_name: current_path.to_string(),
+                            source_path: "inputs".to_string(),
+                            target_path: current_path.to_string(),
+                        });
+                    }
+                    
+                    for step_name in step_dependencies {
+                        data_flow_edges.push(DataFlowEdge {
+                            from_step: step_name,
+                            to_step: target_step.to_string(),
+                            variable_name: current_path.to_string(),
+                            source_path: "outputs".to_string(),
+                            target_path: current_path.to_string(),
+                        });
+                    }
+                }
+            },
+            Value::Object(obj) => {
+                for (key, v) in obj {
+                    let new_path = if current_path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{}.{}", current_path, key)
+                    };
+                    self.analyze_template_variables_for_data_flow_recursive(v, target_step, &new_path, data_flow_edges)?;
+                }
+            },
+            Value::Array(arr) => {
+                for (index, item) in arr.iter().enumerate() {
+                    let new_path = if current_path.is_empty() {
+                        format!("[{}]", index)
+                    } else {
+                        format!("{}[{}]", current_path, index)
+                    };
+                    self.analyze_template_variables_for_data_flow_recursive(item, target_step, &new_path, data_flow_edges)?;
+                }
+            },
+            _ => {}
+        }
+        
+        Ok(())
+    }
+    
+    async fn execute_prepared_steps(&self, execution_state: &mut ExecutionState) -> Result<Value> {
+        let total_steps = execution_state.steps.len();
+        for (i, step_state) in execution_state.steps.iter_mut().enumerate() {
+            println!("Executing step {}/{}: {}", i + 1, total_steps, step_state.id);
+            
+            // Execute the step using the information stored in the step state
+            let result = match step_state.kind.as_str() {
+                "wasm" => {
+                    let step_params = Value::Object(step_state.inputs.clone().into_iter().collect());
+                    println!("📤 WASM inputs for step '{}': {}", step_state.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
+                    
+                    // Create a temporary StepSpec for the run_wasm_step function
+                    let temp_step = StepSpec {
+                        id: step_state.id.clone(),
+                        kind: step_state.kind.clone(),
+                        ref_: step_state.ref_.clone(),
+                        args: vec![],
+                        env: std::collections::HashMap::new(),
+                        workdir: None,
+                        network: None,
+                        entry: None,
+                        mounts: vec![],
+                        step_definition: None,
+                        calling_step_definition: None,
+                    };
+                    
+                    self.run_wasm_step(&temp_step, None, &step_params).await?
+                },
+                "docker" => {
+                    let step_params = Value::Object(step_state.inputs.clone().into_iter().collect());
+                    println!("📤 Docker inputs for step '{}': {}", step_state.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
+                    
+                    // Create a temporary StepSpec for the run_docker_step function
+                    let temp_step = StepSpec {
+                        id: step_state.id.clone(),
+                        kind: step_state.kind.clone(),
+                        ref_: step_state.ref_.clone(),
+                        args: vec![],
+                        env: std::collections::HashMap::new(),
+                        workdir: None,
+                        network: None,
+                        entry: None,
+                        mounts: vec![],
+                        step_definition: None,
+                        calling_step_definition: None,
+                    };
+                    
+                    self.run_docker_step(&temp_step, None, &step_params).await?
+                },
+                _ => return Err(anyhow::anyhow!("Unknown step kind: {}", step_state.kind)),
+            };
+            
+            // Store the outputs in the step state
+            step_state.outputs = result.as_object().unwrap().clone().into_iter().collect();
+        }
         
         // Return the final execution state
         Ok(serde_json::to_value(execution_state)?)
@@ -275,7 +623,6 @@ impl ExecutionEngine {
         // Create action-specific cache directory
         let action_cache_dir = self.cache_dir.join(action_ref);
         std::fs::create_dir_all(&action_cache_dir)?;
-        println!("📁 Cache directory: {}", action_cache_dir.display());
         
         // Download the artifacts zip file
         let response = reqwest::get(&artifacts_url).await?;
@@ -290,7 +637,6 @@ impl ExecutionEngine {
         let mut archive = zip::ZipArchive::new(cursor)?;
         archive.extract(&action_cache_dir)?;
         
-        println!("✅ Artifacts extracted to: {}", action_cache_dir.display());
         
         Ok(())
     }
@@ -298,9 +644,9 @@ impl ExecutionEngine {
 
 
     async fn build_step_parameters_from_state(&self, step: &StepSpec, execution_state: &ExecutionState) -> Result<Value> {
-        // If we have a step definition, process it to build correct parameters
-        if let Some(step_def) = &step.step_definition {
-            return self.process_step_definition_from_state(step_def, execution_state).await;
+        // Use the calling step definition for template processing (this has the correct template variables)
+        if let Some(calling_step_def) = &step.calling_step_definition {
+            return self.process_step_definition_from_state(calling_step_def, execution_state).await;
         }
         
         // Fallback: for simple actions without step definitions, use initial inputs directly
@@ -313,50 +659,25 @@ impl ExecutionEngine {
     }
 
     async fn process_step_definition_from_state(&self, step_def: &Value, execution_state: &ExecutionState) -> Result<Value> {
+        
         let step_obj = step_def.as_object()
             .ok_or_else(|| anyhow::anyhow!("Step definition is not an object"))?;
         
-        // Get the target module reference
-        let uses_ref = step_obj.get("uses")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Step definition missing 'uses' field"))?;
-        
-        // Fetch the target module's manifest to understand its input structure
-        let target_manifests = self.fetch_all_action_manifests(uses_ref).await?;
-        let target_manifest = target_manifests.first()
-            .ok_or_else(|| anyhow::anyhow!("No manifest found for target module: {}", uses_ref))?;
-        
-        // Get the inputs array from the step definition
-        let inputs_array = step_obj.get("inputs")
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Step definition missing 'inputs' array"))?;
+        // Get the inputs object from the step definition (this is from the calling action)
+        let inputs_obj = step_obj.get("inputs")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| anyhow::anyhow!("Step definition missing 'inputs' object"))?;
         
         let mut module_params = Map::new();
         
-        // Get the target module's input field names from its manifest
-        let target_inputs = &target_manifest.inputs;
-        
-                // Process each input in the array and map to target module's expected field names by type
-        for input_item in inputs_array.iter() {
-            if let Some(input_obj) = input_item.as_object() {
-                // Get the type and value
-                if let (Some(input_type), Some(input_value)) = (input_obj.get("type"), input_obj.get("value")) {
-                    let processed_value = self.process_template_variable_from_state(input_value, execution_state)?;
-                    
-                    // Find the field in target manifest that matches this input type
-                    if let Some(input_type_str) = input_type.as_str() {
-                        for (field_name, field_def) in target_inputs {
-                            if let Some(field_type) = field_def.get("type").and_then(|t| t.as_str()) {
-                                if field_type == input_type_str {
-                                    module_params.insert(field_name.clone(), processed_value);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        // Process each input key-value pair directly
+        // The keys should match what the target action expects
+        // The values should be processed template variables from the calling action
+        for (input_key, input_value) in inputs_obj {
+            let processed_value = self.process_template_variable_from_state(input_value, execution_state)?;
+            module_params.insert(input_key.clone(), processed_value);
         }
+        
         
         Ok(Value::Object(module_params))
     }
@@ -390,9 +711,9 @@ impl ExecutionEngine {
                     let section = &caps[2];
                     let path = &caps[3];
                     
-                    // Find step by name (could be step ID or uses reference)
+                    // Find step by original name (this is the key fix!)
                     let step_state = execution_state.steps.iter()
-                        .find(|step| step.id == step_name || step.uses == step_name);
+                        .find(|step| step.original_name == step_name);
                     
                     if let Some(step_state) = step_state {
                         let target_map = match section {
