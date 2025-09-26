@@ -74,7 +74,11 @@ impl ExecutionEngine {
             &parsed_inputs      // Pass inputs for variable resolution
         ).await?;        
         // 6. Execute the action tree
-        self.execute_action_tree(&mut root_action).await
+        println!("Execution tree: {}", serde_json::to_string_pretty(&root_action).unwrap());
+        self.execute_action_recursive(&mut root_action).await?;
+        
+        // Return the final action tree
+        Ok(serde_json::to_value(root_action)?)
     }
 
     fn print_action_hierarchy(&self, action: &ActionState, depth: usize) {
@@ -153,19 +157,22 @@ impl ExecutionEngine {
             data_flow: Vec::new(),
         };
         
-        // 3. Process steps in the order they appear in the manifest
-        for (step_name, step_definition) in &manifest.steps {
-            // 4. Get the uses reference for this step
+        // 3. Topologically sort steps based on dependencies
+        let sorted_steps = self.topological_sort_composition_steps(&manifest).await?;
+        
+        // 4. Process steps in dependency order
+        for (step_name, step_definition) in sorted_steps {
+            // 5. Get the uses reference for this step
             let uses = step_definition.get("uses")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'uses' field in step definition"))?;
             
-            // 5. Download the child manifest to determine its type
+            // 6. Download the child manifest to determine its type
             let child_manifest = self.download_manifest(uses).await?;
             
             match &child_manifest.kind {
                 Some(ShKind::Composition) => {
-                    // 6. Create child composition action with inputs from step definition
+                    // 7. Create child composition action with inputs from step definition
                     let mut child_action = Box::pin(self.build_action_tree(
                         uses,                    // Download the child action manifest
                         Some(&action_name),      // Parent action name
@@ -191,7 +198,7 @@ impl ExecutionEngine {
                     action_state.execution_order.push(child_id);
                 },
                 Some(ShKind::Wasm) | Some(ShKind::Docker) => {
-                    // 7. BASE CASE - create atomic action with proper inputs
+                    // 8. BASE CASE - create atomic action with proper inputs
                     let full_step_name = format!("{}.{}", action_name, step_name);
                     let atomic_step = self.create_atomic_step_from_manifest(
                         &full_step_name,
@@ -728,31 +735,24 @@ impl ExecutionEngine {
         Ok(())
     }
     
-    async fn execute_action_tree(&self, root_action: &mut ActionState) -> Result<Value> {
-        // Execute the root action and all its children
-        self.execute_action_recursive(root_action).await?;
-        
-        // Return the final action tree
-        Ok(serde_json::to_value(root_action)?)
-    }
 
     async fn execute_action_recursive(&self, action: &mut ActionState) -> Result<()> {
-        // Execute children in order
-        for child_id in &action.execution_order {
-            if let Some(child) = action.children.get_mut(child_id) {
-                println!("Executing child action: {}", child.name);
+        println!("Executing action: {} (kind: {})", action.id, action.kind);
+        
+        // Resolve variables for ALL action types (compositions and atomic actions)
+        self.resolve_variables_for_action(action).await?;
+        
+        match action.kind.as_str() {
+            "wasm" | "docker" => {
+                // BASE CASE: Execute atomic action
+                let step_params = Value::Object(action.inputs.clone().into_iter().collect());
+                println!("📤 {} inputs for action '{}': {}", action.kind.to_uppercase(), action.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
                 
-                // Execute the child action
-                let result = match child.kind.as_str() {
-                "wasm" => {
-                        let step_params = Value::Object(child.inputs.clone().into_iter().collect());
-                        println!("📤 WASM inputs for action '{}': {}", child.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
-                    
-                    // Create a temporary StepSpec for the run_wasm_step function
+                // Create a temporary StepSpec for the execution functions
                     let temp_step = StepSpec {
-                            id: child.id.clone(),
-                            kind: child.kind.clone(),
-                            ref_: child.uses.clone(),
+                    id: action.id.clone(),
+                    kind: action.kind.clone(),
+                    ref_: action.uses.clone(),
                         args: vec![],
                         env: std::collections::HashMap::new(),
                         workdir: None,
@@ -763,51 +763,129 @@ impl ExecutionEngine {
                         calling_step_definition: None,
                     };
                     
+                // Execute the atomic action
+                let result = if action.kind == "wasm" {
                     self.run_wasm_step(&temp_step, None, &step_params).await?
-                },
-                "docker" => {
-                        let step_params = Value::Object(child.inputs.clone().into_iter().collect());
-                        println!("📤 Docker inputs for action '{}': {}", child.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
-                    
-                    // Create a temporary StepSpec for the run_docker_step function
-                    let temp_step = StepSpec {
-                            id: child.id.clone(),
-                            kind: child.kind.clone(),
-                            ref_: child.uses.clone(),
-                        args: vec![],
-                        env: std::collections::HashMap::new(),
-                        workdir: None,
-                        network: None,
-                        entry: None,
-                        mounts: vec![],
-                        step_definition: None,
-                        calling_step_definition: None,
-                    };
-                    
+                } else {
                     self.run_docker_step(&temp_step, None, &step_params).await?
-                },
-                    "composition" => {
-                        // For compositions, recursively execute
-                        Box::pin(self.execute_action_recursive(child)).await?;
-                        Value::Object(child.outputs.clone().into_iter().collect())
-                    },
-                    _ => return Err(anyhow::anyhow!("Unknown action kind: {}", child.kind)),
                 };
                 
-                // Store the outputs in the child action
-                println!("📥 Outputs for action '{}': {}", child.name, serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
+                // Store the outputs
+                println!("📥 Outputs for action '{}': {}", action.name, serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
                 if let Some(obj) = result.as_object() {
-                    child.outputs = obj.clone();
+                    action.outputs = obj.clone();
                 } else {
                     // If result is not an object, wrap it in a generic output
                     let mut outputs = serde_json::Map::new();
                     outputs.insert("result".to_string(), result);
-                    child.outputs = outputs;
+                    action.outputs = outputs;
                 }
-            }
+            },
+            "composition" => {
+                // RECURSIVE CASE: Execute children in depth-first order
+                // Clone parent inputs to avoid borrowing conflicts
+                let parent_inputs = action.inputs.clone();
+                
+                for child_id in &action.execution_order {
+                    if let Some(child) = action.children.get_mut(child_id) {
+                        // Resolve variables for child using parent's inputs
+                        self.resolve_variables_for_action_with_parent(child, &parent_inputs).await?;
+                        
+                        // Recursively execute each child
+                        Box::pin(self.execute_action_recursive(child)).await?;
+                    }
+                }
+            },
+            _ => return Err(anyhow::anyhow!("Unknown action kind: {}", action.kind)),
         }
         
         Ok(())
+    }
+    
+    async fn resolve_variables_for_action(&self, action: &mut ActionState) -> Result<()> {
+        println!("🔍 Resolving variables for action: {} (using own inputs)", action.name);
+        println!("   Inputs before resolution: {}", serde_json::to_string_pretty(&action.inputs).unwrap_or_else(|_| "{}".to_string()));
+        
+        // Resolve variables in the action's inputs
+        // Variables can come from two sources:
+        // 1. The action's own inputs ({{inputs.*}})
+        // 2. Sibling actions' outputs ({{step_name.*}})
+        
+        // For now, let's focus on resolving {{inputs.*}} patterns
+        // TODO: Implement sibling variable resolution
+        let mut resolved_inputs = serde_json::Map::new();
+        
+        for (key, value) in &action.inputs {
+            let resolved_value = self.resolve_template_variables(value, &action.inputs)?;
+            resolved_inputs.insert(key.clone(), resolved_value);
+        }
+        
+        action.inputs = resolved_inputs;
+        println!("   Inputs after resolution: {}", serde_json::to_string_pretty(&action.inputs).unwrap_or_else(|_| "{}".to_string()));
+        Ok(())
+    }
+    
+    async fn resolve_variables_for_action_with_parent(&self, action: &mut ActionState, parent_inputs: &serde_json::Map<String, Value>) -> Result<()> {
+        println!("🔍 Resolving variables for action: {} (using parent inputs)", action.name);
+        println!("   Parent inputs: {}", serde_json::to_string_pretty(parent_inputs).unwrap_or_else(|_| "{}".to_string()));
+        println!("   Child inputs before resolution: {}", serde_json::to_string_pretty(&action.inputs).unwrap_or_else(|_| "{}".to_string()));
+        
+        // Resolve variables in the action's inputs using parent's inputs
+        let mut resolved_inputs = serde_json::Map::new();
+        
+        for (key, value) in &action.inputs {
+            let resolved_value = self.resolve_template_variables(value, parent_inputs)?;
+            resolved_inputs.insert(key.clone(), resolved_value);
+        }
+        
+        action.inputs = resolved_inputs;
+        println!("   Child inputs after resolution: {}", serde_json::to_string_pretty(&action.inputs).unwrap_or_else(|_| "{}".to_string()));
+        Ok(())
+    }
+    
+    fn resolve_template_variables(&self, value: &Value, inputs: &serde_json::Map<String, Value>) -> Result<Value> {
+        match value {
+            Value::String(s) => {
+                let mut result = s.clone();
+                
+                // Replace {{inputs.*}} patterns
+                let input_pattern = regex::Regex::new(r"\{\{inputs\.([^}]+)\}\}")?;
+                result = input_pattern.replace_all(&result, |caps: &regex::Captures| {
+                    let path = &caps[1];
+                    println!("     🔍 Looking for path '{}' in inputs", path);
+                    if let Some(value) = self.get_nested_value(inputs, path) {
+                        let resolved = match value {
+                            Value::String(s) => s.clone(),
+                            Value::Number(n) => n.to_string(),
+                            Value::Bool(b) => b.to_string(),
+                            _ => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
+                        };
+                        println!("     ✅ Found value: '{}'", resolved);
+                        resolved
+                    } else {
+                        println!("     ❌ Path '{}' not found in inputs", path);
+                        caps[0].to_string() // Keep original if not found
+                    }
+                }).to_string();
+                
+                Ok(Value::String(result))
+            },
+            Value::Object(obj) => {
+                let mut resolved_obj = serde_json::Map::new();
+                for (key, val) in obj {
+                    resolved_obj.insert(key.clone(), self.resolve_template_variables(val, inputs)?);
+                }
+                Ok(Value::Object(resolved_obj))
+            },
+            Value::Array(arr) => {
+                let mut resolved_arr = Vec::new();
+                for item in arr {
+                    resolved_arr.push(self.resolve_template_variables(item, inputs)?);
+                }
+                Ok(Value::Array(resolved_arr))
+            },
+            other => Ok(other.clone()),
+        }
     }
 
     async fn fetch_all_action_manifests(&self, action_ref: &str) -> Result<Vec<ShManifest>> {
