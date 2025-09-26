@@ -21,23 +21,18 @@ struct DataFlowEdge {
     target_path: String,    // Path in target (e.g., "lat" or "location_name")
 }
 
-// Execution state to track inputs and outputs of each step
 #[derive(Debug, Clone, serde::Serialize)]
-struct ExecutionState {
-    inputs: HashMap<String, Value>,
-    steps: Vec<StepState>,
-    data_flow: Vec<DataFlowEdge>, // Global data flow mapping
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct StepState {
+struct ActionState {
     id: String,
-    original_name: String, // Original step name from the composition
-    uses: String,
-    kind: String,
-    ref_: String,
-    inputs: HashMap<String, Value>,
-    outputs: HashMap<String, Value>,
+    name: String,                    // "get_coordinates" or "get_weather_response"
+    kind: String,                    // "composition", "wasm", "docker"
+    uses: String,                    // Reference to the action
+    inputs: serde_json::Map<String, Value>,
+    outputs: serde_json::Map<String, Value>,
+    parent_action: Option<String>,   // UUID of parent action (None for root)
+    children: HashMap<String, ActionState>, // Nested actions keyed by UUID
+    execution_order: Vec<String>,   // Order of execution within this action
+    data_flow: Vec<DataFlowEdge>,   // Data flow edges for this action and its children
 }
 
 pub struct ExecutionEngine {
@@ -68,28 +63,247 @@ impl ExecutionEngine {
             return Err(anyhow::anyhow!("Failed to create cache directory: {}", e));
         }
         
-        // 1. Download the manifest of the action
-        let manifests = self.fetch_all_action_manifests(action_ref).await?;
-        if manifests.is_empty() {
-            return Err(anyhow::anyhow!("No action definition found for: {}", action_ref));
+        // 1. Parse and prepare inputs
+        let parsed_inputs = self.parse_inputs(&inputs);
+
+        // 2. Build the action tree
+        let mut root_action = self.build_action_tree(
+            action_ref,         // Action reference to download
+            None,               // No parent action name
+            None,               // No parent action ID (root)
+            &parsed_inputs      // Pass inputs for variable resolution
+        ).await?;        
+        // 6. Execute the action tree
+        self.execute_action_tree(&mut root_action).await
+    }
+
+    fn print_action_hierarchy(&self, action: &ActionState, depth: usize) {
+        let indent = "  ".repeat(depth);
+        for child in action.children.values() {
+            println!("{}- {} ({})", indent, child.name, child.kind);
+            self.print_action_hierarchy(child, depth + 1);
+        }
+    }
+
+    fn flatten_actions<'a>(&self, action: &'a ActionState) -> Vec<&'a ActionState> {
+        let mut result = vec![action];
+        for child in action.children.values() {
+            result.extend(self.flatten_actions(child));
+        }
+        result
+    }
+
+    fn parse_inputs(&self, inputs: &HashMap<String, Value>) -> serde_json::Map<String, Value> {
+        let mut parsed_inputs = serde_json::Map::new();
+        for (key, value) in inputs {
+            if let Some(str_value) = value.as_str() {
+                // Try to parse as JSON
+                if let Ok(parsed_json) = serde_json::from_str::<Value>(str_value) {
+                    parsed_inputs.insert(key.clone(), parsed_json);
+                } else {
+                    parsed_inputs.insert(key.clone(), value.clone());
+                }
+            } else {
+                parsed_inputs.insert(key.clone(), value.clone());
+            }
+        }
+        parsed_inputs
+    }
+
+    async fn build_action_tree(
+        &self,
+        action_ref: &str,
+        parent_action_name: Option<&str>,
+        parent_action_id: Option<&str>,
+        global_inputs: &serde_json::Map<String, Value>
+    ) -> Result<ActionState> {
+        // 1. Download the manifest for this action
+        let manifest = self.download_manifest(action_ref).await?;
+        
+        // 2. Create action state
+        let action_id = uuid::Uuid::new_v4().to_string();
+        let action_name = if let Some(parent) = parent_action_name {
+            format!("{}.{}", parent, manifest.name)
+        } else {
+            manifest.name.clone()
+        };
+        let parent_id = action_id.clone();
+        
+        let mut action_state = ActionState {
+            id: action_id,
+            name: action_name.clone(),
+            kind: match &manifest.kind {
+                Some(ShKind::Composition) => "composition".to_string(),
+                Some(ShKind::Wasm) => "wasm".to_string(),
+                Some(ShKind::Docker) => "docker".to_string(),
+                None => return Err(anyhow::anyhow!("Unknown manifest kind for action: {}", action_ref))
+            },
+            uses: action_ref.to_string(),
+            inputs: if parent_action_name.is_none() {
+                // Root action gets the global inputs
+                global_inputs.clone()
+            } else {
+                // Child actions start with empty inputs (will be populated from step definitions)
+                serde_json::Map::new()
+            },
+            outputs: serde_json::Map::new(),
+            parent_action: parent_action_id.map(|s| s.to_string()),
+            children: HashMap::new(),
+            execution_order: Vec::new(),
+            data_flow: Vec::new(),
+        };
+        
+        // 3. Process steps in the order they appear in the manifest
+        for (step_name, step_definition) in &manifest.steps {
+            // 4. Get the uses reference for this step
+            let uses = step_definition.get("uses")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("Missing 'uses' field in step definition"))?;
+            
+            // 5. Download the child manifest to determine its type
+            let child_manifest = self.download_manifest(uses).await?;
+            
+            match &child_manifest.kind {
+                Some(ShKind::Composition) => {
+                    // 6. Create child composition action with inputs from step definition
+                    let mut child_action = Box::pin(self.build_action_tree(
+                        uses,                    // Download the child action manifest
+                        Some(&action_name),      // Parent action name
+                        Some(&parent_id),        // Current action's UUID as parent
+                        global_inputs            // Pass global inputs for variable resolution
+                    )).await?;
+                    
+                    // Process inputs for the composition child based on step definition
+                    if let Some(inputs_obj) = step_definition.get("inputs").and_then(|v| v.as_object()) {
+                        let mut processed_inputs = serde_json::Map::new();
+                        for (key, value) in inputs_obj {
+                            let processed_value = self.process_template_variable_from_inputs(value, global_inputs)?;
+                            processed_inputs.insert(key.clone(), processed_value);
+                        }
+                        child_action.inputs = processed_inputs;
+                    }
+                    
+                    // Add child action to current action's children
+                    let child_id = child_action.id.clone();
+                    action_state.children.insert(child_id.clone(), child_action);
+                    
+                    // Add to execution order (using child's UUID)
+                    action_state.execution_order.push(child_id);
+                },
+                Some(ShKind::Wasm) | Some(ShKind::Docker) => {
+                    // 7. BASE CASE - create atomic action with proper inputs
+                    let full_step_name = format!("{}.{}", action_name, step_name);
+                    let atomic_step = self.create_atomic_step_from_manifest(
+                        &full_step_name,
+                        &child_manifest,
+                        &step_definition
+                    )?;
+                    
+                    // Build parameters for this action using global inputs
+                    let step_params = self.build_step_parameters_from_inputs(&atomic_step, global_inputs).await?;
+                    
+                    // Analyze template variables to build data flow edges
+                    let data_flow_edges = self.analyze_data_flow_edges(&atomic_step, &atomic_step.id)?;
+                    action_state.data_flow.extend(data_flow_edges);
+                    
+                    // Create atomic action state with proper inputs
+                    let atomic_action = ActionState {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: step_name.clone(),
+                        kind: atomic_step.kind.clone(),
+                        uses: atomic_step.ref_.clone(),
+                        inputs: step_params.as_object().unwrap().clone(),
+                        outputs: serde_json::Map::new(),
+                        parent_action: Some(parent_id.clone()),
+                        children: HashMap::new(),
+                        execution_order: Vec::new(),
+                        data_flow: Vec::new(),
+                    };
+                    
+                    // Add atomic action to current action's children
+                    let atomic_id = atomic_action.id.clone();
+                    action_state.children.insert(atomic_id.clone(), atomic_action);
+                    
+                    // Add to execution order (using child's UUID)
+                    action_state.execution_order.push(atomic_id);
+                },
+                None => return Err(anyhow::anyhow!("Unknown manifest kind for step: {}", step_name))
+            }
         }
         
-        let main_manifest = &manifests[0];
+        Ok(action_state)
+    }
+
+    async fn download_manifest(&self, action_ref: &str) -> Result<ShManifest> {
+        // Construct storage URL for starthub-lock.json
+        let url_path = action_ref.replace(":", "/");
+        let storage_url = format!(
+            "https://api.starthub.so/storage/v1/object/public/artifacts/{}/starthub-lock.json",
+            url_path
+        );
         
-        // 2. Apply topological sorting to composition steps BEFORE flattening
-        let sorted_composition_steps = self.topological_sort_composition_steps(main_manifest).await?;
+        // Download and parse starthub-lock.json
+        let manifest = self.client.download_starthub_lock(&storage_url).await?;
         
-        // 3. Flatten the topologically sorted composition steps into atomic steps
-        let execution_steps = self.flatten_sorted_steps_to_atomic(sorted_composition_steps, &inputs, action_ref).await?;
-    
-        // 4. Prepare steps and store them in state
-        let mut execution_state = self.prepare_atomic_steps(&execution_steps, &inputs).await?;
+        // If it's a WASM or Docker action, download and extract artifacts
+        if let Some(kind) = &manifest.kind {
+            match kind {
+                ShKind::Wasm | ShKind::Docker => {
+                    self.download_and_extract_artifacts(action_ref).await?;
+                }
+                ShKind::Composition => {
+                    // For compositions, we'll download nested manifests as needed during recursion
+                }
+            }
+        }
         
-        // Print the execution steps
-        println!("Execution state: {:#?}", execution_state);
+        Ok(manifest)
+    }
+
+
+
+
+
+    fn find_manifest_by_uses<'a>(&self, manifests: &'a [ShManifest], uses: &str) -> Result<&'a ShManifest> {
+        // Find manifest by matching the uses string with the manifest name and version
+        for manifest in manifests {
+            let manifest_ref = format!("{}:{}", 
+                manifest.repository.split('/').last().unwrap_or(""),
+                manifest.version
+            );
+            if manifest_ref == uses || manifest.name == uses.split(':').next().unwrap_or("") {
+                return Ok(manifest);
+            }
+        }
+        Err(anyhow::anyhow!("Manifest not found for uses: {}", uses))
+    }
+
+
+    fn create_atomic_step_from_manifest(
+        &self,
+        step_name: &str,
+        manifest: &ShManifest,
+        step_definition: &Value
+    ) -> Result<StepSpec> {
+        let kind = match &manifest.kind {
+            Some(ShKind::Wasm) => "wasm",
+            Some(ShKind::Docker) => "docker",
+            _ => return Err(anyhow::anyhow!("Invalid manifest kind for atomic step"))
+        };
         
-        // 5. Execute the prepared steps
-        self.execute_prepared_steps(&mut execution_state).await
+        Ok(StepSpec {
+            id: step_name.to_string(),
+            kind: kind.to_string(),
+            ref_: format!("{}:{}", manifest.repository, manifest.version),
+            args: Vec::new(),
+            env: HashMap::new(),
+            workdir: None,
+            network: None,
+            entry: None,
+            mounts: Vec::new(),
+            step_definition: Some(step_definition.clone()),
+            calling_step_definition: Some(step_definition.clone()),
+        })
     }
 
     async fn convert_composite_steps_to_execution(&self, manifest: &ShManifest, _inputs: &HashMap<String, Value>, action_ref: &str) -> Result<Vec<StepSpec>> {
@@ -356,9 +570,9 @@ impl ExecutionEngine {
         Ok(())
     }
     
-    async fn prepare_atomic_steps(&self, steps: &[StepSpec], inputs: &HashMap<String, Value>) -> Result<ExecutionState> {
+    async fn prepare_atomic_steps(&self, steps: &[StepSpec], inputs: &HashMap<String, Value>) -> Result<ActionState> {
         // Parse stringified JSON values in inputs
-        let mut parsed_inputs = HashMap::new();
+        let mut parsed_inputs = serde_json::Map::new();
         for (key, value) in inputs {
             if let Some(str_value) = value.as_str() {
                 // Try to parse as JSON
@@ -372,10 +586,17 @@ impl ExecutionEngine {
             }
         }
         
-        // Initialize execution state with parsed inputs
-        let mut execution_state = ExecutionState {
+        // Create a root action state
+        let mut root_action = ActionState {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "root".to_string(),
+            kind: "composition".to_string(),
+            uses: "".to_string(),
             inputs: parsed_inputs,
-            steps: Vec::new(),
+            outputs: serde_json::Map::new(),
+            parent_action: None,
+            children: HashMap::new(),
+            execution_order: Vec::new(),
             data_flow: Vec::new(),
         };
         
@@ -384,27 +605,34 @@ impl ExecutionEngine {
             // Generate UUID for this step
             let step_id = uuid::Uuid::new_v4().to_string();
             
-            // Build parameters for this step using the execution state
-            let step_params = self.build_step_parameters_from_state(step, &execution_state).await?;
+            // Build parameters for this step using the root action inputs
+            let step_params = self.build_step_parameters_from_inputs(step, &root_action.inputs).await?;
             
             // Analyze template variables to build data flow edges
             let data_flow_edges = self.analyze_data_flow_edges(step, &step.id)?;
-            execution_state.data_flow.extend(data_flow_edges);
+            root_action.data_flow.extend(data_flow_edges);
             
-            // Store the step state in execution state (without outputs yet)
-            let step_state = StepState {
+            // Create child action state
+            let child_action = ActionState {
                 id: step_id,
-                original_name: step.id.clone(), // Use the original step name from the composition
+                name: step.id.clone(), // Use the original step name from the composition
                 uses: step.ref_.clone(),
                 kind: step.kind.clone(),
-                ref_: step.ref_.clone(),
-                inputs: step_params.as_object().unwrap().clone().into_iter().collect(),
-                outputs: HashMap::new(), // Empty outputs initially
+                inputs: step_params.as_object().unwrap().clone(),
+                outputs: serde_json::Map::new(), // Empty outputs initially
+                parent_action: Some("root".to_string()), // This function is deprecated
+                children: HashMap::new(),
+                execution_order: Vec::new(),
+                data_flow: Vec::new(),
             };
-            execution_state.steps.push(step_state);
+            
+            // Add child action to root action
+            let child_id = child_action.id.clone();
+            root_action.children.insert(child_id.clone(), child_action);
+            root_action.execution_order.push(child_id);
         }
         
-        Ok(execution_state)
+        Ok(root_action)
     }
     
     fn analyze_data_flow_edges(&self, step: &StepSpec, step_name: &str) -> Result<Vec<DataFlowEdge>> {
@@ -500,22 +728,31 @@ impl ExecutionEngine {
         Ok(())
     }
     
-    async fn execute_prepared_steps(&self, execution_state: &mut ExecutionState) -> Result<Value> {
-        let total_steps = execution_state.steps.len();
-        for (i, step_state) in execution_state.steps.iter_mut().enumerate() {
-            println!("Executing step {}/{}: {}", i + 1, total_steps, step_state.id);
-            
-            // Execute the step using the information stored in the step state
-            let result = match step_state.kind.as_str() {
+    async fn execute_action_tree(&self, root_action: &mut ActionState) -> Result<Value> {
+        // Execute the root action and all its children
+        self.execute_action_recursive(root_action).await?;
+        
+        // Return the final action tree
+        Ok(serde_json::to_value(root_action)?)
+    }
+
+    async fn execute_action_recursive(&self, action: &mut ActionState) -> Result<()> {
+        // Execute children in order
+        for child_id in &action.execution_order {
+            if let Some(child) = action.children.get_mut(child_id) {
+                println!("Executing child action: {}", child.name);
+                
+                // Execute the child action
+                let result = match child.kind.as_str() {
                 "wasm" => {
-                    let step_params = Value::Object(step_state.inputs.clone().into_iter().collect());
-                    println!("📤 WASM inputs for step '{}': {}", step_state.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
+                        let step_params = Value::Object(child.inputs.clone().into_iter().collect());
+                        println!("📤 WASM inputs for action '{}': {}", child.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
                     
                     // Create a temporary StepSpec for the run_wasm_step function
                     let temp_step = StepSpec {
-                        id: step_state.id.clone(),
-                        kind: step_state.kind.clone(),
-                        ref_: step_state.ref_.clone(),
+                            id: child.id.clone(),
+                            kind: child.kind.clone(),
+                            ref_: child.uses.clone(),
                         args: vec![],
                         env: std::collections::HashMap::new(),
                         workdir: None,
@@ -529,14 +766,14 @@ impl ExecutionEngine {
                     self.run_wasm_step(&temp_step, None, &step_params).await?
                 },
                 "docker" => {
-                    let step_params = Value::Object(step_state.inputs.clone().into_iter().collect());
-                    println!("📤 Docker inputs for step '{}': {}", step_state.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
+                        let step_params = Value::Object(child.inputs.clone().into_iter().collect());
+                        println!("📤 Docker inputs for action '{}': {}", child.id, serde_json::to_string_pretty(&step_params).unwrap_or_else(|_| "{}".to_string()));
                     
                     // Create a temporary StepSpec for the run_docker_step function
                     let temp_step = StepSpec {
-                        id: step_state.id.clone(),
-                        kind: step_state.kind.clone(),
-                        ref_: step_state.ref_.clone(),
+                            id: child.id.clone(),
+                            kind: child.kind.clone(),
+                            ref_: child.uses.clone(),
                         args: vec![],
                         env: std::collections::HashMap::new(),
                         workdir: None,
@@ -549,15 +786,28 @@ impl ExecutionEngine {
                     
                     self.run_docker_step(&temp_step, None, &step_params).await?
                 },
-                _ => return Err(anyhow::anyhow!("Unknown step kind: {}", step_state.kind)),
-            };
-            
-            // Store the outputs in the step state
-            step_state.outputs = result.as_object().unwrap().clone().into_iter().collect();
+                    "composition" => {
+                        // For compositions, recursively execute
+                        Box::pin(self.execute_action_recursive(child)).await?;
+                        Value::Object(child.outputs.clone().into_iter().collect())
+                    },
+                    _ => return Err(anyhow::anyhow!("Unknown action kind: {}", child.kind)),
+                };
+                
+                // Store the outputs in the child action
+                println!("📥 Outputs for action '{}': {}", child.name, serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string()));
+                if let Some(obj) = result.as_object() {
+                    child.outputs = obj.clone();
+                } else {
+                    // If result is not an object, wrap it in a generic output
+                    let mut outputs = serde_json::Map::new();
+                    outputs.insert("result".to_string(), result);
+                    child.outputs = outputs;
+                }
+            }
         }
         
-        // Return the final execution state
-        Ok(serde_json::to_value(execution_state)?)
+        Ok(())
     }
 
     async fn fetch_all_action_manifests(&self, action_ref: &str) -> Result<Vec<ShManifest>> {
@@ -643,22 +893,22 @@ impl ExecutionEngine {
 
 
 
-    async fn build_step_parameters_from_state(&self, step: &StepSpec, execution_state: &ExecutionState) -> Result<Value> {
+    async fn build_step_parameters_from_inputs(&self, step: &StepSpec, global_inputs: &serde_json::Map<String, Value>) -> Result<Value> {
         // Use the calling step definition for template processing (this has the correct template variables)
         if let Some(calling_step_def) = &step.calling_step_definition {
-            return self.process_step_definition_from_state(calling_step_def, execution_state).await;
+            return self.process_step_definition_from_inputs(calling_step_def, global_inputs).await;
         }
         
         // Fallback: for simple actions without step definitions, use initial inputs directly
         let mut params = Map::new();
-        for (key, value) in &execution_state.inputs {
+        for (key, value) in global_inputs {
             params.insert(key.clone(), value.clone());
         }
         
         Ok(Value::Object(params))
     }
 
-    async fn process_step_definition_from_state(&self, step_def: &Value, execution_state: &ExecutionState) -> Result<Value> {
+    async fn process_step_definition_from_inputs(&self, step_def: &Value, global_inputs: &serde_json::Map<String, Value>) -> Result<Value> {
         
         let step_obj = step_def.as_object()
             .ok_or_else(|| anyhow::anyhow!("Step definition is not an object"))?;
@@ -674,7 +924,7 @@ impl ExecutionEngine {
         // The keys should match what the target action expects
         // The values should be processed template variables from the calling action
         for (input_key, input_value) in inputs_obj {
-            let processed_value = self.process_template_variable_from_state(input_value, execution_state)?;
+            let processed_value = self.process_template_variable_from_inputs(input_value, global_inputs)?;
             module_params.insert(input_key.clone(), processed_value);
         }
         
@@ -682,7 +932,7 @@ impl ExecutionEngine {
         Ok(Value::Object(module_params))
     }
 
-    fn process_template_variable_from_state(&self, template: &Value, execution_state: &ExecutionState) -> Result<Value> {
+    fn process_template_variable_from_inputs(&self, template: &Value, global_inputs: &serde_json::Map<String, Value>) -> Result<Value> {
         match template {
             Value::String(template_str) => {
                 // Process template string like "{{inputs.open_weather_config.location_name}}"
@@ -692,7 +942,7 @@ impl ExecutionEngine {
                 let input_pattern = regex::Regex::new(r"\{\{inputs\.([^}]+)\}\}")?;
                 result = input_pattern.replace_all(&result, |caps: &regex::Captures| {
                     let path = &caps[1];
-                    if let Some(value) = self.get_nested_value(&execution_state.inputs, path) {
+                    if let Some(value) = self.get_nested_value(global_inputs, path) {
                         match value {
                             Value::String(s) => s.clone(),
                             Value::Number(n) => n.to_string(),
@@ -705,36 +955,12 @@ impl ExecutionEngine {
                 }).to_string();
                 
                 // Replace {{step_name.inputs.*}} and {{step_name.outputs.*}} patterns
-                let step_pattern = regex::Regex::new(r"\{\{([^.]+)\.(inputs|outputs)\.([^}]+)\}\}")?;
-                result = step_pattern.replace_all(&result, |caps: &regex::Captures| {
-                    let step_name = &caps[1];
-                    let section = &caps[2];
-                    let path = &caps[3];
-                    
-                    // Find step by original name (this is the key fix!)
-                    let step_state = execution_state.steps.iter()
-                        .find(|step| step.original_name == step_name);
-                    
-                    if let Some(step_state) = step_state {
-                        let target_map = match section {
-                            "inputs" => &step_state.inputs,
-                            "outputs" => &step_state.outputs,
-                            _ => return caps[0].to_string(),
-                        };
-                        if let Some(value) = self.get_nested_value(target_map, path) {
-                            match value {
-                                Value::String(s) => s.clone(),
-                                Value::Number(n) => n.to_string(),
-                                Value::Bool(b) => b.to_string(),
-                                _ => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
-                            }
-                        } else {
-                            caps[0].to_string()
-                        }
-                    } else {
-                        caps[0].to_string()
-                    }
-                }).to_string();
+                // TODO: Implement step reference resolution
+                // let step_pattern = regex::Regex::new(r"\{\{([^.]+)\.(inputs|outputs)\.([^}]+)\}\}")?;
+                // TODO: Implement step reference resolution
+                // result = step_pattern.replace_all(&result, |caps: &regex::Captures| {
+                //     // ... step pattern processing ...
+                // }).to_string();
                 
                 Ok(Value::String(result))
             },
@@ -742,7 +968,7 @@ impl ExecutionEngine {
                 // Process object templates recursively
                 let mut processed_obj = Map::new();
                 for (key, value) in obj {
-                    processed_obj.insert(key.clone(), self.process_template_variable_from_state(value, execution_state)?);
+                    processed_obj.insert(key.clone(), self.process_template_variable_from_inputs(value, global_inputs)?);
                 }
                 Ok(Value::Object(processed_obj))
             },
@@ -750,7 +976,7 @@ impl ExecutionEngine {
                 // Process array templates recursively
                 let mut processed_arr = Vec::new();
                 for item in arr {
-                    processed_arr.push(self.process_template_variable_from_state(item, execution_state)?);
+                    processed_arr.push(self.process_template_variable_from_inputs(item, global_inputs)?);
                 }
                 Ok(Value::Array(processed_arr))
             },
@@ -759,7 +985,7 @@ impl ExecutionEngine {
     }
 
 
-    fn get_nested_value(&self, inputs: &HashMap<String, Value>, path: &str) -> Option<Value> {
+    fn get_nested_value(&self, inputs: &serde_json::Map<String, Value>, path: &str) -> Option<Value> {
         let parts: Vec<&str> = path.split('.').collect();
         let mut current = inputs.get(parts[0])?.clone();
         
