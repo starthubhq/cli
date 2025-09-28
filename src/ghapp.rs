@@ -184,9 +184,7 @@ fn creds_path(provider: &str) -> Result<PathBuf> {
             Ok::<_, anyhow::Error>(PathBuf::from(home).join(".starthub"))
         })?;
     Ok(base.join("creds").join(format!("{provider}.json")))
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
+}#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StoredCredentials {
     pub access_token: String,
     pub token_type: String,
@@ -324,3 +322,4 @@ pub async fn create_user_repo(
         bail!("create repo failed: {s} — {t}");
     }
 }
+

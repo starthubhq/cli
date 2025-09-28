@@ -13,8 +13,8 @@ pub struct ShManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
     pub license: String,
-    pub inputs: std::collections::HashMap<String, serde_json::Value>,
-    pub outputs: std::collections::HashMap<String, serde_json::Value>,
+    pub inputs: serde_json::Value,
+    pub outputs: serde_json::Value,
     // Custom type definitions
     #[serde(default)]
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
