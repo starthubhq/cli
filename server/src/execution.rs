@@ -236,9 +236,6 @@ impl ExecutionEngine {
         Ok(manifest)
     }
 
-
-
-
     fn create_atomic_step_from_manifest(
         &self,
         step_name: &str,
