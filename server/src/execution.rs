@@ -7,7 +7,7 @@ use petgraph::Graph;
 use petgraph::algo::toposort;
 use jsonschema::JSONSchema;
 
-use crate::models::{ShManifest, ShKind, HubClient, ShPort, ShAction};
+use crate::models::{ShManifest, ShKind, HubClient, ShIO, ShAction};
 
 // Constants
 const STARTHUB_API_BASE_URL: &str = "https://api.starthub.so";
@@ -56,15 +56,15 @@ impl ExecutionEngine {
     }
 
     async fn run_action_tree(&self,
-        action_state: &ShAction,
+        action_state: &mut ShAction,
         inputs: Vec<Value>) -> Result<()> {
 
         // Run type checking
-        self.type_check_io(action_state, inputs);
-        
-        // Inject the inputs in the input variables
+        let resolved_action: ShAction = self.resolve_inputs(action_state, &inputs)?;
 
-        // Run the action tree recursively again.
+        // Run the action tree recursively again,
+        // this time with the resolved inputs.
+
         // The base condition is for the kind to be "wasm" or "docker".
         // If it's a composition, then we keep iterating recursively.
 
@@ -79,64 +79,103 @@ impl ExecutionEngine {
         return Ok(());
     }
 
+    fn resolve_json_path(&self, path: &str, inputs: &Vec<Value>) -> Result<Value> {
+        let parts: Vec<&str> = path.split('.').collect();
+        
+        if parts.is_empty() {
+            return Err(anyhow::anyhow!("Empty JSON path"));
+        }
+        
+        let root = parts[0];
+        let mut current = match root {
+            "inputs" => Value::Array(inputs.iter().map(|input| serde_json::to_value(input).unwrap()).collect()),
+            _ => return Err(anyhow::anyhow!("Unknown root variable: {}", root))
+        };
+        
+        for part in &parts[1..] {
+            current = match current {
+                Value::Array(arr) => {
+                    if let Ok(index) = part.parse::<usize>() {
+                        arr.get(index)
+                            .ok_or_else(|| anyhow::anyhow!("Index {} out of bounds", index))?
+                            .clone()
+                    } else {
+                        return Err(anyhow::anyhow!("Invalid array index: {}", part));
+                    }
+                }
+                Value::Object(obj) => {
+                    obj.get(*part)
+                        .ok_or_else(|| anyhow::anyhow!("Property '{}' not found", part))?
+                        .clone()
+                }
+                _ => return Err(anyhow::anyhow!("Cannot access property '{}' on non-object", part))
+            };
+        }
+        
+        Ok(current)
+    }
+
     // Returns true or false, depending on whether the injected values are co
-    fn type_check_io(&self, action_state: &ShAction, values: Vec<Value>) -> bool {        
+    fn resolve_inputs(&self, action_state: &ShAction, inputs: &Vec<Value>) -> Result<ShAction> {        
+        let mut resolved_action = action_state.clone();
+
         // We extract the types from the action state
         let types = &action_state.types;
         let inputs = &action_state.inputs;
-        
+        let mut type_checked_inputs = Vec::new();
+
         // For every value, find its corresponding input by index
-        for (index, value) in values.iter().enumerate() {
-            println!("Value {} has type: {:#?}", index, value);
+        for (index, value) in inputs.iter().enumerate() {
             if let Some(input) = inputs.get(index) {
-                // Access the type directly from the ShIO struct
-                println!("Input {} has type: {}", index, input.r#type);
-                
                 // Find the type definition in the types object
                 if let Some(types_map) = types {
-                    if let Some(type_definition) = types_map.get(&input.r#type) {
-                        println!("Found type definition: {:?}", type_definition);
-                        
+                    if let Some(type_definition) = types_map.get(&input.r#type) {                        
                         let json_schema = match self.convert_to_json_schema(type_definition) {
                             Ok(schema) => schema,
                             Err(e) => {
                                 println!("Failed to convert type definition: {}", e);
-                                return false;
+                                return Err(anyhow::anyhow!("Failed to convert type definition: {}", e));
                             }
                         };
 
-                        println!("Schema: {:?}", json_schema);
                         // Compile the JSON schema
                         let compiled_schema = match JSONSchema::compile(&json_schema) {
                             Ok(schema) => schema,
                             Err(e) => {
                                 println!("Failed to compile schema for type '{}': {}", input.r#type, e);
-                                return false;
+                                return Err(anyhow::anyhow!("Failed to compile schema for type '{}': {}", input.r#type, e));
                             }
                         };
                         
-                        
-                        println!("Value being input: {:?}", value);
                         // Validate the value against the schema
-                        if compiled_schema.validate(value).is_ok() {
-                            println!("Value {} is valid", index);
-                        } else {
-                            let error_list: Vec<_> = compiled_schema.validate(value).unwrap_err().collect();
-                            println!("Value {} is invalid: {:?}", index, error_list);
-                            return false;
-                        }
+                        // if compiled_schema.validate(&value.value).is_ok() {
+                        //     println!("Value {} is valid", index);
+                        //     type_checked_inputs.push(ShIO {
+                        //         name: input.name.clone(),
+                        //         r#type: input.r#type.clone(),
+                        //         required: input.required,
+                        //         template: value.template.clone(),
+                        //         value: None,
+                        //     });
+                        // } else {
+                        //     let error_list: Vec<_> = compiled_schema.validate(value).unwrap_err().collect();
+                        //     println!("Value {} is invalid: {:?}", index, error_list);
+                        //     return Err(anyhow::anyhow!("Value {} is invalid: {:?}", index, error_list));
+                        // }
                     } else {
                         println!("Type '{}' not found in types", input.r#type);
-                        return false;
+                        return Err(anyhow::anyhow!("Type '{}' not found in types", input.r#type));                       
                     }
                 } else {
                     println!("No types defined");
-                    return false;
+                    return Err(anyhow::anyhow!("No types defined"));
                 }
             }
         }
+
+        resolved_action.inputs = type_checked_inputs;
         
-        true // All values are valid
+        return Ok(resolved_action); // All values are valid
     }
 
     fn convert_to_json_schema(&self, type_definition: &Value) -> Result<Value> {
@@ -254,11 +293,12 @@ impl ExecutionEngine {
             .map(|arr| {
                 arr.iter().filter_map(|output| {
                     if let Some(obj) = output.as_object() {
-                        Some(ShPort {
+                        Some(ShIO {
                             name: obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             r#type: obj.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             required: obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
-                            value: obj.get("value").cloned().unwrap_or(serde_json::Value::Null),
+                            template: obj.get("value").cloned().unwrap_or(serde_json::Value::Null),
+                            value: None,
                         })
                     } else {
                         None
@@ -270,11 +310,12 @@ impl ExecutionEngine {
                 .map(|arr| {
                     arr.iter().filter_map(|output| {
                         if let Some(obj) = output.as_object() {
-                            Some(ShPort {
+                            Some(ShIO {
                                 name: obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                 r#type: obj.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                 required: obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
-                                value: obj.get("value").cloned().unwrap_or(serde_json::Value::Null),
+                                template: obj.get("value").cloned().unwrap_or(serde_json::Value::Null),
+                                value: None,
                             })
                         } else {
                             None
@@ -283,7 +324,7 @@ impl ExecutionEngine {
                 })
                 .unwrap_or_default(),
             parent_action: parent_action_id.map(|s| s.to_string()),
-            children: HashMap::new(),
+            steps: HashMap::new(),
             // Initially empty execution order
             execution_order: Vec::new(),
             // Initially empty types
@@ -294,19 +335,35 @@ impl ExecutionEngine {
         for (step_name, step_value) in manifest.steps {
             if let Some(uses_value) = step_value.get("uses") {
                 if let Some(uses_str) = uses_value.as_str() {
-                    let child_action = Box::pin(self.build_action_tree(
+                    let mut child_action = Box::pin(self.build_action_tree(
                         uses_str,
                         Some(&action_id_for_children)
                     )).await?;
                     
+                     // Extract step inputs and inject them into the child action
+                    if let Some(step_inputs) = step_value.get("inputs") {
+                        if let Some(inputs_array) = step_inputs.as_array() {
+                            for (index, input) in inputs_array.iter().enumerate() {
+                                if let Some(input_obj) = input.as_object() {
+                                    if let Some(child_input) = child_action.inputs.get_mut(index) {
+                                        // Inject the template value from the step input
+                                        if let Some(template_value) = input_obj.get("value") {
+                                            child_input.template = template_value.clone();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Add child to parent's children HashMap
-                    action_state.children.insert(child_action.id.clone(), child_action);
+                    action_state.steps.insert(child_action.id.clone(), child_action);
                 }
             }
         }
 
         // 5. Topologically sort steps based on dependencies
-        let sorted_step_ids = self.topological_sort_composition_steps(&action_state.children).await?;
+        let sorted_step_ids = self.topological_sort_composition_steps(&action_state.steps).await?;
         
         // 6. Add the sorted step IDs to the execution order field
         for step_id in sorted_step_ids {

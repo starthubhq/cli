@@ -35,12 +35,13 @@ pub struct ShManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShPort {
+pub struct ShIO {
     pub name: String,
     #[serde(rename = "type")]
     pub r#type: String,
     pub required: bool,
-    pub value: Value,
+    pub template: Value,
+    pub value: Option<Value>,
 }
 
 // Data flow edge representing a variable dependency between steps
@@ -50,10 +51,10 @@ pub struct ShAction {
     pub name: String,                    // "get_coordinates" or "get_weather_response"
     pub kind: String,                    // "composition", "wasm", "docker"
     pub uses: String,                    // Reference to the action
-    pub inputs: Vec<ShPort>,              // Array format: [{"name": "...", "type": "...", "value": ...}]
-    pub outputs: Vec<ShPort>,             // Array format: [{"name": "...", "type": "...", "value": ...}]
+    pub inputs: Vec<ShIO>,              // Array format: [{"name": "...", "type": "...", "value": ...}]
+    pub outputs: Vec<ShIO>,             // Array format: [{"name": "...", "type": "...", "value": ...}]
     pub parent_action: Option<String>,   // UUID of parent action (None for root)
-    pub children: HashMap<String, ShAction>, // Nested actions keyed by UUID
+    pub steps: HashMap<String, ShAction>, // Nested actions keyed by UUID
     pub execution_order: Vec<String>,   // Order of execution within this action
     
     // Manifest structure fields
@@ -145,30 +146,6 @@ impl<'de> serde::Deserialize<'de> for ShType {
             custom_type => Ok(ShType::Custom(custom_type.to_string())),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShActionStep {
-    pub id: String,
-    pub uses: ShActionUses,
-    #[serde(default)]
-    pub with: std::collections::HashMap<String, serde_json::Value>,
-    #[serde(default)]
-    pub env: std::collections::HashMap<String, String>,
-    // Additional fields for composition steps
-    #[serde(default)]
-    pub types: std::collections::HashMap<String, serde_json::Value>,
-    #[serde(default)]
-    pub inputs: Vec<serde_json::Value>,
-    #[serde(default)]
-    pub outputs: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShActionUses {
-    pub name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
