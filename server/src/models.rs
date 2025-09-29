@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+
 use serde::{Serialize, Deserialize};
+use serde_json::Value;
 
 // ---- Starthub manifest schema ----
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,32 @@ pub struct ShManifest {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_default_export")]
     pub export: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShPort {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub required: bool,
+    pub value: Value,
+}
+
+// Data flow edge representing a variable dependency between steps
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ShAction {
+    pub id: String,
+    pub name: String,                    // "get_coordinates" or "get_weather_response"
+    pub kind: String,                    // "composition", "wasm", "docker"
+    pub uses: String,                    // Reference to the action
+    pub inputs: Vec<ShPort>,              // Array format: [{"name": "...", "type": "...", "value": ...}]
+    pub outputs: Vec<ShPort>,             // Array format: [{"name": "...", "type": "...", "value": ...}]
+    pub parent_action: Option<String>,   // UUID of parent action (None for root)
+    pub children: HashMap<String, ShAction>, // Nested actions keyed by UUID
+    pub execution_order: Vec<String>,   // Order of execution within this action
+    
+    // Manifest structure fields
+    pub types: Option<serde_json::Map<String, Value>>,   // From manifest.types
 }
 
 // Helper function to determine if export field should be skipped during serialization
@@ -71,23 +100,6 @@ impl<'de> serde::Deserialize<'de> for ShKind {
             _ => Err(serde::de::Error::unknown_variant(&s, &["wasm", "docker", "composition"])),
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShPort {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(rename = "type")]
-    pub ty: ShType,
-    #[serde(default = "default_required")]
-    pub required: bool,
-    #[serde(default)]
-    pub default: Option<serde_json::Value>,
-}
-
-fn default_required() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -304,19 +316,4 @@ impl HubClient {
         Ok(artifact_path)
     }
 
-    pub async fn download_starthub_lock(&self, storage_url: &str) -> anyhow::Result<ShManifest> {
-        let client = reqwest::Client::new();
-        let response = client.get(storage_url).send().await?;
-        
-        if response.status().is_success() {
-            // Log the response body for debugging
-            let response_text = response.text().await?;            
-            // Try to parse the JSON
-            let manifest: ShManifest = serde_json::from_str(&response_text)
-                .map_err(|e| anyhow::anyhow!("JSON parsing error: {} - Response: {}", e, response_text))?;
-            Ok(manifest)
-        } else {
-            Err(anyhow::anyhow!("Failed to download starthub-lock.json: {}", response.status()))
-        }
-    }
 }

@@ -14,7 +14,6 @@ use futures_util::{StreamExt, SinkExt};
 use tokio::sync::broadcast;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use std::collections::HashMap;
 use std::fs;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -124,19 +123,26 @@ async fn handle_run(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     
+    // Parse inputs as JSON objects instead of strings
     let inputs = payload.get("inputs")
-        .and_then(|v| v.as_object())
-        .cloned()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    // If the item is a string, try to parse it as JSON
+                    if let Some(json_str) = item.as_str() {
+                        serde_json::from_str::<Value>(json_str).ok()
+                    } else {
+                        // If it's already a JSON object, use it directly
+                        Some(item.clone())
+                    }
+                })
+                .collect::<Vec<Value>>()
+        })
         .unwrap_or_default();
     
-    // Convert inputs to HashMap<String, Value>
-    let mut input_map = HashMap::new();
-    for (key, value) in inputs {
-        input_map.insert(key, value);
-    }
-    
-    // Execute the action
-    match state.execution_engine.execute_action(action, input_map).await {
+    // Execute the action with array inputs
+    match state.execution_engine.execute_action(action, inputs).await {
         Ok(result) => {
             // Send execution result via WebSocket
             let result_msg = json!({
