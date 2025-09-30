@@ -41,6 +41,7 @@ pub struct ShIO {
     pub r#type: String,
     pub template: Value,
     pub value: Option<Value>,
+    pub required: bool,
 }
 
 // Data flow edge representing a variable dependency between steps
