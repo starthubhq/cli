@@ -45,7 +45,7 @@ impl ExecutionEngine {
             None,               // No parent action ID (root)
         ).await?;     
 
-        // Print root actino
+        // Print root action
         println!("Root action: {:#?}", root_action);
         // self.run_action_tree(&mut root_action, inputs).await?;
 
@@ -576,6 +576,70 @@ mod tests {
     //     let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
     //     assert_eq!(result, Vec::<String>::new());
     // }
+
+    #[test]
+    fn test_execution_engine_new() {
+        // Test creating a new ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Verify the cache directory is set correctly
+        let expected_cache_dir = dirs::cache_dir()
+            .unwrap_or(std::env::temp_dir())
+            .join("starthub/oci");
+        
+        assert_eq!(engine.cache_dir, expected_cache_dir);
+    }
+
+    #[tokio::test]
+    async fn test_build_action_tree() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test building action tree for the coordinates action
+        let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
+        let result = engine.build_action_tree(action_ref, None).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "build_action_tree should succeed for valid action_ref");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the root action structure
+        assert_eq!(action_tree.name, "get-weather-by-location-name");
+        assert_eq!(action_tree.kind, "composition");
+        assert_eq!(action_tree.uses, action_ref);
+        assert!(action_tree.parent_action.is_none());
+        
+        // Verify inputs
+        assert_eq!(action_tree.inputs.len(), 1);
+        let input = &action_tree.inputs[0];
+        assert_eq!(input.name, "weather_config");
+        assert_eq!(input.r#type, "WeatherConfig");
+        
+        // Verify outputs
+        assert_eq!(action_tree.outputs.len(), 1);
+        let output = &action_tree.outputs[0];
+        assert_eq!(output.name, "response");
+        assert_eq!(output.r#type, "CustomWeatherResponse");
+        
+        // Verify it has child steps
+        assert_eq!(action_tree.steps.len(), 2);
+        assert!(action_tree.steps.contains_key("openweather-coordinates-by-location-name"));
+        assert!(action_tree.steps.contains_key("openweather-current-weather"));
+        
+        // Verify execution order
+        assert_eq!(action_tree.execution_order.len(), 2);
+        assert_eq!(action_tree.execution_order[0], "openweather-coordinates-by-location-name");
+        assert_eq!(action_tree.execution_order[1], "openweather-current-weather");
+        
+        // Verify types are present
+        assert!(action_tree.types.is_some());
+        let types = action_tree.types.as_ref().unwrap();
+        assert!(types.contains_key("WeatherConfig"));
+        assert!(types.contains_key("CustomWeatherResponse"));
+    }
+
+    
 
     #[tokio::test]
     async fn test_topological_sort_composition_steps() {
