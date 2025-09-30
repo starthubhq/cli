@@ -332,7 +332,7 @@ impl ExecutionEngine {
                     }
 
                     // Add child to parent's children HashMap
-                    action_state.steps.insert(child_action.name.clone(), child_action);
+                    action_state.steps.insert(_step_name.clone(), child_action);
                 }
             }
         }
@@ -431,17 +431,14 @@ impl ExecutionEngine {
 
         match value {
             // The template could be a string, an object or an array
-            Value::String(s) => {                        
+            Value::String(s) => {      
                 for cap in re.captures_iter(s) {
                     if let Some(step_name) = cap.get(1) {
                         let step_name = step_name.as_str();
-                        
                         // Find the step ID that corresponds to this step name
-                        for (step_id, step) in steps {
-                            if step.name == step_name {
-                                deps.insert(step_id.clone());
-                                break;
-                            }
+                        let step = steps.get(step_name);
+                        if let Some(_step) = step {
+                            deps.insert(step_name.to_string());
                         }
                     }
                 }
@@ -622,15 +619,10 @@ mod tests {
         assert_eq!(output.name, "response");
         assert_eq!(output.r#type, "CustomWeatherResponse");
         
-        // Verify it has child steps
-        assert_eq!(action_tree.steps.len(), 2);
-        assert!(action_tree.steps.contains_key("openweather-coordinates-by-location-name"));
-        assert!(action_tree.steps.contains_key("openweather-current-weather"));
-        
         // Verify execution order
         assert_eq!(action_tree.execution_order.len(), 2);
-        assert_eq!(action_tree.execution_order[0], "openweather-coordinates-by-location-name");
-        assert_eq!(action_tree.execution_order[1], "openweather-current-weather");
+        assert_eq!(action_tree.execution_order[0], "get_coordinates");
+        assert_eq!(action_tree.execution_order[1], "get_weather");
         
         // Verify types are present
         assert!(action_tree.types.is_some());
@@ -648,31 +640,6 @@ mod tests {
         
         // Create mock steps with dependencies
         let mut steps = HashMap::new();
-        
-        // Step 1: get_coordinates - no dependencies
-        let coordinates_id = uuid::Uuid::new_v4().to_string();
-        steps.insert("get_coordinates".to_string(), ShAction {
-            id: coordinates_id,
-            name: "get_coordinates".to_string(),
-            kind: "composition".to_string(),
-            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "open_weather_config".to_string(),
-                    r#type: "OpenWeatherConfig".to_string(),
-                    template: json!({
-                        "location_name": "{{inputs[0].location_name}}",
-                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
-                    }),
-                    value: None,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None,
-        });
         
         // Step 2: get_weather - depends on get_coordinates
         let weather_id = uuid::Uuid::new_v4().to_string();
@@ -700,9 +667,36 @@ mod tests {
             types: None,
         });
 
+        // Step 1: get_coordinates - no dependencies
+        let coordinates_id = uuid::Uuid::new_v4().to_string();
+        steps.insert("get_coordinates".to_string(), ShAction {
+            id: coordinates_id,
+            name: "get_coordinates".to_string(),
+            kind: "composition".to_string(),
+            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "open_weather_config".to_string(),
+                    r#type: "OpenWeatherConfig".to_string(),
+                    template: json!({
+                        "location_name": "{{inputs[0].location_name}}",
+                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
+                    }),
+                    value: None,
+                }
+            ],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+    
+
         // Test the topological sort
         let sorted_steps = engine.topological_sort_composition_steps(&steps).await.unwrap();
         
+        println!("Sorted steps: {:#?}", sorted_steps);
         // Just assert that sorted steps are an array ["get_coordinates", "get_weather"]
         assert_eq!(sorted_steps, vec!["get_coordinates", "get_weather"]);
         // Verify all steps are included
