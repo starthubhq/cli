@@ -18,9 +18,7 @@ use std::fs;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod models;
-mod execution;
-
+use starthub_server::{ execution};
 use execution::ExecutionEngine;
 
 // Global constants for local development server
@@ -48,9 +46,9 @@ impl AppState {
         let (ws_sender, _) = broadcast::channel(100);
         
         // Initialize execution engine with API configuration
-        let base_url = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
-        let token = std::env::var("STARTHUB_TOKEN").ok();
-        let execution_engine = Arc::new(ExecutionEngine::new(base_url, token));
+        // let base_url = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
+        // let token = std::env::var("STARTHUB_TOKEN").ok();
+        let execution_engine = Arc::new(ExecutionEngine::new());
         
         Self { 
             ws_sender,

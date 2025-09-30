@@ -5,21 +5,19 @@ use dirs;
 use reqwest::{self};
 use petgraph::Graph;
 use petgraph::algo::toposort;
-use jsonschema::JSONSchema;
 
-use crate::models::{ShManifest, ShKind, HubClient, ShIO, ShAction};
+use crate::models::{ShManifest, ShKind, ShIO, ShAction};
 
 // Constants
 const STARTHUB_API_BASE_URL: &str = "https://api.starthub.so";
 const STARTHUB_STORAGE_PATH: &str = "/storage/v1/object/public/artifacts";
 const STARTHUB_MANIFEST_FILENAME: &str = "starthub-lock.json";
 pub struct ExecutionEngine {
-    client: HubClient,
     cache_dir: std::path::PathBuf,
 }
 
 impl ExecutionEngine {
-    pub fn new(base_url: String, token: Option<String>) -> Self {
+    pub fn new() -> Self {
         let cache_dir = dirs::cache_dir()
             .unwrap_or(std::env::temp_dir())
             .join("starthub/oci");
@@ -30,12 +28,11 @@ impl ExecutionEngine {
         }
         
         Self {
-            client: HubClient::new(base_url, token),
             cache_dir,
         }
     }
 
-    pub async fn execute_action(&self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
+    pub async fn execute_action(&self, action_ref: &str, _inputs: Vec<Value>) -> Result<Value> {
         // Ensure cache directory exists before starting execution.
         // It should already exist, but just in case.
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
@@ -43,227 +40,207 @@ impl ExecutionEngine {
         }
         
         // 1. Build the action tree
-        let mut root_action = self.build_action_tree(
+        let root_action = self.build_action_tree(
             action_ref,         // Action reference to download
             None,               // No parent action ID (root)
         ).await?;     
 
+        // Print root actino
         println!("Root action: {:#?}", root_action);
-        self.run_action_tree(&mut root_action, inputs).await?;
+        // self.run_action_tree(&mut root_action, inputs).await?;
 
         // Return the action tree (no execution)
         Ok(serde_json::to_value(root_action)?)
     }
 
-    async fn run_action_tree(&self,
-        action_state: &mut ShAction,
-        inputs: Vec<Value>) -> Result<()> {
+    // async fn run_action_tree(&self,
+    //     action_state: &mut ShAction,
+    //     inputs: Vec<Value>) -> Result<()> {
 
-        // Run type checking
-        let resolved_action: ShAction = self.resolve_inputs(action_state, &inputs)?;
+    //     // Base condition
+    //     if action_state.kind == "wasm" || action_state.kind == "docker" {
+    //         return Ok(());
+    //     }
 
-        // Run the action tree recursively again,
-        // this time with the resolved inputs.
-
-        // The base condition is for the kind to be "wasm" or "docker".
-        // If it's a composition, then we keep iterating recursively.
-
-        // After we return from the execution, we run type checking against the outputs,
-        // just the same way we did for inputs.
-
-        // Inject the outputs in the output variables
-
-        // If it's a composition and all steps have been executed, then
-        // the aggregate all the outputs back at the higher level
-
-        return Ok(());
-    }
-
-    fn resolve_json_path(&self, path: &str, inputs: &Vec<Value>) -> Result<Value> {
-        let parts: Vec<&str> = path.split('.').collect();
+    //     // Resolve inputs and run type checking
+    //     let resolved_inputs: Vec<Value> = self.resolve_inputs(action_state, &inputs)?;
         
-        if parts.is_empty() {
-            return Err(anyhow::anyhow!("Empty JSON path"));
-        }
-        
-        let root = parts[0];
-        let mut current = match root {
-            "inputs" => Value::Array(inputs.iter().map(|input| serde_json::to_value(input).unwrap()).collect()),
-            _ => return Err(anyhow::anyhow!("Unknown root variable: {}", root))
-        };
-        
-        for part in &parts[1..] {
-            current = match current {
-                Value::Array(arr) => {
-                    if let Ok(index) = part.parse::<usize>() {
-                        arr.get(index)
-                            .ok_or_else(|| anyhow::anyhow!("Index {} out of bounds", index))?
-                            .clone()
-                    } else {
-                        return Err(anyhow::anyhow!("Invalid array index: {}", part));
-                    }
-                }
-                Value::Object(obj) => {
-                    obj.get(*part)
-                        .ok_or_else(|| anyhow::anyhow!("Property '{}' not found", part))?
-                        .clone()
-                }
-                _ => return Err(anyhow::anyhow!("Cannot access property '{}' on non-object", part))
-            };
-        }
-        
-        Ok(current)
-    }
+    //     // For every input, want to assign the value of the corresponding index
+    //     // in the resolved_inputs vector
+    //     for (index, input) in action_state.inputs.iter_mut().enumerate() {
+    //         if let Some(resolved_input) = resolved_inputs.get(index) {
+    //             input.value = Some(resolved_input.clone());
+    //         }
+    //     }
 
-    // Returns true or false, depending on whether the injected values are co
-    fn resolve_inputs(&self, action_state: &ShAction, inputs: &Vec<Value>) -> Result<ShAction> {        
-        let mut resolved_action = action_state.clone();
+    //     // Run the action tree recursively - DFS
+    //     for step_id in &action_state.execution_order {
+    //         if let Some(step) = action_state.steps.get_mut(step_id) {
+    //             Box::pin(self.run_action_tree(step, resolved_inputs.clone())).await?;
+    //         }
+    //     }
 
-        // We extract the types from the action state
-        let types = &action_state.types;
-        let inputs = &action_state.inputs;
-        let mut type_checked_inputs = Vec::new();
+    //     // The base condition is for the kind to be "wasm" or "docker".
+    //     // If it's a composition, then we keep iterating recursively.
 
-        // For every value, find its corresponding input by index
-        for (index, value) in inputs.iter().enumerate() {
-            if let Some(input) = inputs.get(index) {
-                // Find the type definition in the types object
-                if let Some(types_map) = types {
-                    if let Some(type_definition) = types_map.get(&input.r#type) {                        
-                        let json_schema = match self.convert_to_json_schema(type_definition) {
-                            Ok(schema) => schema,
-                            Err(e) => {
-                                println!("Failed to convert type definition: {}", e);
-                                return Err(anyhow::anyhow!("Failed to convert type definition: {}", e));
-                            }
-                        };
+    //     // After we return from the execution, we run type checking against the outputs,
+    //     // just the same way we did for inputs.
 
-                        // Compile the JSON schema
-                        let compiled_schema = match JSONSchema::compile(&json_schema) {
-                            Ok(schema) => schema,
-                            Err(e) => {
-                                println!("Failed to compile schema for type '{}': {}", input.r#type, e);
-                                return Err(anyhow::anyhow!("Failed to compile schema for type '{}': {}", input.r#type, e));
-                            }
-                        };
-                        
-                        // Validate the value against the schema
-                        // if compiled_schema.validate(&value.value).is_ok() {
-                        //     println!("Value {} is valid", index);
-                        //     type_checked_inputs.push(ShIO {
-                        //         name: input.name.clone(),
-                        //         r#type: input.r#type.clone(),
-                        //         required: input.required,
-                        //         template: value.template.clone(),
-                        //         value: None,
-                        //     });
-                        // } else {
-                        //     let error_list: Vec<_> = compiled_schema.validate(value).unwrap_err().collect();
-                        //     println!("Value {} is invalid: {:?}", index, error_list);
-                        //     return Err(anyhow::anyhow!("Value {} is invalid: {:?}", index, error_list));
-                        // }
-                    } else {
-                        println!("Type '{}' not found in types", input.r#type);
-                        return Err(anyhow::anyhow!("Type '{}' not found in types", input.r#type));                       
-                    }
-                } else {
-                    println!("No types defined");
-                    return Err(anyhow::anyhow!("No types defined"));
-                }
-            }
-        }
+    //     // Inject the outputs in the output variables
 
-        resolved_action.inputs = type_checked_inputs;
-        
-        return Ok(resolved_action); // All values are valid
-    }
+    //     // If it's a composition and all steps have been executed, then
+    //     // the aggregate all the outputs back at the higher level
 
-    fn convert_to_json_schema(&self, type_definition: &Value) -> Result<Value> {
-        match type_definition {
-            Value::Object(obj) => {
-                // Check if this is a field definition (has type, description, required)
-                if obj.contains_key("type") {
-                    // This is a field definition, convert it
-                    let mut property = serde_json::Map::new();
+    //     return Ok(());
+    // }
+
+    // // Returns true or false, depending on whether the injected values are co
+    // fn resolve_inputs(&self, action_state: &ShAction, inputs: &Vec<Value>) -> Result<Vec<Value>> {        
+    //     // Print inputs
+    //     // We extract the types from the action state
+    //     let types = &action_state.types;
+    //     let action_inputs = &action_state.inputs;
+    //     let mut type_checked_inputs: Vec<Value> = Vec::new();
+
+    //     // For every value, find its corresponding input by index
+    //     for (index, input) in action_inputs.iter().enumerate() {
+    //         if let Some(input) = action_inputs.get(index) {
+                
+    //             // Find the type definition in the types object
+    //             if let Some(types_map) = types {
+    //                 if let Some(type_definition) = types_map.get(&input.r#type) {                        
+    //                     let json_schema = match self.convert_to_json_schema(type_definition) {
+    //                         Ok(schema) => schema,
+    //                         Err(e) => {
+    //                             println!("Failed to convert type definition: {}", e);
+    //                             return Err(anyhow::anyhow!("Failed to convert type definition: {}", e));
+    //                         }
+    //                     };
+
+    //                     // Compile the JSON schema
+    //                     let compiled_schema = match JSONSchema::compile(&json_schema) {
+    //                         Ok(schema) => schema,
+    //                         Err(e) => {
+    //                             println!("Failed to compile schema for type '{}': {}", input.r#type, e);
+    //                             return Err(anyhow::anyhow!("Failed to compile schema for type '{}': {}", input.r#type, e));
+    //                         }
+    //                     };
+
+    //                     println!("Compiled schema: {:#?}", compiled_schema);
+
+    //                     // Validate the value against the schema
+    //                     if let Some(actual_value) = inputs.get(index) {
+    //                         if compiled_schema.validate(actual_value).is_ok() {
+    //                             println!("Value is valid {}: {}", index, actual_value);
+    //                             type_checked_inputs.push(actual_value.clone());
+    //                         } else {
+    //                             let error_list: Vec<_> = compiled_schema.validate(actual_value).unwrap_err().collect();
+    //                             println!("Value {} is invalid: {:?}", index, error_list);
+    //                             return Err(anyhow::anyhow!("Value {} is invalid: {:?}", index, error_list));
+    //                         }
+    //                     } else {
+    //                         return Err(anyhow::anyhow!("No value provided for input {}", index));
+    //                     }
+    //                 } else {
+    //                     println!("Type '{}' not found in types", input.r#type);
+    //                     return Err(anyhow::anyhow!("Type '{}' not found in types", input.r#type));                       
+    //                 }
+    //             } else {
+    //                 println!("No types defined");
+    //                 return Err(anyhow::anyhow!("No types defined"));
+    //             }
+    //         }
+    //     }
+
+    //     Ok(type_checked_inputs)
+    // }
+
+    // fn convert_to_json_schema(&self, type_definition: &Value) -> Result<Value> {
+    //     match type_definition {
+    //         Value::Object(obj) => {
+    //             // Check if this is a field definition (has type, description, required)
+    //             if obj.contains_key("type") {
+    //                 // This is a field definition, convert it
+    //                 let mut property = serde_json::Map::new();
                     
-                    // Add type
-                    if let Some(field_type) = obj.get("type") {
-                        property.insert("type".to_string(), field_type.clone());
-                    }
+    //                 // Add type
+    //                 if let Some(field_type) = obj.get("type") {
+    //                     property.insert("type".to_string(), field_type.clone());
+    //                 }
                     
-                    // Add description
-                    if let Some(description) = obj.get("description") {
-                        property.insert("description".to_string(), description.clone());
-                    }
+    //                 // Add description
+    //                 if let Some(description) = obj.get("description") {
+    //                     property.insert("description".to_string(), description.clone());
+    //                 }
                     
-                    // Handle nested objects recursively
-                    if let Some(properties) = obj.get("properties") {
-                        if let Ok(nested_schema) = self.convert_to_json_schema(properties) {
-                            property.insert("properties".to_string(), nested_schema);
-                        }
-                    }
+    //                 // Handle nested objects recursively
+    //                 if let Some(properties) = obj.get("properties") {
+    //                     if let Ok(nested_schema) = self.convert_to_json_schema(properties) {
+    //                         property.insert("properties".to_string(), nested_schema);
+    //                     }
+    //                 }
                     
-                    // Handle arrays
-                    if let Some(items) = obj.get("items") {
-                        if let Ok(item_schema) = self.convert_to_json_schema(items) {
-                            property.insert("items".to_string(), item_schema);
-                        }
-                    }
+    //                 // Handle arrays
+    //                 if let Some(items) = obj.get("items") {
+    //                     if let Ok(item_schema) = self.convert_to_json_schema(items) {
+    //                         property.insert("items".to_string(), item_schema);
+    //                     }
+    //                 }
                     
-                    Ok(Value::Object(property))
-                } else {
-                    // This is a type definition with multiple fields
-                    let mut schema = serde_json::Map::new();
-                    schema.insert("type".to_string(), Value::String("object".to_string()));
+    //                 Ok(Value::Object(property))
+    //             } else {
+    //                 // This is a type definition with multiple fields
+    //                 let mut schema = serde_json::Map::new();
+    //                 schema.insert("type".to_string(), Value::String("object".to_string()));
                     
-                    let mut properties = serde_json::Map::new();
-                    let mut required = Vec::new();
+    //                 let mut properties = serde_json::Map::new();
+    //                 let mut required = Vec::new();
                     
-                    for (field_name, field_def) in obj {
-                        if let Ok(converted_field) = self.convert_to_json_schema(field_def) {
-                            properties.insert(field_name.clone(), converted_field);
+    //                 for (field_name, field_def) in obj {
+    //                     if let Ok(converted_field) = self.convert_to_json_schema(field_def) {
+    //                         properties.insert(field_name.clone(), converted_field);
                             
-                            // Check if this field is required
-                            if let Some(field_obj) = field_def.as_object() {
-                                if let Some(required_val) = field_obj.get("required") {
-                                    if required_val.as_bool().unwrap_or(false) {
-                                        required.push(field_name.clone());
-                                    }
-                                }
-                            }
-                        }
-                    }
+    //                         // Check if this field is required
+    //                         if let Some(field_obj) = field_def.as_object() {
+    //                             if let Some(required_val) = field_obj.get("required") {
+    //                                 if required_val.as_bool().unwrap_or(false) {
+    //                                     required.push(field_name.clone());
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+    //                 }
                     
-                    schema.insert("properties".to_string(), Value::Object(properties));
-                    if !required.is_empty() {
-                        schema.insert("required".to_string(), Value::Array(required.into_iter().map(Value::String).collect()));
-                    }
+    //                 schema.insert("properties".to_string(), Value::Object(properties));
+    //                 if !required.is_empty() {
+    //                     schema.insert("required".to_string(), Value::Array(required.into_iter().map(Value::String).collect()));
+    //                 }
                     
-                    Ok(Value::Object(schema))
-                }
-            }
-            Value::Array(arr) => {
-                // Handle arrays
-                let mut schema = serde_json::Map::new();
-                schema.insert("type".to_string(), Value::String("array".to_string()));
+    //                 Ok(Value::Object(schema))
+    //             }
+    //         }
+    //         Value::Array(arr) => {
+    //             // Handle arrays
+    //             let mut schema = serde_json::Map::new();
+    //             schema.insert("type".to_string(), Value::String("array".to_string()));
                 
-                if let Some(first_item) = arr.first() {
-                    if let Ok(item_schema) = self.convert_to_json_schema(first_item) {
-                        schema.insert("items".to_string(), item_schema);
-                    }
-                }
+    //             if let Some(first_item) = arr.first() {
+    //                 if let Ok(item_schema) = self.convert_to_json_schema(first_item) {
+    //                     schema.insert("items".to_string(), item_schema);
+    //                 }
+    //             }
                 
-                Ok(Value::Object(schema))
-            }
-            Value::String(s) => {
-                // Handle primitive types
-                let mut schema = serde_json::Map::new();
-                schema.insert("type".to_string(), Value::String(s.clone()));
-                Ok(Value::Object(schema))
-            }
-            _ => Err(anyhow::anyhow!("Unsupported type definition format"))
-        }
-    }
+    //             Ok(Value::Object(schema))
+    //         }
+    //         Value::String(s) => {
+    //             // Handle primitive types
+    //             let mut schema = serde_json::Map::new();
+    //             schema.insert("type".to_string(), Value::String(s.clone()));
+    //             Ok(Value::Object(schema))
+    //         }
+    //         _ => Err(anyhow::anyhow!("Unsupported type definition format"))
+    //     }
+    // }
 
     async fn build_action_tree(&self,
         action_ref: &str,
@@ -296,7 +273,6 @@ impl ExecutionEngine {
                         Some(ShIO {
                             name: obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                             r#type: obj.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            required: obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
                             template: obj.get("value").cloned().unwrap_or(serde_json::Value::Null),
                             value: None,
                         })
@@ -313,7 +289,6 @@ impl ExecutionEngine {
                             Some(ShIO {
                                 name: obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                                 r#type: obj.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                required: obj.get("required").and_then(|v| v.as_bool()).unwrap_or(false),
                                 template: obj.get("value").cloned().unwrap_or(serde_json::Value::Null),
                                 value: None,
                             })
@@ -332,7 +307,7 @@ impl ExecutionEngine {
         };
         
         // 4. For each step, call the build_action_tree function recursively
-        for (step_name, step_value) in manifest.steps {
+        for (_step_name, step_value) in manifest.steps {
             if let Some(uses_value) = step_value.get("uses") {
                 if let Some(uses_str) = uses_value.as_str() {
                     let mut child_action = Box::pin(self.build_action_tree(
@@ -357,14 +332,15 @@ impl ExecutionEngine {
                     }
 
                     // Add child to parent's children HashMap
-                    action_state.steps.insert(child_action.id.clone(), child_action);
+                    action_state.steps.insert(child_action.name.clone(), child_action);
                 }
             }
         }
 
+        // At this point we have resolved all the children
         // 5. Topologically sort steps based on dependencies
         let sorted_step_ids = self.topological_sort_composition_steps(&action_state.steps).await?;
-        
+
         // 6. Add the sorted step IDs to the execution order field
         for step_id in sorted_step_ids {
             action_state.execution_order.push(step_id);
@@ -401,27 +377,39 @@ impl ExecutionEngine {
         }
     }
 
-    async fn topological_sort_composition_steps(&self, children: &HashMap<String, ShAction>) -> Result<Vec<String>> {
+    async fn topological_sort_composition_steps(&self, steps: &HashMap<String, ShAction>) -> Result<Vec<String>> {
         // Build dependency graph using petgraph
         let mut graph = Graph::<String, ()>::new();
         let mut node_map = HashMap::new();
         
+        // Nodes
         // Add all child actions as nodes
-        for (child_id, _) in children {
+        for (child_id, _) in steps {
             let node = graph.add_node(child_id.clone());
             node_map.insert(child_id.clone(), node);
         }
         
+        // Edges
         // Analyze dependencies by looking at template variables in child action inputs
-        for (child_id, child_action) in children {
-            let step_deps = self.find_template_dependencies(&serde_json::to_value(&child_action.inputs)?)?;
-            for dep in step_deps {
-                if let (Some(&current_node), Some(&dep_node)) = (node_map.get(child_id), node_map.get(&dep)) {
-                    graph.add_edge(dep_node, current_node, ());
+        for (child_id, child_action) in steps {
+            // Every composite action contains, in its child steps, the mapping of how they use
+            // either the inputs or other steps to get information to use.
+
+            // For each input in the child action
+            // find the template dependencies
+            for input in child_action.inputs.clone() {
+                let step_deps = self.find_template_dependencies(&serde_json::to_value(&input.template)?, steps)?;
+                
+                for dep in step_deps {
+                    if let (Some(&current_node), Some(&dep_node)) = (node_map.get(child_id), node_map.get(&dep)) {
+                        graph.add_edge(dep_node, current_node, ());
+                    }
                 }
             }
         }
         
+        // println!("Graph DOT format:");
+        // println!("{:?}", petgraph::dot::Dot::new(&graph));
         // Perform topological sort
         let sorted_nodes = toposort(&graph, None)
             .map_err(|_| anyhow::anyhow!("Circular dependency detected in composition steps"))?;
@@ -436,61 +424,323 @@ impl ExecutionEngine {
         Ok(sorted_step_ids)
     }
     
-    fn find_template_dependencies(&self, value: &Value) -> Result<Vec<String>> {
+    pub fn find_template_dependencies(&self, value: &Value, steps: &HashMap<String, ShAction>) -> Result<Vec<String>> {        
+        // Look for patterns like {{steps.step_name.field}}
+        let re = regex::Regex::new(r"\{\{steps\.([^.]+)")?;
+        let mut deps = std::collections::HashSet::new();
+
         match value {
-            Value::String(s) => {
-                // Look for patterns like {{step_name.field}} (but not {{inputs.field}})
-                let re = regex::Regex::new(r"\{\{([^}]+)\}\}")?;
-                let mut deps = Vec::new();
-                
+            // The template could be a string, an object or an array
+            Value::String(s) => {                        
                 for cap in re.captures_iter(s) {
-                    if let Some(match_str) = cap.get(1) {
-                        let template = match_str.as_str();
-                        // Only extract step dependencies, not input dependencies
-                        if !template.starts_with("inputs.") {
-                            // Extract step name from template (e.g., "get_coordinates[0].coordinates.lat" -> "get_coordinates")
-                            let step_name = if let Some(bracket_pos) = template.find('[') {
-                                &template[..bracket_pos]
-                            } else if let Some(dot_pos) = template.find('.') {
-                                // Fallback for old format without brackets
-                                &template[..dot_pos]
-                            } else {
-                                continue;
-                            };
-                            
-                            let step_name = step_name.to_string();
-                            if !deps.contains(&step_name) {
-                                deps.push(step_name);
+                    if let Some(step_name) = cap.get(1) {
+                        let step_name = step_name.as_str();
+                        
+                        // Find the step ID that corresponds to this step name
+                        for (step_id, step) in steps {
+                            if step.name == step_name {
+                                deps.insert(step_id.clone());
+                                break;
                             }
                         }
                     }
                 }
-                Ok(deps)
+                Ok(deps.into_iter().collect())
             },
+            // If the value is an object, we need to find the dependencies int the object
+            // recursively
             Value::Object(obj) => {
-                let mut all_deps = Vec::new();
                 for (_, v) in obj {
-                    let child_deps = self.find_template_dependencies(v)?;
-                    all_deps.extend(child_deps);
+                    let child_deps = self.find_template_dependencies(v, steps)?;
+                    deps.extend(child_deps);
                 }
-                // Remove duplicates
-                all_deps.sort();
-                all_deps.dedup();
-                Ok(all_deps)
+                Ok(deps.into_iter().collect())
             },
+            // If the value is an array, we need to find the dependencies in the array
+            // recursively
             Value::Array(arr) => {
-                let mut all_deps = Vec::new();
                 for item in arr {
-                    let child_deps = self.find_template_dependencies(item)?;
-                    all_deps.extend(child_deps);
+                    let child_deps = self.find_template_dependencies(item, steps)?;
+                    deps.extend(child_deps);
                 }
-                // Remove duplicates
-                all_deps.sort();
-                all_deps.dedup();
-                Ok(all_deps)
+                Ok(deps.into_iter().collect())
             },
             _ => Ok(Vec::new())
         }
     }
+}
 
-  }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_find_template_dependencies() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Create mock steps representing the weather composition scenario
+        let mut steps = HashMap::new();
+        
+        // Step 1: get_coordinates - no dependencies
+        let coordinates_id = uuid::Uuid::new_v4().to_string();
+        let coordinates_id_clone = coordinates_id.clone();
+        steps.insert("get_coordinates".to_string(), ShAction {
+            id: coordinates_id,
+            name: "get_coordinates".to_string(),
+            kind: "wasm".to_string(),
+            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "open_weather_config".to_string(),
+                    r#type: "OpenWeatherConfig".to_string(),
+                    template: json!({
+                        "location_name": "{{inputs[0].location_name}}",
+                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
+                    }),
+                    value: None,
+                }
+            ],
+            outputs: vec![
+                ShIO {
+                    name: "coordinates".to_string(),
+                    r#type: "GeocodingResponse".to_string(),
+                    template: json!({}),
+                    value: None,
+                }
+            ],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+        
+        // Step 2: get_weather - depends on get_coordinates
+        let weather_id = uuid::Uuid::new_v4().to_string();
+        let weather_id_clone = weather_id.clone();
+        steps.insert("get_weather".to_string(), ShAction {
+            id: weather_id,
+            name: "get_weather".to_string(),
+            kind: "wasm".to_string(),
+            uses: "starthubhq/openweather-current-weather:0.0.1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "weather_config".to_string(),
+                    r#type: "WeatherConfig".to_string(),
+                    template: json!({
+                        "lat": "{{steps.get_coordinates.outputs[0].coordinates.lat}}",
+                        "lon": "{{steps.get_coordinates.outputs[0].coordinates.lon}}",
+                        "open_weather_api_key": "{{inputs.weather_config.open_weather_api_key}}"
+                    }),
+                    value: None,
+                }
+            ],
+            outputs: vec![
+                ShIO {
+                    name: "weather".to_string(),
+                    r#type: "WeatherResponse".to_string(),
+                    template: json!({}),
+                    value: None,
+                }
+            ],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+
+        // Test case 1: Template that references get_coordinates step (like in the weather composition)
+        let template_value = json!("{{steps.get_coordinates.outputs[0].coordinates.lat}}");
+        let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
+        assert_eq!(result, vec![coordinates_id_clone.clone()]);
+
+        // Test case 2: Template that references get_coordinates step for longitude
+        let template_value = json!("{{steps.get_coordinates.outputs[0].coordinates.lon}}");
+        let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
+        assert_eq!(result, vec![coordinates_id_clone.clone()]);
+
+        // Test case 3: Template that references get_weather step (circular dependency scenario)
+        let template_value = json!("{{steps.get_weather.outputs[0].weather.weather[0].description}}");
+        let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
+        assert_eq!(result, vec![weather_id_clone.clone()]);
+
+        // Test case 4: String without template dependencies
+        let template_value = json!("regular string without templates");
+        let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
+        assert_eq!(result, Vec::<String>::new());
+
+        // Test case 5: Non-string value
+        let template_value = json!(42);
+        let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn test_topological_sort_composition_steps() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Create mock steps with dependencies
+        let mut steps = HashMap::new();
+        
+        // Step 1: get_coordinates - no dependencies
+        let coordinates_id = uuid::Uuid::new_v4().to_string();
+        steps.insert("get_coordinates".to_string(), ShAction {
+            id: coordinates_id,
+            name: "get_coordinates".to_string(),
+            kind: "composition".to_string(),
+            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "open_weather_config".to_string(),
+                    r#type: "OpenWeatherConfig".to_string(),
+                    template: json!({
+                        "location_name": "{{inputs[0].location_name}}",
+                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
+                    }),
+                    value: None,
+                }
+            ],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+        
+        // Step 2: get_weather - depends on get_coordinates
+        let weather_id = uuid::Uuid::new_v4().to_string();
+        steps.insert("get_weather".to_string(), ShAction {
+            id: weather_id,
+            name: "get_weather".to_string(),
+            kind: "composition".to_string(),
+            uses: "starthubhq/openweather-current-weather:0.0.1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "weather_config".to_string(),
+                    r#type: "WeatherConfig".to_string(),
+                    template: json!({
+                        "lat": "{{steps.get_coordinates.outputs[0].coordinates.lat}}",
+                        "lon": "{{steps.get_coordinates.outputs[0].coordinates.lon}}",
+                        "open_weather_api_key": "{{inputs.weather_config.open_weather_api_key}}"
+                    }),
+                    value: None,
+                }
+            ],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+
+        // Test the topological sort
+        let sorted_steps = engine.topological_sort_composition_steps(&steps).await.unwrap();
+        
+        // Just assert that sorted steps are an array ["get_coordinates", "get_weather"]
+        assert_eq!(sorted_steps, vec!["get_coordinates", "get_weather"]);
+        // Verify all steps are included
+        assert_eq!(sorted_steps.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_topological_sort_single_step() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Create mock steps with just one step
+        let mut steps = HashMap::new();
+        
+        // Single step: get_coordinates - no dependencies
+        let coordinates_id = uuid::Uuid::new_v4().to_string();
+        steps.insert("get_coordinates".to_string(), ShAction {
+            id: coordinates_id,
+            name: "get_coordinates".to_string(),
+            kind: "composition".to_string(),
+            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "open_weather_config".to_string(),
+                    r#type: "OpenWeatherConfig".to_string(),
+                    template: json!({
+                        "location_name": "{{inputs[0].location_name}}",
+                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
+                    }),
+                    value: None,
+                }
+            ],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+
+        // Test the topological sort
+        let sorted_steps = engine.topological_sort_composition_steps(&steps).await.unwrap();
+        
+        // Just assert that sorted steps contains only the single step
+        assert_eq!(sorted_steps, vec!["get_coordinates"]);
+        assert_eq!(sorted_steps.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_topological_sort_circular_dependency() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Create mock steps with circular dependency
+        let mut steps = HashMap::new();
+        
+        // Step 1: depends on step 2
+        steps.insert("step1".to_string(), ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test:action1".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "input1".to_string(),
+                    r#type: "string".to_string(),
+                    template: json!("{{steps.step2.outputs[0].result}}"),
+                    value: None,
+                }
+            ],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+        
+        // Step 2: depends on step 1 (circular dependency)
+        steps.insert("step2".to_string(), ShAction {
+            id: "step2".to_string(),
+            name: "step2".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test:action2".to_string(),
+            inputs: vec![
+                ShIO {
+                    name: "input2".to_string(),
+                    r#type: "string".to_string(),
+                    template: json!("{{steps.step1.outputs[0].result}}"),
+                    value: None,
+                }
+            ],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        });
+
+        // Test that circular dependency is detected
+        let result = engine.topological_sort_composition_steps(&steps).await;
+        assert!(result.is_err(), "Should detect circular dependency");
+        
+        if let Err(e) = result {
+            assert!(e.to_string().contains("Circular dependency detected"));
+        }
+    }
+}

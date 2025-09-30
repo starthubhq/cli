@@ -3,6 +3,10 @@ name = "starthub-server"
 version = "0.0.1"
 edition = "2021"
 
+[lib]
+name = "starthub_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "starthub-server"
 path = "src/main.rs"

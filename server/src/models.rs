@@ -39,7 +39,6 @@ pub struct ShIO {
     pub name: String,
     #[serde(rename = "type")]
     pub r#type: String,
-    pub required: bool,
     pub template: Value,
     pub value: Option<Value>,
 }
