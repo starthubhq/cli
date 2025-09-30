@@ -67,6 +67,7 @@ impl ExecutionEngine {
         // Resolve inputs and run type checking
         let resolved_inputs: Vec<Value> = self.resolve_inputs(action_state, &inputs)?;
         
+        println!("Resolved inputs: {:#?}", resolved_inputs);
         // For every input, want to assign the value of the corresponding index
         // in the resolved_inputs vector
         for (index, input) in action_state.inputs.iter_mut().enumerate() {
@@ -75,7 +76,9 @@ impl ExecutionEngine {
             }
         }
 
-        // Run the action tree recursively - DFS
+        println!("Action state: {:#?}", action_state);
+        println!("+++++++++++++++++++++++++++++++++++++++++++");
+        // // Run the action tree recursively - DFS
         for step_id in &action_state.execution_order {
             if let Some(step) = action_state.steps.get_mut(step_id) {
                 Box::pin(self.run_action_tree(step, resolved_inputs.clone())).await?;
@@ -99,10 +102,12 @@ impl ExecutionEngine {
     // Returns true or false, depending on whether the injected values are co
     fn resolve_inputs(&self, action_state: &ShAction, inputs: &Vec<Value>) -> Result<Vec<Value>> {        
         // Print inputs
+        println!("Action state: {:#?}", action_state);
+        println!("Inputs: {:#?}", inputs);
         // We extract the types from the action state
         let types = &action_state.types;
         let action_inputs = &action_state.inputs;
-        let mut type_checked_inputs: Vec<Value> = Vec::new();
+        let mut resolved_inputs: Vec<Value> = Vec::new();
 
         // For every value, find its corresponding input by index
         for (index, _input) in action_inputs.iter().enumerate() {
@@ -128,13 +133,11 @@ impl ExecutionEngine {
                             }
                         };
 
-                        println!("Compiled schema: {:#?}", compiled_schema);
-
                         // Validate the value against the schema
                         if let Some(actual_value) = inputs.get(index) {
                             if compiled_schema.validate(actual_value).is_ok() {
                                 println!("Value is valid {}: {}", index, actual_value);
-                                type_checked_inputs.push(actual_value.clone());
+                                resolved_inputs.push(actual_value.clone());
                             } else {
                                 let error_list: Vec<_> = compiled_schema.validate(actual_value).unwrap_err().collect();
                                 println!("Value {} is invalid: {:?}", index, error_list);
@@ -154,7 +157,7 @@ impl ExecutionEngine {
             }
         }
 
-        Ok(type_checked_inputs)
+        Ok(resolved_inputs)
     }
 
     fn convert_to_json_schema(&self, type_definition: &Value) -> Result<Value> {
@@ -954,7 +957,7 @@ mod tests {
             parent_action: None,
             steps: HashMap::new(),
             execution_order: vec![],
-            types: Some(types.into_iter().collect()),
+            types: Some(types.clone().into_iter().collect()),
         };
         
         // Test case 1: Valid inputs that match the schema
@@ -1013,6 +1016,31 @@ mod tests {
         
         let result = engine.resolve_inputs(&action_state_no_types, &valid_inputs);
         assert!(result.is_err(), "resolve_inputs should fail when no types are defined");
+    }
+
+    #[tokio::test]
+    async fn test_run_action_tree_wasm_early_return() {
+        // Test that WASM actions return early without processing
+        let engine = ExecutionEngine::new();
+        
+        let mut wasm_action = ShAction {
+            id: "test-wasm".to_string(),
+            name: "test-wasm".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test:wasm".to_string(),
+            inputs: vec![],
+            outputs: vec![],
+            parent_action: None,
+            steps: HashMap::new(),
+            execution_order: vec![],
+            types: None,
+        };
+        
+        let inputs = vec![json!({"test": "data"})];
+        let result = engine.run_action_tree(&mut wasm_action, inputs).await;
+        
+        // Should succeed and return early without processing
+        assert!(result.is_ok(), "run_action_tree should succeed for wasm action");
     }
 
     
