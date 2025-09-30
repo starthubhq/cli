@@ -65,7 +65,10 @@ impl ExecutionEngine {
         }
 
         // Resolve inputs and run type checking
-        let resolved_inputs: Vec<Value> = self.resolve_inputs(action_state, &inputs)?;
+        let resolved_inputs: Vec<Value> = self.resolve_inputs(
+            &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+            &action_state.inputs,
+            &inputs)?;
         
         println!("Resolved inputs: {:#?}", resolved_inputs);
         // For every input, want to assign the value of the corresponding index
@@ -100,13 +103,11 @@ impl ExecutionEngine {
     }
 
     // Returns true or false, depending on whether the injected values are co
-    fn resolve_inputs(&self, action_state: &ShAction, inputs: &Vec<Value>) -> Result<Vec<Value>> {        
-        // Print inputs
-        println!("Action state: {:#?}", action_state);
-        println!("Inputs: {:#?}", inputs);
+    fn resolve_inputs(&self,
+        types: &Option<HashMap<String, Value>>, 
+        action_inputs: &Vec<ShIO>,
+        inputs: &Vec<Value>) -> Result<Vec<Value>> {        
         // We extract the types from the action state
-        let types = &action_state.types;
-        let action_inputs = &action_state.inputs;
         let mut resolved_inputs: Vec<Value> = Vec::new();
 
         // For every value, find its corresponding input by index
@@ -968,7 +969,10 @@ mod tests {
             })
         ];
         
-        let result = engine.resolve_inputs(&action_state, &valid_inputs);
+        let result = engine.resolve_inputs(
+            &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+            &action_state.inputs,
+            &valid_inputs);
         assert!(result.is_ok(), "resolve_inputs should succeed for valid inputs");
         
         let resolved_inputs = result.unwrap();
@@ -984,12 +988,16 @@ mod tests {
             })
         ];
         
-        let result = engine.resolve_inputs(&action_state, &invalid_inputs);
+        let result = engine.resolve_inputs(&action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+        &action_state.inputs,
+        &invalid_inputs);
         assert!(result.is_err(), "resolve_inputs should fail for invalid inputs");
         
         // Test case 3: No inputs provided
         let empty_inputs = vec![];
-        let result = engine.resolve_inputs(&action_state, &empty_inputs);
+        let result = engine.resolve_inputs(&action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+        &action_state.inputs,
+        &empty_inputs);
         assert!(result.is_err(), "resolve_inputs should fail when no inputs provided");
         
         // Test case 4: Action state with no types defined
@@ -1014,7 +1022,9 @@ mod tests {
             types: None, // No types defined
         };
         
-        let result = engine.resolve_inputs(&action_state_no_types, &valid_inputs);
+        let result = engine.resolve_inputs(&action_state_no_types.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+        &action_state_no_types.inputs,
+        &valid_inputs);
         assert!(result.is_err(), "resolve_inputs should fail when no types are defined");
     }
 
