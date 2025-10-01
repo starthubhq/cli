@@ -60,33 +60,17 @@ impl ExecutionEngine {
     async fn run_action_tree(&self,
         action_state: &mut ShAction,
         parent_inputs: &Vec<Value>,
-        executed_sibling_steps: &HashMap<String, ShAction>) -> Result<()> {
-        println!("_______________________________________________________");
-        println!("action: {}", action_state.uses);
-        println!("_______________________________________________________");
-
+        executed_sibling_steps: &HashMap<String, ShAction>) -> Result<(ShAction)> {
+        
         // 1) Check whether the current action is ok with the inputs that are being passed to it.
         // Always resolve inputs first, independently of whether
         // we are dealing with a composition or an atomic action
-        let instantiated_inputs: Vec<Value> = self.instantiate_inputs(
+        let instantiated_inputs: Vec<Value> = self.instantiate(
             &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
             &action_state.inputs,
             &parent_inputs
         )?;
 
-        println!("Instantiated inputs to be applied to the current action: {:#?}", instantiated_inputs);
-        // Base condition
-        // TODO: we need to figure out what to really return from the leaves
-        if action_state.kind == "wasm" || action_state.kind == "docker" {
-            println!("Executing atomic action: {}", action_state.uses);
-            let inputs_value = serde_json::to_value(&instantiated_inputs)?;
-            let result = self.run_wasm_step(action_state, None, &inputs_value).await?;
-            
-            println!("Result: {:#?}", result);
-            
-            return Ok(());
-        }
-        
         // For every input, want to assign the value of the corresponding resolved
         // input to its value field.
         for (index, input) in action_state.inputs.iter_mut().enumerate() {
@@ -95,12 +79,56 @@ impl ExecutionEngine {
             }
         }
 
+        println!("instantiated_inputs: {:#?}", instantiated_inputs);
+        println!("action_state: {:#?}", action_state);
+
+        // Base condition
+        // TODO: we need to figure out what to really return from the leaves
+        if action_state.kind == "wasm" || action_state.kind == "docker" {
+            let inputs_value = serde_json::to_value(&instantiated_inputs)?;
+            let result = self.run_wasm_step(action_state, None, &inputs_value).await?;
+            let json_objects: Vec<Value> = if result.is_empty() {
+                Vec::new()
+            } else {
+                if let Some(first_result) = result.first() {
+                    if let Some(array) = first_result.as_array() {
+                        array.iter().map(|item| Self::parse_json_strings_recursively(item.clone())).collect()
+                    } else {
+                        vec![Self::parse_json_strings_recursively(first_result.clone())]
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let mut action_state_clone = action_state.clone();
+            
+            let instantiated_outputs: Vec<Value> = self.instantiate(
+                &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+                &action_state.outputs,
+                &json_objects
+            )?;
+
+            // For every output, want to assign the value of the corresponding resolved
+            // output to its value field.
+            for (index, output) in action_state_clone.outputs.iter_mut().enumerate() {
+                if let Some(resolved_output) = instantiated_outputs.get(index) {
+                    output.value = Some(resolved_output.clone());
+                }
+            }
+
+            println!("instantiated_outputs: {:#?}", instantiated_outputs);
+            println!("action_state_clone: {:#?}", action_state_clone);
+
+            return Ok(action_state_clone);
+        }
+
         // Track executed steps as we go
         let mut local_executed_steps = executed_sibling_steps.clone();
         
         // Run the action tree recursively - DFS
         for step_id in &action_state.execution_order {
-            
+            println!("Executing step: {:#?}", step_id);
             if let Some(step) = action_state.steps.get_mut(step_id) {
                 // For each step, we need to use the inputs and types field
                 // of the step to generate a completely new object with that structure.
@@ -109,7 +137,6 @@ impl ExecutionEngine {
                 // also the structure of the input, along with how the inputs from the
                 // current action or sibling need to be injected into each child step input.
 
-                println!("Step id: {}", step_id);    
                 // 2) Generate the inputs object that are going to be passed to the next recursion.
                 // Resolve inputs for this step using the same logic as the main resolve_inputs function
                 let child_step_resolved_inputs = self.resolve_template(
@@ -119,57 +146,98 @@ impl ExecutionEngine {
                     &local_executed_steps
                 )?;
 
-                println!("Child step resolved inputs to be passed to next recursion: {:#?}", child_step_resolved_inputs);
-
                 // Clone the step before executing to avoid borrow checker issues
-                let step_clone = step.clone();
-                let step_name = step_clone.name.clone();
+                // let mut step_clone = step.clone();
+                // let step_name = step_clone.name.clone();
                 
                 // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
-                Box::pin(self.run_action_tree(
+                let processed_child = Box::pin(self.run_action_tree(
                     step, 
                     &child_step_resolved_inputs,  // Parent's resolved inputs for template resolution
                     &local_executed_steps
                 )).await?;
-                
+         
+                // We want to assign the outputs of the processed child
+                // into the outputs of the child step used by the parent.
+                // for (index, output) in step_clone.outputs.iter_mut().enumerate() {
+                //     if let Some(resolved_output) = processed_child.outputs.get(index) {
+                //         if let Some(output_value) = &resolved_output.value {
+                //             output.value = Some(output_value.clone());
+                //         }
+                //     }
+                // }
+
                 // Add the executed step to our tracking
-                local_executed_steps.insert(step_name, step_clone);
+                // local_executed_steps.insert(step_name, step_clone);
             }
         }
 
-        // The base condition is for the kind to be "wasm" or "docker".
-        // If it's a composition, then we keep iterating recursively.
+        // If we got here, it means that we have executed all the steps in the action tree.
+        // Now we need to aggregate the outputs back at the higher level.
+        // let parent_step_resolved_outputs = self.resolve_template(
+        //     &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()),
+        //     &action_state.outputs,
+        //     &action_state.outputs.iter().map(|io| io.value.clone().unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>(),
+        //     &local_executed_steps
+        // )?;
 
-        // After we return from the execution, we run type checking against the outputs,
-        // just the same way we did for inputs.
+        // // For every output, want to assign the value of the corresponding resolved
+        // // output to its value field.
+        // for (index, output) in action_state.outputs.iter_mut().enumerate() {
+        //     if let Some(resolved_output) = parent_step_resolved_outputs.get(index) {
+        //         output.value = Some(resolved_output.clone());
+        //     }
+        // }
 
-        // Inject the outputs in the output variables
-
-        // If it's a composition and all steps have been executed, then
-        // the aggregate all the outputs back at the higher level
-
-        return Ok(());
+        return Ok(action_state.clone());
     }
 
-    fn instantiate_inputs(&self, types: &Option<HashMap<String, Value>>, 
-        input_definitions: &Vec<ShIO>,
-        input_values: &Vec<Value>) -> Result<Vec<Value>> {
-        println!("Instantiate inputs");
-        println!("instantiate_inputs: {:#?}", input_definitions);
-        println!("input_values: {:#?}", input_values);
+    fn parse_json_strings_recursively(value: Value) -> Value {
+        match value {
+            Value::Object(mut obj) => {
+                for (key, val) in obj.iter_mut() {
+                    *val = Self::parse_json_strings_recursively(val.clone());
+                }
+                Value::Object(obj)
+            },
+            Value::Array(arr) => {
+                Value::Array(arr.into_iter().map(Self::parse_json_strings_recursively).collect())
+            },
+            Value::String(s) => {
+                // Try to parse as JSON
+                if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
+                    Self::parse_json_strings_recursively(parsed)
+                } else {
+                    Value::String(s)
+                }
+            },
+            _ => value
+        }
+    }
+
+    fn instantiate(&self, types: &Option<HashMap<String, Value>>, 
+        io_definitions: &Vec<ShIO>,
+        io_values: &Vec<Value>) -> Result<Vec<Value>> {
+        println!("Instantiate IO");
+        println!("instantiate_io: {:#?}", io_definitions);
+        println!("io_values: {:#?}", io_values);
         println!("types: {:#?}", types);
-        let mut instantiated_inputs: Vec<Value> = Vec::new();
-        for (index, input) in input_definitions.iter().enumerate() {
+        let mut values_to_inject: Vec<Value> = Vec::new();
+        for (index, input) in io_definitions.iter().enumerate() {
             // For each input definition, we want to fetch the corresponding input value by index
             // and instantiate the input with the value.
-            let instantiated_input = input_values.get(index).unwrap().clone();
-
+            let value_to_inject = io_values.get(index).unwrap().clone();
+            
             // Handle primitive types
-            if input.r#type.as_str() == "string" || input.r#type.as_str() == "bool" || input.r#type.as_str() == "number" {
-                instantiated_inputs.push(instantiated_input);
+            if input.r#type.as_str() == "string" || 
+                input.r#type.as_str() == "bool" ||
+                input.r#type.as_str() == "number" ||
+                input.r#type.as_str() == "object" {
+                values_to_inject.push(value_to_inject);
                 continue;
             }
 
+            // Handle non-primitive types
             // Since the type definition has a "type" field, we can find the corresponding type
             // in the types object.
             if let Some(types_map) = types {
@@ -183,7 +251,6 @@ impl ExecutionEngine {
                         }
                     };
 
-                    println!("4");
                     // Compile the JSON schema
                     let compiled_schema = match JSONSchema::compile(&json_schema) {
                         Ok(schema) => schema,
@@ -193,22 +260,23 @@ impl ExecutionEngine {
                         }
                     };
 
-                    println!("5");
-                    println!("actual_value: {:#?}", input_values.get(index));
                     // Validate the resolved template against the schema
-                    if compiled_schema.validate(&instantiated_input).is_ok() {
-                        instantiated_inputs.push(instantiated_input);
-                        println!("5.5");
+                    if compiled_schema.validate(&value_to_inject).is_ok() {
+                        values_to_inject.push(value_to_inject);
                     } else {
-                        let error_list: Vec<_> = compiled_schema.validate(&instantiated_input).unwrap_err().collect();
+                        let error_list: Vec<_> = compiled_schema.validate(&value_to_inject).unwrap_err().collect();
+                        println!("instantiated_io: {:#?}", value_to_inject);
+                        println!("input: {:#?}", input);
+                        println!("type_definition: {:#?}", type_definition);
+                        println!("json_schema: {:#?}", json_schema);
+                        println!("compiled_schema: {:#?}", compiled_schema);
                         println!("Value {} is invalid: {:?}", index, error_list);
-                        println!("6.5");
                         return Err(anyhow::anyhow!("Value {} is invalid: {:?}", index, error_list));
                     }
                 }
             }
         }
-        Ok(instantiated_inputs)
+        Ok(values_to_inject)
     }
 
     // Given a key value types object, a list of input definitions,
@@ -216,37 +284,37 @@ impl ExecutionEngine {
     // it returns a list of type-checked, resolved inputs.
     fn resolve_template(&self,
         types: &Option<HashMap<String, Value>>, 
-        input_definitions: &Vec<ShIO>,
-        input_values: &Vec<Value>,
+        io_definitions: &Vec<ShIO>,
+        io_values: &Vec<Value>,
         executed_sibling_steps: &HashMap<String, ShAction>) -> Result<Vec<Value>> {        
         // We extract the types from the action state
         let mut resolved_inputs: Vec<Value> = Vec::new();
 
-        println!("types: {:#?}", types);
-        println!("input_definitions: {:#?}", input_definitions);
-        println!("input_values: {:#?}", input_values);
-        println!("executed_sibling_steps: {:#?}", executed_sibling_steps);
+        // println!("types: {:#?}", types);
+        // println!("io_definitions: {:#?}", io_definitions);
+        // println!("io_values: {:#?}", io_values);
+        // println!("executed_sibling_steps: {:#?}", executed_sibling_steps);
 
         // For every value, find its corresponding input by index
-        for (index, _input) in input_definitions.iter().enumerate() {
-            if let Some(input) = input_definitions.get(index) {
+        for (index, _input) in io_definitions.iter().enumerate() {
+            if let Some(input) = io_definitions.get(index) {
                 // First, resolve the template to get the actual input value
                 let interpolated_template = self.interpolate(
                     &input.template, 
                     // We need parent inputs since the input
                     // might be coming from a parent
-                    input_values, 
+                    io_values, 
                     // We need sibling steps since the input
                     // might be coming from a sibling that 
                     // has already been executed
                     executed_sibling_steps
                 )?;
 
-                println!("resolved_template: {:#?}", interpolated_template);
-                println!("1");
+                // println!("resolved_template: {:#?}", interpolated_template);
+                // println!("1");
                 // Handle primitive types that don't need custom type definitions
                 if input.r#type == "string" || input.r#type == "bool" || input.r#type == "number" {
-                    println!("Primitive type: {}", input.r#type);
+                    // println!("Primitive type: {}", input.r#type);
                     // For primitive types, just push the resolved value without schema validation
                     resolved_inputs.push(interpolated_template);
                     continue;
@@ -256,8 +324,6 @@ impl ExecutionEngine {
                 resolved_inputs.push(interpolated_template);
             }
         }
-
-        println!("6");
 
         Ok(resolved_inputs)
     }
@@ -269,15 +335,14 @@ impl ExecutionEngine {
         parent_inputs: &Vec<Value>, 
         executed_steps: &HashMap<String, ShAction>
     ) -> Result<Value> {
-        println!("interpolate: {:#?}", template);
         match template {
             Value::String(s) => {
-                println!("resolve_template_string: {:#?}", s);
+                // println!("resolve_template_string: {:#?}", s);
                 let resolved = self.interpolate_string(s, parent_inputs, executed_steps)?;
                 Ok(Value::String(resolved))
             },
             Value::Object(obj) => {
-                println!("resolve_template_object: {:#?}", obj);
+                // println!("resolve_template_object: {:#?}", obj);
                 // Recursively resolve object templates
                 let mut resolved_obj = serde_json::Map::new();
                 for (key, value) in obj {
@@ -287,7 +352,7 @@ impl ExecutionEngine {
                 Ok(Value::Object(resolved_obj))
             },
             Value::Array(arr) => {
-                println!("resolve_template_array: {:#?}", arr);
+                // println!("resolve_template_array: {:#?}", arr);
                 // Recursively resolve array templates
                 let mut resolved_arr = Vec::new();
                 for item in arr {
@@ -325,11 +390,12 @@ impl ExecutionEngine {
             }
         }
         
-        // Handle {{steps.step_name.outputs[index].field}} patterns
+            // Handle {{steps.step_name.outputs[index].field}} patterns
         let steps_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\.([^}]+)\}\}")?;
         for cap in steps_re.captures_iter(template) {
             if let (Some(step_name), Some(index_str), Some(field)) = (cap.get(1), cap.get(2), cap.get(3)) {
                 if let Ok(index) = index_str.as_str().parse::<usize>() {
+                    println!("Looking for step: {:#?} in executed_steps: {:#?}", step_name.as_str(), executed_steps);
                     if let Some(step) = executed_steps.get(step_name.as_str()) {
                         if let Some(output) = step.outputs.get(index) {
                             if let Some(output_value) = &output.value {
@@ -338,6 +404,7 @@ impl ExecutionEngine {
                                         Value::String(s) => s.clone(),
                                         _ => resolved_value.to_string(),
                                     };
+                                    println!("replacement: {:#?}", replacement);
                                     result = result.replace(&cap[0], &replacement);
                                 }
                             }
@@ -672,7 +739,7 @@ impl ExecutionEngine {
         action: &mut ShAction,
         pipeline_workdir: Option<&str>,
         inputs: &Value,
-    ) -> Result<Value> {
+    ) -> Result<Vec<Value>> {
         if which::which("wasmtime").is_err() {
             bail!("wasmtime not found in PATH");
         }
@@ -757,14 +824,26 @@ impl ExecutionEngine {
             bail!("step '{}' failed with {}", action.id, status);
         }
 
-        // Collect all results from the action
+        // Collect the first result from the WASM module
         let mut results = Vec::new();
         while let Ok(v) = rx.try_recv() { 
             results.push(v);
         }
         
-        // Return the last result or an empty object if no results
-        Ok(results.last().cloned().unwrap_or_else(|| serde_json::json!({})))
+        // The WASM module outputs a single JSON array, so we take the first result
+        if results.is_empty() {
+            // If no results, return an empty vector
+            Ok(Vec::new())
+        } else {
+            // Take the first result and parse it as an array
+            let first_result = &results[0];
+            if let Some(array) = first_result.as_array() {
+                Ok(array.clone())
+            } else {
+                // If it's not an array, wrap it in a single-element array
+                Ok(vec![first_result.clone()])
+            }
+        }
     }
 
     async fn download_wasm(&self, action_ref: &str) -> Result<std::path::PathBuf> {
