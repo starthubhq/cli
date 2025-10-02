@@ -1,8 +1,3 @@
-<<<<<<< HEAD
-# Starthub CLI
-
-A powerful command-line tool for building, publishing, and managing cloud-native applications and WebAssembly modules. Starthub CLI provides a unified workflow for creating, packaging, distributing, and tracking applications with support for both Docker containers and WebAssembly modules.
-=======
 # StartHub CLI
 
 A powerful command-line tool for building, publishing, and managing cloud-native applications and WebAssembly modules. The StartHub CLI uses a hybrid architecture with a lightweight CLI and a separate server for optimal performance and scalability.
@@ -23,7 +18,6 @@ The StartHub CLI follows a **two-tier architecture**:
 │ • Options       │    │ • Server Mgmt   │    │ • WebSocket     │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
 ```
->>>>>>> staging
 
 ## 🚀 Features
 
