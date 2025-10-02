@@ -76,6 +76,75 @@ impl ExecutionEngine {
         self.log("success", message, action_id);
     }
 
+    // Send tree update to frontend
+    async fn send_tree_update(&self, 
+        action_state: &ShAction, 
+        executed_steps: &HashMap<String, ShAction>, 
+        current_step: &str
+    ) {
+        if let Some(sender) = &self.ws_sender {
+            // Create a simplified tree structure for the frontend
+            let tree_data = self.build_tree_data(action_state, executed_steps, current_step);
+            
+            let tree_msg = serde_json::json!({
+                "type": "tree_update",
+                "action_id": action_state.id,
+                "current_step": current_step,
+                "tree_data": tree_data,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            
+            if let Ok(msg_str) = serde_json::to_string(&tree_msg) {
+                let _ = sender.send(msg_str);
+            }
+        }
+    }
+
+    // Build complete tree data structure for frontend
+    fn build_tree_data(&self, 
+        action_state: &ShAction, 
+        executed_steps: &HashMap<String, ShAction>, 
+        current_step: &str
+    ) -> serde_json::Value {
+        // Convert the entire ShAction to JSON recursively
+        let mut tree_data = serde_json::to_value(action_state).unwrap_or(serde_json::Value::Null);
+        
+        // Add execution status information
+        if let serde_json::Value::Object(ref mut tree_obj) = tree_data {
+            tree_obj.insert("current_step".to_string(), serde_json::Value::String(current_step.to_string()));
+            tree_obj.insert("timestamp".to_string(), serde_json::Value::String(chrono::Utc::now().to_rfc3339()));
+            
+            // Add execution status to each step
+            if let Some(steps) = tree_obj.get_mut("steps") {
+                if let serde_json::Value::Object(steps_obj) = steps {
+                    for (step_id, step_value) in steps_obj.iter_mut() {
+                        if let serde_json::Value::Object(step_obj) = step_value {
+                            // Check if step is completed
+                            let is_completed = executed_steps.contains_key(step_id);
+                            step_obj.insert("completed".to_string(), serde_json::Value::Bool(is_completed));
+                            
+                            // Check if this is the current step
+                            let is_current = step_id == current_step;
+                            step_obj.insert("current".to_string(), serde_json::Value::Bool(is_current));
+                            
+                            // Add execution status
+                            let status = if is_completed {
+                                "completed"
+                            } else if is_current {
+                                "running"
+                            } else {
+                                "pending"
+                            };
+                            step_obj.insert("status".to_string(), serde_json::Value::String(status.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        
+        tree_data
+    }
+
     // Main flow
     pub async fn execute_action(&self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
         self.log_info(&format!("Starting execution of action: {}", action_ref), None);
@@ -99,6 +168,9 @@ impl ExecutionEngine {
         self.run_action_tree(&mut root_action,
             &inputs, &HashMap::new()).await?;
         self.log_success("Action execution completed", Some(&root_action.id));
+
+        // Send final tree update
+        self.send_tree_update(&root_action, &HashMap::new(), "completed").await;
 
         // Return the action tree (no execution)
         Ok(serde_json::to_value(root_action)?)
@@ -176,7 +248,8 @@ impl ExecutionEngine {
         // Run the action tree recursively - DFS
         for step_id in &action_state.execution_order {
             if let Some(step) = action_state.steps.get_mut(step_id) {
-                println!("step_id: {:#?}", step_id);
+                self.log_info(&format!("Starting step: {}", step_id), Some(&action_state.id));
+                
                 // For each step, we need to use the inputs and types field
                 // of the step to generate a completely new object with that structure.
                 
@@ -200,6 +273,9 @@ impl ExecutionEngine {
                     &local_executed_steps
                 )).await?;
                 
+                // Send tree update after each recursion iteration
+                self.send_tree_update(&action_state, &local_executed_steps, step_id).await;
+                
                 // Given the step name, assing the processed child to the step
                 let processed_child_clone = processed_child.clone();
                 action_state.steps.insert(step_id.clone(), processed_child);
@@ -208,6 +284,8 @@ impl ExecutionEngine {
                 // next iteration the template resolution can pick up the outputs
                 // of the executed steps.
                 local_executed_steps.insert(step_id.clone(), processed_child_clone);
+                
+                self.log_success(&format!("Completed step: {}", step_id), Some(&action_state.id));
             }
         }
 
