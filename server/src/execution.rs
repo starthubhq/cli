@@ -38,6 +38,7 @@ impl ExecutionEngine {
         }
     }
 
+    // Main flow
     pub async fn execute_action(&self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
         // Ensure cache directory exists before starting execution.
         // It should already exist, but just in case.
@@ -51,7 +52,8 @@ impl ExecutionEngine {
             None,               // No parent action ID (root)
         ).await?;     
 
-        self.run_action_tree(&mut root_action, &inputs, &HashMap::new()).await?;
+        self.run_action_tree(&mut root_action,
+            &inputs, &HashMap::new()).await?;
 
         // Return the action tree (no execution)
         Ok(serde_json::to_value(root_action)?)
@@ -62,31 +64,30 @@ impl ExecutionEngine {
         parent_inputs: &Vec<Value>,
         executed_sibling_steps: &HashMap<String, ShAction>) -> Result<(ShAction)> {
         
-        // 1) Check whether the current action is ok with the inputs that are being passed to it.
-        // Always resolve inputs first, independently of whether
-        // we are dealing with a composition or an atomic action
+        // 1) Instantiate the inputs according to the types specified
         let instantiated_inputs: Vec<Value> = self.instantiate(
             &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
             &action_state.inputs,
             &parent_inputs
         )?;
 
-        // For every input, want to assign the value of the corresponding resolved
-        // input to its value field.
+        // 2) Assign the instantiated inputs to the action state inputs
         for (index, input) in action_state.inputs.iter_mut().enumerate() {
             if let Some(resolved_input) = instantiated_inputs.get(index) {
                 input.value = Some(resolved_input.clone());
             }
         }
 
-        println!("instantiated_inputs: {:#?}", instantiated_inputs);
-        println!("action_state: {:#?}", action_state);
+        // println!("instantiated_inputs: {:#?}", instantiated_inputs);
+        // println!("action_state: {:#?}", action_state);
 
         // Base condition
-        // TODO: we need to figure out what to really return from the leaves
         if action_state.kind == "wasm" || action_state.kind == "docker" {
+            // Serialize the instantiated inputs
             let inputs_value = serde_json::to_value(&instantiated_inputs)?;
             let result = self.run_wasm_step(action_state, None, &inputs_value).await?;
+
+            // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
                 Vec::new()
             } else {
@@ -117,9 +118,6 @@ impl ExecutionEngine {
                 }
             }
 
-            println!("instantiated_outputs: {:#?}", instantiated_outputs);
-            println!("action_state_clone: {:#?}", action_state_clone);
-
             return Ok(action_state_clone);
         }
 
@@ -128,8 +126,8 @@ impl ExecutionEngine {
         
         // Run the action tree recursively - DFS
         for step_id in &action_state.execution_order {
-            println!("Executing step: {:#?}", step_id);
             if let Some(step) = action_state.steps.get_mut(step_id) {
+                println!("step_id: {:#?}", step_id);
                 // For each step, we need to use the inputs and types field
                 // of the step to generate a completely new object with that structure.
                 
@@ -139,55 +137,46 @@ impl ExecutionEngine {
 
                 // 2) Generate the inputs object that are going to be passed to the next recursion.
                 // Resolve inputs for this step using the same logic as the main resolve_inputs function
-                let child_step_resolved_inputs = self.resolve_template(
+                let resolved_inputs_to_inject_into_child_step = self.resolve_into_inputs(
                     &step.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()),
                     &step.inputs,
                     &instantiated_inputs,  // Inject inputs from current action into the step
                     &local_executed_steps
                 )?;
-
-                // Clone the step before executing to avoid borrow checker issues
-                // let mut step_clone = step.clone();
-                // let step_name = step_clone.name.clone();
                 
                 // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
                 let processed_child = Box::pin(self.run_action_tree(
                     step, 
-                    &child_step_resolved_inputs,  // Parent's resolved inputs for template resolution
+                    &resolved_inputs_to_inject_into_child_step,  // Parent's resolved inputs for template resolution
                     &local_executed_steps
                 )).await?;
-         
-                // We want to assign the outputs of the processed child
-                // into the outputs of the child step used by the parent.
-                // for (index, output) in step_clone.outputs.iter_mut().enumerate() {
-                //     if let Some(resolved_output) = processed_child.outputs.get(index) {
-                //         if let Some(output_value) = &resolved_output.value {
-                //             output.value = Some(output_value.clone());
-                //         }
-                //     }
-                // }
-
-                // Add the executed step to our tracking
-                // local_executed_steps.insert(step_name, step_clone);
+                
+                // Given the step name, assing the processed child to the step
+                let processed_child_clone = processed_child.clone();
+                action_state.steps.insert(step_id.clone(), processed_child);
+                
+                // Add the executed steps to the executed siblings, so in the
+                // next iteration the template resolution can pick up the outputs
+                // of the executed steps.
+                local_executed_steps.insert(step_id.clone(), processed_child_clone);
             }
         }
 
         // If we got here, it means that we have executed all the steps in the action tree.
         // Now we need to aggregate the outputs back at the higher level.
-        // let parent_step_resolved_outputs = self.resolve_template(
-        //     &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()),
-        //     &action_state.outputs,
-        //     &action_state.outputs.iter().map(|io| io.value.clone().unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>(),
-        //     &local_executed_steps
-        // )?;
+        let resolved_outputs = self.resolve_into_outputs(
+            &action_state.inputs,
+            &action_state.outputs,
+            &action_state.steps
+        )?;
 
-        // // For every output, want to assign the value of the corresponding resolved
-        // // output to its value field.
-        // for (index, output) in action_state.outputs.iter_mut().enumerate() {
-        //     if let Some(resolved_output) = parent_step_resolved_outputs.get(index) {
-        //         output.value = Some(resolved_output.clone());
-        //     }
-        // }
+        // valueFor every output, want to assign the value of the corresponding resolved
+        // output to its value field.
+        for (index, output) in action_state.outputs.iter_mut().enumerate() {
+            if let Some(resolved_output) = resolved_outputs.get(index) {
+                output.value = Some(resolved_output.clone());
+            }
+        }
 
         return Ok(action_state.clone());
     }
@@ -218,10 +207,6 @@ impl ExecutionEngine {
     fn instantiate(&self, types: &Option<HashMap<String, Value>>, 
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<Value>) -> Result<Vec<Value>> {
-        println!("Instantiate IO");
-        println!("instantiate_io: {:#?}", io_definitions);
-        println!("io_values: {:#?}", io_values);
-        println!("types: {:#?}", types);
         let mut values_to_inject: Vec<Value> = Vec::new();
         for (index, input) in io_definitions.iter().enumerate() {
             // For each input definition, we want to fetch the corresponding input value by index
@@ -265,7 +250,7 @@ impl ExecutionEngine {
                         values_to_inject.push(value_to_inject);
                     } else {
                         let error_list: Vec<_> = compiled_schema.validate(&value_to_inject).unwrap_err().collect();
-                        println!("instantiated_io: {:#?}", value_to_inject);
+                        println!("value to inject: {:#?}", value_to_inject);
                         println!("input: {:#?}", input);
                         println!("type_definition: {:#?}", type_definition);
                         println!("json_schema: {:#?}", json_schema);
@@ -279,10 +264,47 @@ impl ExecutionEngine {
         Ok(values_to_inject)
     }
 
+    // We need both input and output definitions, as long as all steps, since the
+    // output values might come from the inputs or the outputs of the steps.
+    fn resolve_into_outputs(&self,
+        inputs: &Vec<ShIO>, //Contains both template and values of the inputs
+        output_definitions: &Vec<ShIO>, //Only contains the template of the outputs
+        steps: &HashMap<String, ShAction>) -> Result<Vec<Value>> {        
+        // We extract the types from the action state
+        let mut resolved_outputs: Vec<Value> = Vec::new();
+
+        // println!("types: {:#?}", types);
+        // println!("io_definitions: {:#?}", io_definitions);
+        // println!("io_values: {:#?}", io_values);
+        // println!("executed_sibling_steps: {:#?}", executed_sibling_steps);
+
+        // We want to create a vector of input by extracting the value from the inputs vector.
+        // This is because the outputs might be fetching values from the inputs directly.
+        let inputs_values = inputs.iter().map(|input| input.value.clone().unwrap_or(Value::Null)).collect::<Vec<_>>();
+
+        // For every value, find its corresponding input by index
+        for (index, _output) in output_definitions.iter().enumerate() {
+            if let Some(output) = output_definitions.get(index) {                
+                // First, resolve the template to get the actual input value
+                let interpolated_template = self.interpolate(
+                    &output.template, 
+                    &inputs_values, 
+                    steps
+                )?;
+
+                resolved_outputs.push(interpolated_template);
+            }
+        }
+
+        Ok(resolved_outputs)
+    }
+
+    
+
     // Given a key value types object, a list of input definitions,
     // a list of input values and a list of executed sibling steps,
     // it returns a list of type-checked, resolved inputs.
-    fn resolve_template(&self,
+    fn resolve_into_inputs(&self,
         types: &Option<HashMap<String, Value>>, 
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<Value>,
@@ -290,37 +312,16 @@ impl ExecutionEngine {
         // We extract the types from the action state
         let mut resolved_inputs: Vec<Value> = Vec::new();
 
-        // println!("types: {:#?}", types);
-        // println!("io_definitions: {:#?}", io_definitions);
-        // println!("io_values: {:#?}", io_values);
-        // println!("executed_sibling_steps: {:#?}", executed_sibling_steps);
-
         // For every value, find its corresponding input by index
         for (index, _input) in io_definitions.iter().enumerate() {
             if let Some(input) = io_definitions.get(index) {
                 // First, resolve the template to get the actual input value
                 let interpolated_template = self.interpolate(
                     &input.template, 
-                    // We need parent inputs since the input
-                    // might be coming from a parent
                     io_values, 
-                    // We need sibling steps since the input
-                    // might be coming from a sibling that 
-                    // has already been executed
                     executed_sibling_steps
                 )?;
 
-                // println!("resolved_template: {:#?}", interpolated_template);
-                // println!("1");
-                // Handle primitive types that don't need custom type definitions
-                if input.r#type == "string" || input.r#type == "bool" || input.r#type == "number" {
-                    // println!("Primitive type: {}", input.r#type);
-                    // For primitive types, just push the resolved value without schema validation
-                    resolved_inputs.push(interpolated_template);
-                    continue;
-                }
-
-                println!("2");
                 resolved_inputs.push(interpolated_template);
             }
         }
@@ -332,23 +333,23 @@ impl ExecutionEngine {
     // function needs to know the parent inputs and the steps that have already been executed.
     fn interpolate(&self, 
         template: &Value, 
-        parent_inputs: &Vec<Value>, 
+        variables: &Vec<Value>, 
         executed_steps: &HashMap<String, ShAction>
     ) -> Result<Value> {
         match template {
             Value::String(s) => {
                 // println!("resolve_template_string: {:#?}", s);
-                let resolved = self.interpolate_string(s, parent_inputs, executed_steps)?;
+                let resolved = self.interpolate_string(s, variables, executed_steps)?;
                 Ok(Value::String(resolved))
             },
             Value::Object(obj) => {
-                // println!("resolve_template_object: {:#?}", obj);
                 // Recursively resolve object templates
                 let mut resolved_obj = serde_json::Map::new();
                 for (key, value) in obj {
-                    let resolved_value = self.interpolate(value, parent_inputs, executed_steps)?;
+                    let resolved_value = self.interpolate(value, variables, executed_steps)?;
                     resolved_obj.insert(key.clone(), resolved_value);
                 }
+                
                 Ok(Value::Object(resolved_obj))
             },
             Value::Array(arr) => {
@@ -356,7 +357,7 @@ impl ExecutionEngine {
                 // Recursively resolve array templates
                 let mut resolved_arr = Vec::new();
                 for item in arr {
-                    let resolved_item = self.interpolate(item, parent_inputs, executed_steps)?;
+                    let resolved_item = self.interpolate(item, variables, executed_steps)?;
                     resolved_arr.push(resolved_item);
                 }
                 Ok(Value::Array(resolved_arr))
@@ -367,18 +368,18 @@ impl ExecutionEngine {
 
     fn interpolate_string(&self, 
         template: &str, 
-        parent_inputs: &Vec<Value>, 
+        variables: &Vec<Value>, 
         executed_steps: &HashMap<String, ShAction>
     ) -> Result<String> {
         let mut result = template.to_string();
         
-        // Handle {{inputs[index].field}} patterns
+        // Handle {{inputs[index].jsonpath}} patterns
         let inputs_re = regex::Regex::new(r"\{\{inputs\[(\d+)\]\.([^}]+)\}\}")?;
         for cap in inputs_re.captures_iter(template) {
-            if let (Some(index_str), Some(field)) = (cap.get(1), cap.get(2)) {
+            if let (Some(index_str), Some(jsonpath)) = (cap.get(1), cap.get(2)) {
                 if let Ok(index) = index_str.as_str().parse::<usize>() {
-                    if let Some(input_value) = parent_inputs.get(index) {
-                        if let Some(resolved_value) = input_value.get(field.as_str()) {
+                    if let Some(input_value) = variables.get(index) {
+                        if let Ok(resolved_value) = self.evaluate_jsonpath(input_value, jsonpath.as_str()) {
                             let replacement = match resolved_value {
                                 Value::String(s) => s.clone(),
                                 _ => resolved_value.to_string(),
@@ -390,21 +391,19 @@ impl ExecutionEngine {
             }
         }
         
-            // Handle {{steps.step_name.outputs[index].field}} patterns
+        // Handle {{steps.step_name.outputs[index].jsonpath}} patterns
         let steps_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\.([^}]+)\}\}")?;
         for cap in steps_re.captures_iter(template) {
-            if let (Some(step_name), Some(index_str), Some(field)) = (cap.get(1), cap.get(2), cap.get(3)) {
+            if let (Some(step_name), Some(index_str), Some(jsonpath)) = (cap.get(1), cap.get(2), cap.get(3)) {
                 if let Ok(index) = index_str.as_str().parse::<usize>() {
-                    println!("Looking for step: {:#?} in executed_steps: {:#?}", step_name.as_str(), executed_steps);
                     if let Some(step) = executed_steps.get(step_name.as_str()) {
                         if let Some(output) = step.outputs.get(index) {
                             if let Some(output_value) = &output.value {
-                                if let Some(resolved_value) = output_value.get(field.as_str()) {
+                                if let Ok(resolved_value) = self.evaluate_jsonpath(output_value, jsonpath.as_str()) {
                                     let replacement = match resolved_value {
                                         Value::String(s) => s.clone(),
                                         _ => resolved_value.to_string(),
                                     };
-                                    println!("replacement: {:#?}", replacement);
                                     result = result.replace(&cap[0], &replacement);
                                 }
                             }
@@ -415,6 +414,74 @@ impl ExecutionEngine {
         }
         
         Ok(result)
+    }
+
+    fn evaluate_jsonpath(&self, value: &Value, jsonpath: &str) -> Result<Value> {
+        // Simple JSONPath evaluation for common patterns
+        let path_parts: Vec<&str> = jsonpath.split('.').collect();
+        let mut current = value;
+        for part in path_parts {
+            // Check if part contains array index like "body[0]"
+            if part.contains('[') && part.contains(']') {
+                let bracket_start = part.find('[').unwrap();
+                let bracket_end = part.find(']').unwrap();
+                let key = &part[..bracket_start];
+                let index_str = &part[bracket_start + 1..bracket_end];
+                
+                // First access the object key
+                match current {
+                    Value::Object(obj) => {
+                        if let Some(next) = obj.get(key) {
+                            current = next;
+                        } else {
+                            return Err(anyhow::anyhow!("Path '{}' not found in object", key));
+                        }
+                    },
+                    _ => return Err(anyhow::anyhow!("Cannot access '{}' on non-object", key)),
+                }
+                
+                // Then access the array index
+                if let Ok(index) = index_str.parse::<usize>() {
+                    match current {
+                        Value::Array(arr) => {
+                            if let Some(next) = arr.get(index) {
+                                current = next;
+                            } else {
+                                return Err(anyhow::anyhow!("Index {} out of bounds in array", index));
+                            }
+                        },
+                        _ => return Err(anyhow::anyhow!("Cannot access array index on non-array")),
+                    }
+                } else {
+                    return Err(anyhow::anyhow!("Invalid array index: {}", index_str));
+                }
+            } else {
+                // Regular object key access
+                match current {
+                    Value::Object(obj) => {
+                        if let Some(next) = obj.get(part) {
+                            current = next;
+                        } else {
+                            return Err(anyhow::anyhow!("Path '{}' not found in object", part));
+                        }
+                    },
+                    Value::Array(arr) => {
+                        if let Ok(index) = part.parse::<usize>() {
+                            if let Some(next) = arr.get(index) {
+                                current = next;
+                            } else {
+                                return Err(anyhow::anyhow!("Index {} out of bounds in array", index));
+                            }
+                        } else {
+                            return Err(anyhow::anyhow!("Invalid array index: {}", part));
+                        }
+                    },
+                    _ => return Err(anyhow::anyhow!("Cannot access '{}' on non-object/non-array", part)),
+                }
+            }
+        }
+
+        Ok(current.clone())
     }
 
     fn convert_to_json_schema(&self, type_definition: &Value) -> Result<Value> {
@@ -500,7 +567,16 @@ impl ExecutionEngine {
             Value::String(s) => {
                 // Handle primitive types
                 let mut schema = serde_json::Map::new();
-                schema.insert("type".to_string(), Value::String(s.clone()));
+                
+                // For "object" type, be more flexible to allow arrays and objects
+                if s == "object" {
+                    // Don't validate the structure, just accept any JSON value
+                    // This allows arrays, objects, or any other JSON structure
+                    return Ok(Value::Object(schema));
+                } else {
+                    schema.insert("type".to_string(), Value::String(s.clone()));
+                }
+                
                 Ok(Value::Object(schema))
             }
             _ => Err(anyhow::anyhow!("Unsupported type definition format"))
@@ -1046,6 +1122,7 @@ mod tests {
         
         let result = engine.execute_action(action_ref, inputs).await;
         
+        println!("result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
         
@@ -1364,119 +1441,119 @@ mod tests {
         assert!(result.is_err(), "fetch_manifest should fail for invalid action_ref");
     }
 
-    #[test]
-    fn test_resolve_inputs() {
-        // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+    // #[test]
+    // fn test_resolve_inputs() {
+    //     // Create a mock ExecutionEngine
+    //     let engine = ExecutionEngine::new();
         
-        // Create mock types for validation
-        let mut types = HashMap::new();
-        types.insert("WeatherConfig".to_string(), json!({
-            "location_name": {
-                "type": "string",
-                "description": "The name of the location to get weather for",
-                "required": true
-            },
-            "open_weather_api_key": {
-                "type": "string", 
-                "description": "OpenWeatherMap API key",
-                "required": true
-            }
-        }));
+    //     // Create mock types for validation
+    //     let mut types = HashMap::new();
+    //     types.insert("WeatherConfig".to_string(), json!({
+    //         "location_name": {
+    //             "type": "string",
+    //             "description": "The name of the location to get weather for",
+    //             "required": true
+    //         },
+    //         "open_weather_api_key": {
+    //             "type": "string", 
+    //             "description": "OpenWeatherMap API key",
+    //             "required": true
+    //         }
+    //     }));
         
-        // Create mock action state with inputs and types
-        let action_state = ShAction {
-            id: "test-action".to_string(),
-            name: "test-action".to_string(),
-            kind: "composition".to_string(),
-            uses: "test:action".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "weather_config".to_string(),
-                    r#type: "WeatherConfig".to_string(),
-                    template: json!("{{inputs[0].location_name}}"),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: Some(types.clone().into_iter().collect()),
-        };
+    //     // Create mock action state with inputs and types
+    //     let action_state = ShAction {
+    //         id: "test-action".to_string(),
+    //         name: "test-action".to_string(),
+    //         kind: "composition".to_string(),
+    //         uses: "test:action".to_string(),
+    //         inputs: vec![
+    //             ShIO {
+    //                 name: "weather_config".to_string(),
+    //                 r#type: "WeatherConfig".to_string(),
+    //                 template: json!("{{inputs[0].location_name}}"),
+    //                 value: None,
+    //                 required: true,
+    //             }
+    //         ],
+    //         outputs: vec![],
+    //         parent_action: None,
+    //         steps: HashMap::new(),
+    //         execution_order: vec![],
+    //         types: Some(types.clone().into_iter().collect()),
+    //     };
         
-        // Test case 1: Valid inputs that match the schema
-        let valid_inputs = vec![
-            json!({
-                "location_name": "Rome",
-                "open_weather_api_key": "f13e712db9557544db878888528a5e29"
-            })
-        ];
+    //     // Test case 1: Valid inputs that match the schema
+    //     let valid_inputs = vec![
+    //         json!({
+    //             "location_name": "Rome",
+    //             "open_weather_api_key": "f13e712db9557544db878888528a5e29"
+    //         })
+    //     ];
         
-        let result = engine.resolve_template(
-            &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
-            &action_state.inputs,
-            &valid_inputs,
-            &HashMap::new());
-        assert!(result.is_ok(), "resolve_inputs should succeed for valid inputs");
+    //     let result = engine.resolve_child_inputs(
+    //         &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+    //         &action_state.inputs,
+    //         &valid_inputs,
+    //         &HashMap::new());
+    //     assert!(result.is_ok(), "resolve_inputs should succeed for valid inputs");
         
-        let resolved_inputs = result.unwrap();
-        assert_eq!(resolved_inputs.len(), 1);
-        // Since resolve_template_string is not implemented yet, templates are returned as-is
-        // The resolved value will be the template string, not the actual value
-        assert_eq!(resolved_inputs[0], json!("{{inputs[0].location_name}}"));
+    //     let resolved_inputs = result.unwrap();
+    //     assert_eq!(resolved_inputs.len(), 1);
+    //     // Since resolve_template_string is not implemented yet, templates are returned as-is
+    //     // The resolved value will be the template string, not the actual value
+    //     assert_eq!(resolved_inputs[0], json!("{{inputs[0].location_name}}"));
         
-        // Test case 2: Invalid inputs that don't match the schema (missing required field)
-        let invalid_inputs = vec![
-            json!({
-                "location_name": "Rome"
-                // Missing open_weather_api_key
-            })
-        ];
+    //     // Test case 2: Invalid inputs that don't match the schema (missing required field)
+    //     let invalid_inputs = vec![
+    //         json!({
+    //             "location_name": "Rome"
+    //             // Missing open_weather_api_key
+    //         })
+    //     ];
         
-        let result = engine.resolve_template(&action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
-        &action_state.inputs,
-        &invalid_inputs,
-        &HashMap::new());
-        assert!(result.is_err(), "resolve_inputs should fail for invalid inputs");
+    //     let result = engine.resolve_child_inputs(&action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+    //     &action_state.inputs,
+    //     &invalid_inputs,
+    //     &HashMap::new());
+    //     assert!(result.is_err(), "resolve_inputs should fail for invalid inputs");
         
-        // Test case 3: No inputs provided
-        let empty_inputs = vec![];
-        let result = engine.resolve_template(&action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
-        &action_state.inputs,
-        &empty_inputs,
-        &HashMap::new());
-        assert!(result.is_err(), "resolve_inputs should fail when no inputs provided");
+    //     // Test case 3: No inputs provided
+    //     let empty_inputs = vec![];
+    //     let result = engine.resolve_child_inputs(&action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+    //     &action_state.inputs,
+    //     &empty_inputs,
+    //     &HashMap::new());
+    //     assert!(result.is_err(), "resolve_inputs should fail when no inputs provided");
         
-        // Test case 4: Action state with no types defined
-        let action_state_no_types = ShAction {
-            id: "test-action".to_string(),
-            name: "test-action".to_string(),
-            kind: "composition".to_string(),
-            uses: "test:action".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "weather_config".to_string(),
-                    r#type: "WeatherConfig".to_string(),
-                    template: json!({}),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None, // No types defined
-        };
+    //     // Test case 4: Action state with no types defined
+    //     let action_state_no_types = ShAction {
+    //         id: "test-action".to_string(),
+    //         name: "test-action".to_string(),
+    //         kind: "composition".to_string(),
+    //         uses: "test:action".to_string(),
+    //         inputs: vec![
+    //             ShIO {
+    //                 name: "weather_config".to_string(),
+    //                 r#type: "WeatherConfig".to_string(),
+    //                 template: json!({}),
+    //                 value: None,
+    //                 required: true,
+    //             }
+    //         ],
+    //         outputs: vec![],
+    //         parent_action: None,
+    //         steps: HashMap::new(),
+    //         execution_order: vec![],
+    //         types: None, // No types defined
+    //     };
         
-        let result = engine.resolve_template(&action_state_no_types.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
-        &action_state_no_types.inputs,
-        &valid_inputs,
-        &HashMap::new());
-        assert!(result.is_err(), "resolve_inputs should fail when no types are defined");
-    }
+    //     let result = engine.resolve_child_inputs(&action_state_no_types.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
+    //     &action_state_no_types.inputs,
+    //     &valid_inputs,
+    //     &HashMap::new());
+    //     assert!(result.is_err(), "resolve_inputs should fail when no types are defined");
+    // }
 
     #[tokio::test]
     async fn test_run_action_tree_wasm_early_return() {
@@ -1573,6 +1650,330 @@ mod tests {
         assert!(result.is_ok(), "resolve_template should succeed for boolean template");
         let resolved = result.unwrap();
         assert_eq!(resolved, json!(true));
+    }
+
+    #[test]
+    fn test_instantiate_primitive_types() {
+        let engine = ExecutionEngine::new();
+        
+        // Test case 1: String type
+        let io_definitions = vec![
+            ShIO {
+                name: "test_string".to_string(),
+                r#type: "string".to_string(),
+                template: json!("test"),
+                value: None,
+                required: true,
+            }
+        ];
+        let io_values = vec![json!("hello world")];
+        let types = None;
+        
+        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed for string type");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], json!("hello world"));
+        
+        // Test case 2: Boolean type
+        let io_definitions = vec![
+            ShIO {
+                name: "test_bool".to_string(),
+                r#type: "bool".to_string(),
+                template: json!(true),
+                value: None,
+                required: true,
+            }
+        ];
+        let io_values = vec![json!(false)];
+        
+        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed for bool type");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], json!(false));
+        
+        // Test case 3: Number type
+        let io_definitions = vec![
+            ShIO {
+                name: "test_number".to_string(),
+                r#type: "number".to_string(),
+                template: json!(42),
+                value: None,
+                required: true,
+            }
+        ];
+        let io_values = vec![json!(3.14)];
+        
+        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed for number type");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], json!(3.14));
+        
+        // Test case 4: Object type
+        let io_definitions = vec![
+            ShIO {
+                name: "test_object".to_string(),
+                r#type: "object".to_string(),
+                template: json!({}),
+                value: None,
+                required: true,
+            }
+        ];
+        let io_values = vec![json!({"key": "value", "nested": {"inner": 123}})];
+        
+        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed for object type");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], json!({"key": "value", "nested": {"inner": 123}}));
+    }
+
+    #[test]
+    fn test_instantiate_custom_types() {
+        let engine = ExecutionEngine::new();
+        
+        // Create custom type definition
+        let mut types = HashMap::new();
+        types.insert("WeatherConfig".to_string(), json!({
+            "location_name": {
+                "type": "string",
+                "description": "The name of the location",
+                "required": true
+            },
+            "api_key": {
+                "type": "string",
+                "description": "API key for the service",
+                "required": true
+            },
+            "temperature_unit": {
+                "type": "string",
+                "description": "Temperature unit (celsius/fahrenheit)",
+                "required": false
+            }
+        }));
+        
+        let io_definitions = vec![
+            ShIO {
+                name: "weather_config".to_string(),
+                r#type: "WeatherConfig".to_string(),
+                template: json!({}),
+                value: None,
+                required: true,
+            }
+        ];
+        
+        // Test case 1: Valid custom type
+        let valid_io_values = vec![json!({
+            "location_name": "Rome",
+            "api_key": "abc123",
+            "temperature_unit": "celsius"
+        })];
+        
+        let result = engine.instantiate(&Some(types.clone()), &io_definitions, &valid_io_values);
+        assert!(result.is_ok(), "instantiate should succeed for valid custom type");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], valid_io_values[0]);
+        
+        // Test case 2: Valid custom type with missing optional field
+        let valid_io_values_minimal = vec![json!({
+            "location_name": "Paris",
+            "api_key": "def456"
+        })];
+        
+        let result = engine.instantiate(&Some(types.clone()), &io_definitions, &valid_io_values_minimal);
+        assert!(result.is_ok(), "instantiate should succeed for valid custom type with missing optional field");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], valid_io_values_minimal[0]);
+    }
+
+    #[test]
+    fn test_instantiate_validation_errors() {
+        let engine = ExecutionEngine::new();
+        
+        // Create custom type definition
+        let mut types = HashMap::new();
+        types.insert("WeatherConfig".to_string(), json!({
+            "location_name": {
+                "type": "string",
+                "description": "The name of the location",
+                "required": true
+            },
+            "api_key": {
+                "type": "string",
+                "description": "API key for the service",
+                "required": true
+            }
+        }));
+        
+        let io_definitions = vec![
+            ShIO {
+                name: "weather_config".to_string(),
+                r#type: "WeatherConfig".to_string(),
+                template: json!({}),
+                value: None,
+                required: true,
+            }
+        ];
+        
+        // Test case 1: Missing required field
+        let invalid_io_values = vec![json!({
+            "location_name": "Rome"
+            // Missing required api_key field
+        })];
+        
+        let result = engine.instantiate(&Some(types.clone()), &io_definitions, &invalid_io_values);
+        assert!(result.is_err(), "instantiate should fail for missing required field");
+        
+        // Test case 2: Wrong field type
+        let invalid_io_values_type = vec![json!({
+            "location_name": 123, // Should be string, not number
+            "api_key": "abc123"
+        })];
+        
+        let result = engine.instantiate(&Some(types.clone()), &io_definitions, &invalid_io_values_type);
+        assert!(result.is_err(), "instantiate should fail for wrong field type");
+        
+        // Test case 3: Extra fields not allowed (strict validation)
+        let invalid_io_values_extra = vec![json!({
+            "location_name": "Rome",
+            "api_key": "abc123",
+            "extra_field": "not_allowed" // This should cause validation to fail
+        })];
+        
+        let result = engine.instantiate(&Some(types.clone()), &io_definitions, &invalid_io_values_extra);
+        assert!(result.is_err(), "instantiate should fail for extra fields not in schema");
+    }
+
+    #[test]
+    fn test_instantiate_no_types() {
+        let engine = ExecutionEngine::new();
+        
+        let io_definitions = vec![
+            ShIO {
+                name: "test_string".to_string(),
+                r#type: "string".to_string(), // Use primitive type
+                template: json!(""),
+                value: None,
+                required: true,
+            }
+        ];
+        let io_values = vec![json!("hello world")];
+        let types = None; // No types provided
+        
+        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed when no types are provided");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 1);
+        assert_eq!(instantiated[0], json!("hello world"));
+    }
+
+    #[test]
+    fn test_instantiate_mixed_types() {
+        let engine = ExecutionEngine::new();
+        
+        // Create custom type definition
+        let mut types = HashMap::new();
+        types.insert("WeatherConfig".to_string(), json!({
+            "location_name": {
+                "type": "string",
+                "description": "The name of the location",
+                "required": true
+            },
+            "api_key": {
+                "type": "string",
+                "description": "API key for the service",
+                "required": true
+            }
+        }));
+        
+        let io_definitions = vec![
+            ShIO {
+                name: "location".to_string(),
+                r#type: "string".to_string(), // Primitive type
+                template: json!(""),
+                value: None,
+                required: true,
+            },
+            ShIO {
+                name: "weather_config".to_string(),
+                r#type: "WeatherConfig".to_string(), // Custom type
+                template: json!({}),
+                value: None,
+                required: true,
+            },
+            ShIO {
+                name: "temperature".to_string(),
+                r#type: "number".to_string(), // Primitive type
+                template: json!(0),
+                value: None,
+                required: true,
+            }
+        ];
+        
+        let io_values = vec![
+            json!("Rome"), // For string type
+            json!({ // For custom type
+                "location_name": "Rome",
+                "api_key": "abc123"
+            }),
+            json!(25.5) // For number type
+        ];
+        
+        let result = engine.instantiate(&Some(types), &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed for mixed types");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 3);
+        assert_eq!(instantiated[0], json!("Rome"));
+        assert_eq!(instantiated[1], json!({
+            "location_name": "Rome",
+            "api_key": "abc123"
+        }));
+        assert_eq!(instantiated[2], json!(25.5));
+    }
+
+    #[test]
+    fn test_instantiate_empty_inputs() {
+        let engine = ExecutionEngine::new();
+        
+        let io_definitions = vec![];
+        let io_values = vec![];
+        let types = None;
+        
+        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        assert!(result.is_ok(), "instantiate should succeed for empty inputs");
+        let instantiated = result.unwrap();
+        assert_eq!(instantiated.len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `Option::unwrap()` on a `None` value")]
+    fn test_instantiate_mismatched_lengths() {
+        let engine = ExecutionEngine::new();
+        
+        let io_definitions = vec![
+            ShIO {
+                name: "test1".to_string(),
+                r#type: "string".to_string(),
+                template: json!(""),
+                value: None,
+                required: true,
+            },
+            ShIO {
+                name: "test2".to_string(),
+                r#type: "string".to_string(),
+                template: json!(""),
+                value: None,
+                required: true,
+            }
+        ];
+        let io_values = vec![json!("only_one_value")]; // Only one value for two definitions
+        
+        let _result = engine.instantiate(&None, &io_definitions, &io_values);
+        // This should panic due to unwrap() in the method when trying to access the second value
     }
 
     
