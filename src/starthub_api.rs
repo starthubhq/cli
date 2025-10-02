@@ -1,6 +1,6 @@
 // src/starthub_api.rs
 use anyhow::{Result, Context};
-use reqwest::header::{AUTHORIZATION, ACCEPT};
+use reqwest::header::ACCEPT;
 use serde::Deserialize;
 use crate::models::ShManifest;
 
@@ -9,8 +9,8 @@ use crate::config::SUPABASE_ANON_KEY;
 
 #[derive(Clone)]
 pub struct Client {
-    #[allow(dead_code)]
     base: String,
+    #[allow(dead_code)]
     token: Option<String>,
     http: reqwest::Client,
 }
@@ -20,82 +20,28 @@ pub struct ActionMetadata {
     pub name: String,
     pub inputs: Option<Vec<ActionInput>>,
     pub outputs: Option<Vec<ActionOutput>>,
-    pub action_id: String,
     pub commit_sha: String,
-    pub created_at: String,
     pub description: String,
     pub version_number: String,
-    pub action_version_id: String,
-    pub version_created_at: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ActionInput {
-    pub id: String,
     pub name: String,
-    pub created_at: String,
-    pub rls_owner_id: String,
     pub action_port_type: String,
-    pub action_version_id: String,
     pub action_port_direction: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct ActionOutput {
-    pub id: String,
     pub name: String,
-    pub created_at: String,
-    pub rls_owner_id: String,
     pub action_port_type: String,
-    pub action_version_id: String,
     pub action_port_direction: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct ActionStep {
-    pub id: String,
-    pub kind: Option<String>,
-    pub uses: String,
-    #[serde(default)]
-    pub with: std::collections::HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ActionWire {
-    pub from: ActionWireFrom,
-    pub to: ActionWireTo,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ActionWireFrom {
-    pub source: Option<String>,
-    pub step: Option<String>,
-    pub output: Option<String>,
-    pub key: Option<String>,
-    pub value: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ActionWireTo {
-    pub step: String,
-    pub input: String,
-}
 
 
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct ManifestInput {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub input_type: String,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct ManifestOutput {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub output_type: String,
-}
 
 impl Client {
     pub fn new(base: impl Into<String>, token: Option<String>) -> Self {
@@ -106,12 +52,6 @@ impl Client {
         }
     }
 
-    #[allow(dead_code)]
-    fn auth_header(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(t) = &self.token {
-            req.header(AUTHORIZATION, format!("Bearer {t}"))
-        } else { req }
-    }
 
     /// Fetch action metadata from the actions edge function.
     pub async fn fetch_action_metadata(&self, action: &str) -> Result<ActionMetadata> {
@@ -128,6 +68,7 @@ impl Client {
     }
 
     /// Resolve an OCI/Web URL for WASM and download it to cache; return local file path.
+    #[allow(dead_code)]
     pub async fn download_wasm(&self, ref_str: &str, cache_dir: &std::path::Path) -> Result<std::path::PathBuf> {
         // v1: support file:/http(s):// direct; OCI support can be added via an oci fetcher later.
         if ref_str.starts_with("http://") || ref_str.starts_with("https://") || ref_str.starts_with("file://") {
@@ -156,8 +97,7 @@ impl Client {
         let manifest: ShManifest = res.json().await.context("decoding starthub.json")?;
         Ok(manifest)
     }
-}
-
+}#[allow(dead_code)]
 fn sanitize_ref_to_filename(r: &str) -> String {
     let mut s = r.replace("://", "_").replace('/', "_").replace('@', "_").replace(':', "_");
     if !s.ends_with(".wasm") { s.push_str(".wasm"); }
@@ -203,3 +143,5 @@ mod tests {
         assert_eq!(expected_encoded, "tgirotto%2Ftom-action-4%400.1.0");
     }
 }
+
+
