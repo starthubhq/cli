@@ -306,14 +306,24 @@ pub async fn cmd_stop() -> Result<()> {
 }
 
 pub async fn cmd_run(action: String) -> Result<()> {
-    // Start the server as a separate process
-    let server_process = start_server_process().await?;
-    
-    // Wait a moment for server to start
-    sleep(Duration::from_millis(1000)).await;
-    
     // Parse the action argument to extract namespace, slug, and version
     let (namespace, slug, version) = parse_action_arg(&action);
+    
+    // Check if server is already running
+    let server_running = check_server_running().await?;
+    
+    if !server_running {
+        println!("🚀 Starting server...");
+        // Start the server as a separate process
+        let server_process = start_server_process().await?;
+        
+        // Wait a moment for server to start
+        sleep(Duration::from_millis(2000)).await;
+        
+        println!("✅ Server started at {}", LOCAL_SERVER_URL);
+    } else {
+        println!("✅ Server already running at {}", LOCAL_SERVER_URL);
+    }
     
     // Open browser to the server with a proper route for the Vue app
     let url = format!("{}/{}/{}/{}", LOCAL_SERVER_URL, namespace, slug, version);
@@ -322,21 +332,24 @@ pub async fn cmd_run(action: String) -> Result<()> {
         Err(e) => println!("→ Browser: {url} (couldn't auto-open: {e})"),
     }
     
-    println!("🚀 Server started at {}", LOCAL_SERVER_URL);
     println!("📱 Serving UI for action: {} at route: {}", action, url);
-    println!("🔄 Press Ctrl+C to stop the server");
-    
-    // Wait for Ctrl+C signal
-    tokio::signal::ctrl_c().await?;
-    println!("\n🛑 Shutting down server...");
-    
-    // Kill the server process
-    if let Some(mut child) = server_process {
-        let _ = child.kill().await;
-        println!("✅ Server process terminated");
-    }
     
     Ok(())
+}
+
+async fn check_server_running() -> Result<bool> {
+    // Try to make a request to the server to see if it's running
+    let client = reqwest::Client::new();
+    let response = client
+        .get(LOCAL_SERVER_URL)
+        .timeout(Duration::from_millis(1000))
+        .send()
+        .await;
+    
+    match response {
+        Ok(resp) => Ok(resp.status().is_success()),
+        Err(_) => Ok(false),
+    }
 }
 
 async fn start_server_process_detached(bind: &str) -> Result<std::process::Child> {
@@ -519,28 +532,32 @@ async fn kill_starthub_server_processes() -> Result<usize> {
     Ok(killed_count)
 }
 
-// Parse action argument in format "namespace/slug@version" or "namespace/slug"
+// Parse action argument in format "namespace/slug:version" or "namespace/slug@version" or "namespace/slug"
 fn parse_action_arg(action: &str) -> (String, String, String) {
     // Default values
     let mut namespace = "tgirotto".to_string();
     let mut slug = "test-action".to_string();
     let mut version = "0.1.0".to_string();
     
-    // Parse the action string
-    if let Some(at_pos) = action.find('@') {
-        let name_part = &action[..at_pos];
-        version = action[at_pos + 1..].to_string();
-        
-        if let Some(slash_pos) = name_part.find('/') {
-            namespace = name_part[..slash_pos].to_string();
-            slug = name_part[slash_pos + 1..].to_string();
-                } else {
-            slug = name_part.to_string();
+    // Parse the action string - support both : and @ for version separator
+    let version_separator = if action.contains(':') { ':' } else if action.contains('@') { '@' } else { '\0' };
+    
+    if version_separator != '\0' {
+        if let Some(sep_pos) = action.find(version_separator) {
+            let name_part = &action[..sep_pos];
+            version = action[sep_pos + 1..].to_string();
+            
+            if let Some(slash_pos) = name_part.find('/') {
+                namespace = name_part[..slash_pos].to_string();
+                slug = name_part[slash_pos + 1..].to_string();
+            } else {
+                slug = name_part.to_string();
+            }
         }
     } else if let Some(slash_pos) = action.find('/') {
         namespace = action[..slash_pos].to_string();
         slug = action[slash_pos + 1..].to_string();
-                        } else {
+    } else {
         slug = action.to_string();
     }
     
