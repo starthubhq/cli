@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use clap::{ValueEnum};
 
 mod starthub_api;
 mod ghapp;
@@ -39,6 +38,14 @@ enum Commands {
         /// Package slug/name, e.g. "chirpstack"
         action: String,       
     },
+    /// Start the server in detached mode
+    Start {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        bind: String,
+    },
+    /// Stop the running server
+    Stop,
     /// Show deployment status
     Status {
         #[arg(long)]
@@ -71,6 +78,8 @@ async fn main() -> Result<()> {
         Commands::Init { path } => commands::cmd_init(path).await?,
         Commands::Publish { no_build } => publish::cmd_publish(no_build).await?,
         Commands::Run { action } => commands::cmd_run(action).await?,
+        Commands::Start { bind } => commands::cmd_start(bind).await?,
+        Commands::Stop => commands::cmd_stop().await?,
         Commands::Status { id } => commands::cmd_status(id).await?,
         Commands::Login { api_base } => commands::cmd_login_starthub(api_base).await?,
         Commands::Logout => commands::cmd_logout_starthub().await?,

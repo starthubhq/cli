@@ -5,7 +5,6 @@ use inquire::{Text, Select};
 use tokio::time::{sleep, Duration};
 use webbrowser;
 use reqwest;
-use serde_json::{Value, json};
 
 use crate::models::{ShManifest, ShKind, ShPort, ShType};
 use crate::templates;
@@ -14,8 +13,6 @@ use crate::templates;
 const LOCAL_SERVER_URL: &str = "http://127.0.0.1:3000";
 const LOCAL_SERVER_HOST: &str = "127.0.0.1:3000";
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
     // Implementation for Docker publishing
@@ -274,6 +271,40 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn cmd_start(bind: String) -> Result<()> {
+    println!("🚀 Starting StartHub server in detached mode...");
+    
+    // Start the server as a detached process
+    let server_process = start_server_process_detached(&bind).await?;
+    
+    // Wait a moment for server to start
+    sleep(Duration::from_millis(2000)).await;
+    
+    println!("✅ Server started successfully!");
+    println!("🌐 Server running at: http://{}", bind);
+    println!("📝 Process ID: {}", server_process.id());
+    println!("🔄 Server is running in the background");
+    println!("💡 Use 'starthub run <action>' to interact with the server");
+    println!("🛑 Use 'starthub stop' to stop the server");
+    
+    Ok(())
+}
+
+pub async fn cmd_stop() -> Result<()> {
+    println!("🛑 Stopping StartHub server...");
+    
+    // Find and kill starthub-server processes
+    let killed_count = kill_starthub_server_processes().await?;
+    
+    if killed_count > 0 {
+        println!("✅ Stopped {} server process(es)", killed_count);
+    } else {
+        println!("ℹ️  No running StartHub server processes found");
+    }
+    
+    Ok(())
+}
+
 pub async fn cmd_run(action: String) -> Result<()> {
     // Start the server as a separate process
     let server_process = start_server_process().await?;
@@ -308,6 +339,48 @@ pub async fn cmd_run(action: String) -> Result<()> {
     Ok(())
 }
 
+async fn start_server_process_detached(bind: &str) -> Result<std::process::Child> {
+    // Try to find the starthub-server binary
+    let server_binary = if cfg!(target_os = "windows") {
+        "starthub-server.exe"
+    } else {
+        "starthub-server"
+    };
+    
+    // First try to find it in the current directory or PATH
+    let server_path = which::which(server_binary)
+        .or_else(|_| {
+            // Try relative to the current binary
+            let current_exe = std::env::current_exe()?;
+            let current_dir = current_exe.parent().unwrap();
+            Ok::<std::path::PathBuf, anyhow::Error>(current_dir.join(server_binary))
+        })
+        .or_else(|_| {
+            // Try in the target/release directory
+            Ok::<std::path::PathBuf, anyhow::Error>(std::env::current_dir()?.join("target").join("release").join(server_binary))
+        })
+        .or_else(|_| {
+            // Try in the target/debug directory for development
+            Ok::<std::path::PathBuf, anyhow::Error>(std::env::current_dir()?.join("target").join("debug").join(server_binary))
+        })?;
+    
+    if !server_path.exists() {
+        return Err(anyhow::anyhow!(
+            "Server binary not found. Please build the server first with: cargo build --bin starthub-server"
+        ));
+    }
+    
+    println!("🚀 Starting server process: {:?}", server_path);
+    
+    // Start the server process in detached mode
+    let child = std::process::Command::new(&server_path)
+        .arg("--bind")
+        .arg(bind)
+        .spawn()?;
+    
+    Ok(child)
+}
+
 async fn start_server_process() -> Result<Option<tokio::process::Child>> {
     // Try to find the starthub-server binary
     let server_binary = if cfg!(target_os = "windows") {
@@ -325,7 +398,11 @@ async fn start_server_process() -> Result<Option<tokio::process::Child>> {
             Ok::<std::path::PathBuf, anyhow::Error>(current_dir.join(server_binary))
         })
         .or_else(|_| {
-            // Try in the target directory for development
+            // Try in the target/release directory
+            Ok::<std::path::PathBuf, anyhow::Error>(std::env::current_dir()?.join("target").join("release").join(server_binary))
+        })
+        .or_else(|_| {
+            // Try in the target/debug directory for development
             Ok::<std::path::PathBuf, anyhow::Error>(std::env::current_dir()?.join("target").join("debug").join(server_binary))
         })?;
     
@@ -338,12 +415,108 @@ async fn start_server_process() -> Result<Option<tokio::process::Child>> {
     println!("🚀 Starting server process: {:?}", server_path);
     
     // Start the server process
-    let mut child = tokio::process::Command::new(&server_path)
+    let child = tokio::process::Command::new(&server_path)
         .arg("--bind")
         .arg(LOCAL_SERVER_HOST)
         .spawn()?;
     
     Ok(Some(child))
+}
+
+async fn kill_starthub_server_processes() -> Result<usize> {
+    let mut killed_count = 0;
+    
+    #[cfg(unix)]
+    {
+        // Unix/Linux/macOS: Use ps and kill commands
+        let output = std::process::Command::new("ps")
+            .args(&["-ax", "-o", "pid,comm"])
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to list processes"));
+        }
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        for line in output_str.lines() {
+            if line.contains("starthub-server") {
+                let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                if let Some(pid_str) = parts.first() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        println!("🔍 Found starthub-server process: PID {}", pid);
+                        
+                        // Try to kill the process gracefully first
+                        let kill_result = std::process::Command::new("kill")
+                            .arg("-TERM")
+                            .arg(pid.to_string())
+                            .output();
+                        
+                        match kill_result {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    println!("✅ Killed process {}", pid);
+                                    killed_count += 1;
+                                } else {
+                                    println!("⚠️  Failed to kill process {}: {}", pid, String::from_utf8_lossy(&output.stderr));
+                                }
+                            }
+                            Err(e) => {
+                                println!("⚠️  Failed to kill process {}: {}", pid, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        // Windows: Use tasklist and taskkill commands
+        let output = std::process::Command::new("tasklist")
+            .args(&["/FI", "IMAGENAME eq starthub-server.exe", "/FO", "CSV"])
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to list processes"));
+        }
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        for line in output_str.lines() {
+            if line.contains("starthub-server.exe") {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 2 {
+                    let pid_str = parts[1].trim_matches('"');
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        println!("🔍 Found starthub-server process: PID {}", pid);
+                        
+                        // Try to kill the process
+                        let kill_result = std::process::Command::new("taskkill")
+                            .args(&["/PID", &pid.to_string(), "/F"])
+                            .output();
+                        
+                        match kill_result {
+                            Ok(output) => {
+                                if output.status.success() {
+                                    println!("✅ Killed process {}", pid);
+                                    killed_count += 1;
+                                } else {
+                                    println!("⚠️  Failed to kill process {}: {}", pid, String::from_utf8_lossy(&output.stderr));
+                                }
+                            }
+                            Err(e) => {
+                                println!("⚠️  Failed to kill process {}: {}", pid, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(killed_count)
 }
 
 // Parse action argument in format "namespace/slug@version" or "namespace/slug"
