@@ -97,9 +97,7 @@ impl Client {
         let manifest: ShManifest = res.json().await.context("decoding starthub.json")?;
         Ok(manifest)
     }
-}
-
-#[allow(dead_code)]
+}#[allow(dead_code)]
 fn sanitize_ref_to_filename(r: &str) -> String {
     let mut s = r.replace("://", "_").replace('/', "_").replace('@', "_").replace(':', "_");
     if !s.ends_with(".wasm") { s.push_str(".wasm"); }
@@ -145,3 +143,5 @@ mod tests {
         assert_eq!(expected_encoded, "tgirotto%2Ftom-action-4%400.1.0");
     }
 }
+
+

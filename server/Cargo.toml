@@ -3,6 +3,10 @@ name = "starthub-server"
 version = "0.0.1"
 edition = "2021"
 
+[lib]
+name = "starthub_server"
+path = "src/lib.rs"
+
 [[bin]]
 name = "starthub-server"
 path = "src/main.rs"
@@ -41,3 +45,5 @@ base64 = "0.22"
 sodiumoxide = "0.2"
 regex = "1"
 uuid = { version = "1.0", features = ["v4"] }
+petgraph = "0.6"
+jsonschema = "0.18"
