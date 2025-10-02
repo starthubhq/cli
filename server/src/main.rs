@@ -45,10 +45,10 @@ impl AppState {
     fn new() -> Self {
         let (ws_sender, _) = broadcast::channel(100);
         
-        // Initialize execution engine with API configuration
-        // let base_url = std::env::var("STARTHUB_API").unwrap_or_else(|_| "https://api.starthub.so".to_string());
-        // let token = std::env::var("STARTHUB_TOKEN").ok();
-        let execution_engine = Arc::new(ExecutionEngine::new());
+        // Initialize execution engine
+        let mut execution_engine = ExecutionEngine::new();
+        execution_engine.set_ws_sender(ws_sender.clone());
+        let execution_engine = Arc::new(execution_engine);
         
         Self { 
             ws_sender,

@@ -11,6 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use which;
 use zip::ZipArchive;
+use tokio::sync::broadcast;
 
 use crate::models::{ShManifest, ShKind, ShIO, ShAction};
 
@@ -20,6 +21,7 @@ const STARTHUB_STORAGE_PATH: &str = "/storage/v1/object/public/artifacts";
 const STARTHUB_MANIFEST_FILENAME: &str = "starthub-lock.json";
 pub struct ExecutionEngine {
     cache_dir: std::path::PathBuf,
+    ws_sender: Option<broadcast::Sender<String>>,
 }
 
 impl ExecutionEngine {
@@ -35,25 +37,68 @@ impl ExecutionEngine {
         
         Self {
             cache_dir,
+            ws_sender: None,
         }
+    }
+
+    pub fn set_ws_sender(&mut self, ws_sender: broadcast::Sender<String>) {
+        self.ws_sender = Some(ws_sender);
+    }
+
+    // Logging utility method
+    fn log(&self, level: &str, message: &str, action_id: Option<&str>) {
+        if let Some(sender) = &self.ws_sender {
+            let log_msg = serde_json::json!({
+                "type": "log",
+                "level": level,
+                "message": message,
+                "action_id": action_id,
+                "timestamp": chrono::Utc::now().to_rfc3339()
+            });
+            
+            if let Ok(msg_str) = serde_json::to_string(&log_msg) {
+                let _ = sender.send(msg_str);
+            }
+        }
+    }
+
+    // Convenience logging methods
+    fn log_info(&self, message: &str, action_id: Option<&str>) {
+        self.log("info", message, action_id);
+    }
+
+    fn log_error(&self, message: &str, action_id: Option<&str>) {
+        self.log("error", message, action_id);
+    }
+
+
+    fn log_success(&self, message: &str, action_id: Option<&str>) {
+        self.log("success", message, action_id);
     }
 
     // Main flow
     pub async fn execute_action(&self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
+        self.log_info(&format!("Starting execution of action: {}", action_ref), None);
+        
         // Ensure cache directory exists before starting execution.
         // It should already exist, but just in case.
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
+            self.log_error(&format!("Failed to create cache directory: {}", e), None);
             return Err(anyhow::anyhow!("Failed to create cache directory: {}", e));
         }
         
         // 1. Build the action tree
+        self.log_info("Building action tree...", None);
         let mut root_action = self.build_action_tree(
             action_ref,         // Action reference to download
             None,               // No parent action ID (root)
         ).await?;     
+        self.log_success("Action tree built successfully", Some(&root_action.id));
 
+        self.log_info("Executing action tree...", Some(&root_action.id));
         self.run_action_tree(&mut root_action,
             &inputs, &HashMap::new()).await?;
+        self.log_success("Action execution completed", Some(&root_action.id));
 
         // Return the action tree (no execution)
         Ok(serde_json::to_value(root_action)?)
@@ -62,7 +107,7 @@ impl ExecutionEngine {
     async fn run_action_tree(&self,
         action_state: &mut ShAction,
         parent_inputs: &Vec<Value>,
-        executed_sibling_steps: &HashMap<String, ShAction>) -> Result<(ShAction)> {
+        executed_sibling_steps: &HashMap<String, ShAction>) -> Result<ShAction> {
         
         // 1) Instantiate the inputs according to the types specified
         let instantiated_inputs: Vec<Value> = self.instantiate(
@@ -83,9 +128,13 @@ impl ExecutionEngine {
 
         // Base condition
         if action_state.kind == "wasm" || action_state.kind == "docker" {
+            self.log_info(&format!("Executing {} step: {}", action_state.kind, action_state.name), Some(&action_state.id));
+            
             // Serialize the instantiated inputs
             let inputs_value = serde_json::to_value(&instantiated_inputs)?;
             let result = self.run_wasm_step(action_state, None, &inputs_value).await?;
+            
+            self.log_success(&format!("{} step completed: {}", action_state.kind, action_state.name), Some(&action_state.id));
 
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
@@ -184,7 +233,7 @@ impl ExecutionEngine {
     fn parse_json_strings_recursively(value: Value) -> Value {
         match value {
             Value::Object(mut obj) => {
-                for (key, val) in obj.iter_mut() {
+                for (_, val) in obj.iter_mut() {
                     *val = Self::parse_json_strings_recursively(val.clone());
                 }
                 Value::Object(obj)
@@ -305,7 +354,7 @@ impl ExecutionEngine {
     // a list of input values and a list of executed sibling steps,
     // it returns a list of type-checked, resolved inputs.
     fn resolve_into_inputs(&self,
-        types: &Option<HashMap<String, Value>>, 
+        _types: &Option<HashMap<String, Value>>, 
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<Value>,
         executed_sibling_steps: &HashMap<String, ShAction>) -> Result<Vec<Value>> {        
@@ -817,12 +866,15 @@ impl ExecutionEngine {
         inputs: &Value,
     ) -> Result<Vec<Value>> {
         if which::which("wasmtime").is_err() {
+            self.log_error("wasmtime not found in PATH", Some(&action.id));
             bail!("wasmtime not found in PATH");
         }
 
+        self.log_info(&format!("Downloading WASM module: {}", action.uses), Some(&action.id));
         // For now, we'll create a simple implementation that downloads the WASM file
         // In a real implementation, this would download from the registry
         let module_path = self.download_wasm(&action.uses).await?;
+        self.log_success(&format!("WASM module downloaded: {:?}", module_path), Some(&action.id));
         
         // Verify the WASM file exists and is readable
         if !module_path.exists() {
@@ -837,8 +889,9 @@ impl ExecutionEngine {
         // build stdin payload - use the pre-built parameters
         let input_json = serde_json::to_string(inputs)?;
 
-        println!("Running WASM file: {:?}", module_path);
-        println!("Input json: {:#?}", input_json);
+        self.log_info(&format!("Running WASM file: {:?}", module_path), Some(&action.id));
+        self.log_info(&format!("Input: {}", input_json), Some(&action.id));
+        
         // Construct command
         let mut cmd = TokioCommand::new("wasmtime");
         cmd.arg("-S").arg("http");
@@ -897,8 +950,11 @@ impl ExecutionEngine {
         let _ = pump_err.await;
 
         if !status.success() {
+            self.log_error(&format!("WASM execution failed with status: {}", status), Some(&action.id));
             bail!("step '{}' failed with {}", action.id, status);
         }
+        
+        self.log_success("WASM execution completed successfully", Some(&action.id));
 
         // Collect the first result from the WASM module
         let mut results = Vec::new();
