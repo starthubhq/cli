@@ -76,12 +76,16 @@ async fn start_server(bind_addr: &str) -> Result<()> {
     // Create shared state
     let state = AppState::new();
     
+    // Get the UI directory path relative to the binary
+    let ui_dir = get_ui_directory()?;
+    let assets_dir = ui_dir.join("assets");
+    
     // Create router with UI routes and API endpoints
     let app = Router::new()
         .route("/api/run", post(handle_run))
         .route("/ws", get(ws_handler)) // WebSocket endpoint
-        .nest_service("/assets", ServeDir::new("ui/dist/assets"))
-        .nest_service("/favicon.ico", ServeDir::new("ui/dist"))
+        .nest_service("/assets", ServeDir::new(assets_dir))
+        .nest_service("/favicon.ico", ServeDir::new(&ui_dir))
         .route("/", get(serve_index))
         .fallback(serve_spa) // SPA fallback for Vue Router
         .layer(CorsLayer::permissive())
@@ -95,19 +99,74 @@ async fn start_server(bind_addr: &str) -> Result<()> {
     Ok(())
 }
 
+fn get_ui_directory() -> Result<std::path::PathBuf> {
+    // Get the directory where the binary is located
+    let current_exe = std::env::current_exe()?;
+    let binary_dir = current_exe.parent().unwrap();
+    
+    // Try different possible locations for the UI directory
+    let possible_paths = vec![
+        // When running from CLI directory (cargo run)
+        std::env::current_dir()?.join("ui").join("dist"),
+        // When running from server directory (cargo run from server/)
+        std::env::current_dir()?.join("server").join("ui").join("dist"),
+        // When running the binary directly from CLI directory
+        binary_dir.join("ui").join("dist"),
+        // When running from CLI directory with ./target/release/starthub-server
+        std::env::current_dir()?.join("server").join("ui").join("dist"),
+        // When running from target/release (go up to CLI, then to server/ui)
+        binary_dir.join("..").join("..").join("server").join("ui").join("dist"),
+        // When running from target/debug
+        binary_dir.join("..").join("..").join("server").join("ui").join("dist"),
+    ];
+    
+    for path in &possible_paths {
+        if path.exists() && path.join("index.html").exists() {
+            println!("📁 Found UI directory: {:?}", path);
+            return Ok(path.clone());
+        }
+    }
+    
+    Err(anyhow::anyhow!("UI directory not found. Tried: {:?}", possible_paths))
+}
+
 async fn serve_index() -> Html<String> {
     // Read and serve the index.html file
-    match fs::read_to_string("ui/dist/index.html") {
-        Ok(content) => Html(content),
-        Err(_) => Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+    match get_ui_directory() {
+        Ok(ui_dir) => {
+            let index_path = ui_dir.join("index.html");
+            match fs::read_to_string(&index_path) {
+                Ok(content) => Html(content),
+                Err(e) => {
+                    println!("❌ Failed to read index.html from {:?}: {}", index_path, e);
+                    Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+                }
+            }
+        }
+        Err(e) => {
+            println!("❌ UI directory not found: {}", e);
+            Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+        }
     }
 }
 
 // SPA fallback - serve index.html for all routes to support Vue Router
 async fn serve_spa() -> Html<String> {
-    match fs::read_to_string("ui/dist/index.html") {
-        Ok(content) => Html(content),
-        Err(_) => Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+    match get_ui_directory() {
+        Ok(ui_dir) => {
+            let index_path = ui_dir.join("index.html");
+            match fs::read_to_string(&index_path) {
+                Ok(content) => Html(content),
+                Err(e) => {
+                    println!("❌ Failed to read index.html from {:?}: {}", index_path, e);
+                    Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+                }
+            }
+        }
+        Err(e) => {
+            println!("❌ UI directory not found: {}", e);
+            Html("<!DOCTYPE html><html><body><h1>UI not found</h1><p>Make sure to build the UI first</p></body></html>".to_string())
+        }
     }
 }
 
