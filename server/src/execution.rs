@@ -1241,7 +1241,7 @@ mod tests {
     // TESTS
 
     #[tokio::test]
-    async fn test_execute_action() {
+    async fn test_execute_action_get_weather_by_location_name() {
         // Create a mock ExecutionEngine
         let engine = ExecutionEngine::new();
         
@@ -1251,6 +1251,80 @@ mod tests {
             json!({
                 "location_name": "Rome",
                 "open_weather_api_key": "f13e712db9557544db878888528a5e29"
+            })
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the root action structure
+        assert_eq!(action_tree["name"], "get-weather-by-location-name");
+        assert_eq!(action_tree["kind"], "composition");
+        assert_eq!(action_tree["uses"], action_ref);
+        assert!(action_tree["parent_action"].is_null());
+        
+        // Verify inputs
+        assert!(action_tree["inputs"].is_array());
+        let inputs_array = action_tree["inputs"].as_array().unwrap();
+        assert_eq!(inputs_array.len(), 1);
+        let input = &inputs_array[0];
+        assert_eq!(input["name"], "weather_config");
+        assert_eq!(input["type"], "WeatherConfig");
+        
+        // Verify outputs
+        assert!(action_tree["outputs"].is_array());
+        let outputs_array = action_tree["outputs"].as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        let output = &outputs_array[0];
+        assert_eq!(output["name"], "response");
+        assert_eq!(output["type"], "CustomWeatherResponse");
+        
+        // Verify execution order
+        assert!(action_tree["execution_order"].is_array());
+        let execution_order = action_tree["execution_order"].as_array().unwrap();
+        assert_eq!(execution_order.len(), 2);
+        assert_eq!(execution_order[0], "get_coordinates");
+        assert_eq!(execution_order[1], "get_weather");
+        
+        // Verify types are present
+        assert!(action_tree["types"].is_object());
+        let types = action_tree["types"].as_object().unwrap();
+        assert!(types.contains_key("WeatherConfig"));
+        assert!(types.contains_key("CustomWeatherResponse"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_project() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing action with the same inputs as test_build_action_tree
+        let action_ref = "starthubhq/do-create-project:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_PROJECT_NAME")
+            .unwrap_or_else(|_| "".to_string());
+        let description = std::env::var("DO_PROJECT_DESCRIPTION")
+            .unwrap_or_else(|_| "".to_string());
+        let purpose = std::env::var("DO_PROJECT_PURPOSE")
+            .unwrap_or_else(|_| "".to_string());
+        let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
+            .unwrap_or_else(|_| "".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "description": description,
+                "purpose": purpose,
+                "environment": environment
             })
         ];
         
