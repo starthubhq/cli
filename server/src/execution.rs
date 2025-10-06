@@ -1720,40 +1720,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_action_create_do_ssh_key() {
-        dotenv::dotenv().ok();
-
-        // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
-        
-        // Test executing action for SSH key creation
-        let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
-        
-        // Read test parameters from environment variables with defaults
-        let api_token = std::env::var("DO_API_TOKEN")
-            .unwrap_or_else(|_| "".to_string());
-        let name = std::env::var("DO_SSH_KEY_NAME")
-            .unwrap_or_else(|_| "test-ssh-key".to_string());
-        let public_key = std::env::var("DO_SSH_KEY_PUBLIC_KEY")
-            .unwrap_or_else(|_| "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA...".to_string());
-        
-        let inputs = vec![
-            json!({
-                "api_token": api_token,
-                "name": name,
-                "public_key": public_key
-            })
-        ];
-        
-        println!("inputs: {:#?}", inputs);
-        let result = engine.execute_action(action_ref, inputs).await;
-        
-        println!("result: {:#?}", result);
-        // The test should succeed
-        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
-    }
-
-    #[tokio::test]
     async fn test_execute_action_create_do_ssh_key_from_file() {
         dotenv::dotenv().ok();
 
