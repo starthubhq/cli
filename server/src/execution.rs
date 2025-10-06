@@ -1013,6 +1013,8 @@ impl ExecutionEngine {
             url_path,
             STARTHUB_MANIFEST_FILENAME
         );
+
+        println!("storage_url: {}", storage_url);
         
         // Download and parse starthub-lock.json
         let client = reqwest::Client::new();
@@ -1846,6 +1848,126 @@ mod tests {
         assert_eq!(action_tree["name"], "sleep");
         assert_eq!(action_tree["kind"], "wasm");
         assert_eq!(action_tree["uses"], action_ref);
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_base64_to_text() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing the base64-to-text action directly
+        let action_ref = "starthubhq/base64-to-text:0.0.1";
+        
+        // Test with base64 encoded "Hello World" and ignored value
+        let inputs = vec![
+            json!("SGVsbG8gV29ybGQ="),  // base64 encoded "Hello World"
+            json!("ignored_value")  // second input that will be ignored
+        ];
+        
+        println!("Testing base64-to-text action with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("Base64-to-text test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid base64-to-text action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["name"], "base64-to-text");
+        assert_eq!(action_tree["kind"], "wasm");
+        assert_eq!(action_tree["uses"], action_ref);
+        
+        // Verify that the action has the expected inputs and outputs
+        assert!(action_tree["inputs"].is_array());
+        let inputs_array = action_tree["inputs"].as_array().unwrap();
+        assert_eq!(inputs_array.len(), 2);
+        
+        // Check first input (base64_string)
+        let first_input = &inputs_array[0];
+        assert_eq!(first_input["name"], "base64_string");
+        assert_eq!(first_input["type"], "string");
+        assert_eq!(first_input["required"], true);
+        
+        // Check second input (ignored)
+        let second_input = &inputs_array[1];
+        assert_eq!(second_input["name"], "ignored");
+        assert_eq!(second_input["type"], "object");
+        assert_eq!(second_input["required"], false);
+        
+        // Verify outputs
+        assert!(action_tree["outputs"].is_array());
+        let outputs_array = action_tree["outputs"].as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        
+        let output = &outputs_array[0];
+        assert_eq!(output["name"], "text");
+        assert_eq!(output["type"], "string");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_file_to_string() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing the file-to-string composition
+        let action_ref = "starthubhq/file-to-string:0.0.1";
+        
+        // Test with file path parameter
+        let inputs = vec![
+            json!({
+                "file_path": "/Users/tommaso/Desktop/test.txt"
+            })
+        ];
+        
+        println!("Testing file-to-string composition with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("File-to-string test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid file-to-string action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["name"], "file-to-string");
+        assert_eq!(action_tree["kind"], "composition");
+        assert_eq!(action_tree["uses"], action_ref);
+        
+        // Verify inputs
+        assert!(action_tree["inputs"].is_array());
+        let inputs_array = action_tree["inputs"].as_array().unwrap();
+        assert_eq!(inputs_array.len(), 1);
+        let input = &inputs_array[0];
+        assert_eq!(input["name"], "file_config");
+        assert_eq!(input["type"], "FileConfig");
+        
+        // Verify outputs
+        assert!(action_tree["outputs"].is_array());
+        let outputs_array = action_tree["outputs"].as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        let output = &outputs_array[0];
+        assert_eq!(output["name"], "content");
+        assert_eq!(output["type"], "string");
+        
+        // Verify execution order (should have two steps: read_file and decode_base64)
+        assert!(action_tree["execution_order"].is_array());
+        let execution_order = action_tree["execution_order"].as_array().unwrap();
+        assert_eq!(execution_order.len(), 2);
+        assert_eq!(execution_order[0], "read_file");
+        assert_eq!(execution_order[1], "decode_base64");
+        
+        // Verify types are present
+        assert!(action_tree["types"].is_object());
+        let types = action_tree["types"].as_object().unwrap();
+        assert!(types.contains_key("FileConfig"));
+        
+        // Verify permissions
+        assert!(action_tree["permissions"].is_object());
+        let permissions = action_tree["permissions"].as_object().unwrap();
+        assert!(permissions.contains_key("fs"));
+        let fs_permissions = permissions["fs"].as_array().unwrap();
+        assert!(fs_permissions.contains(&json!("read")));
     }
     
     #[test]
