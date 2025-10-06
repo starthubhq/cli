@@ -164,11 +164,11 @@ impl ExecutionEngine {
             None,               // No parent action ID (root)
         ).await?;     
 
-        println!("root_action: {:#?}", root_action);
+        // println!("root_action: {:#?}", root_action);
         self.log_success("Action tree built successfully", Some(&root_action.id));
 
         self.log_info("Executing action tree...", Some(&root_action.id));
-        self.run_action_tree(&mut root_action,
+        let result = self.run_action_tree(&mut root_action,
             &inputs, &HashMap::new()).await?;
         self.log_success("Action execution completed", Some(&root_action.id));
 
@@ -176,7 +176,7 @@ impl ExecutionEngine {
         self.send_tree_update(&root_action, &HashMap::new(), "completed").await;
 
         // Return the action tree (no execution)
-        Ok(serde_json::to_value(root_action)?)
+        Ok(serde_json::to_value(result)?)
     }
 
     async fn run_action_tree(&self,
@@ -213,7 +213,7 @@ impl ExecutionEngine {
             
             // Serialize the instantiated inputs
             let inputs_value = serde_json::to_value(&instantiated_inputs)?;
-            let result = self.run_wasm_step(action_state, None, &inputs_value).await?;
+            let result = self.run_wasm_step(action_state, &inputs_value).await?;
             
             self.log_success(&format!("{} step completed: {}", action_state.kind, action_state.name), Some(&action_state.id));
 
@@ -247,6 +247,8 @@ impl ExecutionEngine {
                     output.value = Some(resolved_output.clone());
                 }
             }
+
+            println!("action_state_clone: {:#?}", action_state_clone);
 
             return Ok(action_state_clone);
         }
@@ -331,6 +333,7 @@ impl ExecutionEngine {
             }
         }
 
+        println!("just before resolve_into_outputs");
         // If we got here, it means that we have executed all the steps in the action tree.
         // Now we need to aggregate the outputs back at the higher level.
         let resolved_outputs = self.resolve_into_outputs(
@@ -541,6 +544,8 @@ impl ExecutionEngine {
                 resolved_outputs.push(interpolated_template);
             }
         }
+
+        println!("resolved_outputs: {:#?}", resolved_outputs);
 
         Ok(resolved_outputs)
     }
@@ -1118,7 +1123,6 @@ impl ExecutionEngine {
     async fn run_wasm_step(
         &self,
         action: &mut ShAction,
-        pipeline_workdir: Option<&str>,
         inputs: &Value,
     ) -> Result<Vec<Value>> {
         if which::which("wasmtime").is_err() {
@@ -1157,10 +1161,10 @@ impl ExecutionEngine {
             for fs_perm in &permissions.fs {
                 match fs_perm.as_str() {
                     "read" => {
-                        cmd.arg("-S").arg("filesystem:read");
+                        cmd.arg("-S").arg("cli");
                     },
                     "write" => {
-                        cmd.arg("-S").arg("filesystem:write");
+                        cmd.arg("-S").arg("cli");
                     },
                     _ => {
                         self.log_info(&format!("Unknown filesystem permission: {}", fs_perm), Some(&action.id));
@@ -1187,14 +1191,34 @@ impl ExecutionEngine {
             self.log_info("No permissions specified, using default", Some(&action.id));
         }
         
-        // TODO: Uncomment this when we have a way to mount the working directory
         // Mount the working directory for filesystem access
-        // if let Some(wd) = pipeline_workdir {
-        //     if wd.starts_with('/') { 
-        //         cmd.arg("--dir").arg(wd);
-        //         cmd.current_dir(wd); 
-        //     }
-        // }
+        // Special handling for std/read-file and std/write-file actions
+        if action.uses.starts_with("std/read-file:") || action.uses.starts_with("std/write-file:") {
+            // For read-file and write-file, use the first input as the file path and mount its parent directory
+            if let Some(inputs_array) = inputs.as_array() {
+                if let Some(first_input) = inputs_array.first() {
+                    if let Some(file_path) = first_input.as_str() {
+                        if file_path.starts_with('/') {
+                            let path = std::path::Path::new(file_path);
+                            let dir_to_mount = if path.is_file() {
+                                // If it's a file, use its parent directory
+                                path.parent()
+                                    .and_then(|p| p.to_str())
+                                    .unwrap_or(file_path)
+                            } else {
+                                // If it's a directory or doesn't exist, use as-is
+                                file_path
+                            };
+                            
+                            cmd.arg("--dir").arg(dir_to_mount);
+                            cmd.current_dir(dir_to_mount);
+                            
+                            self.log_info(&format!("Mounting directory for read-file: {}", dir_to_mount), Some(&action.id));
+                        }
+                    }
+                }
+            }
+        }
         
         cmd.arg(&module_path);
 
@@ -1205,9 +1229,6 @@ impl ExecutionEngine {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn wasmtime for step {}: {}", action.id, e))?;
-
-        // print a copy of the inputs we are sending to the WASM module
-        println!("Sending inputs to WASM module: {}", input_json);
 
         // feed stdin JSON
         if let Some(stdin) = child.stdin.as_mut() {
@@ -1248,7 +1269,6 @@ impl ExecutionEngine {
         let _ = pump_out.await;
         let _ = pump_err.await;
 
-        println!("WASM execution completed with status: {}", status);
         if !status.success() {
             self.log_error(&format!("WASM execution failed with status: {}", status), Some(&action.id));
             bail!("step '{}' failed with {}", action.id, status);
@@ -1769,6 +1789,34 @@ mod tests {
         println!("result: {:#?}", result);
         // The test should succeed
         // assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_std_read_file() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing the std/read-file action
+        let action_ref = "std/read-file:0.0.1";
+        
+        // Test with file path parameter
+        let inputs = vec![
+            json!("/Users/tommaso/Desktop/test.txt")
+        ];
+        
+        println!("Testing std/read-file with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("std/read-file test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid std/read-file action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["name"], "read-file");
+        assert_eq!(action_tree["kind"], "wasm");
+        assert_eq!(action_tree["uses"], action_ref);
     }
 
     #[tokio::test]
