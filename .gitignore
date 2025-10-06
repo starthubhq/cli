@@ -42,3 +42,4 @@ Thumbs.db
 starthub.json
 test/
 artifacts/
+**/.env

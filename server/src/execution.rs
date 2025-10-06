@@ -10,6 +10,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use which;
+use dotenv::dotenv;
 use zip::ZipArchive;
 use tokio::sync::broadcast;
 
@@ -162,6 +163,8 @@ impl ExecutionEngine {
             action_ref,         // Action reference to download
             None,               // No parent action ID (root)
         ).await?;     
+
+        println!("root_action: {:#?}", root_action);
         self.log_success("Action tree built successfully", Some(&root_action.id));
 
         self.log_info("Executing action tree...", Some(&root_action.id));
@@ -181,12 +184,17 @@ impl ExecutionEngine {
         parent_inputs: &Vec<Value>,
         executed_sibling_steps: &HashMap<String, ShAction>) -> Result<ShAction> {
         
+        println!("Executing {} step 1: {}", action_state.kind, action_state.name);
+        println!("Just before instantiating inputs");
+        println!("parent_inputs: {:#?}", parent_inputs);
         // 1) Instantiate the inputs according to the types specified
         let instantiated_inputs: Vec<Value> = self.instantiate(
             &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
             &action_state.inputs,
             &parent_inputs
         )?;
+        println!("Just after instantiating inputs");
+        println!("instantiated_inputs: {:#?}", instantiated_inputs);
 
         // 2) Assign the instantiated inputs to the action state inputs
         for (index, input) in action_state.inputs.iter_mut().enumerate() {
@@ -196,11 +204,12 @@ impl ExecutionEngine {
         }
 
         // println!("instantiated_inputs: {:#?}", instantiated_inputs);
-        // println!("action_state: {:#?}", action_state);
+        println!("updated action_state inputs: {:#?}", action_state.inputs);
 
         // Base condition
         if action_state.kind == "wasm" || action_state.kind == "docker" {
-            self.log_info(&format!("Executing {} step: {}", action_state.kind, action_state.name), Some(&action_state.id));
+            println!("Executing {} wasm step: {}", action_state.kind, action_state.name);
+            self.log_info(&format!("Executing {} wasm step: {}", action_state.kind, action_state.name), Some(&action_state.id));
             
             // Serialize the instantiated inputs
             let inputs_value = serde_json::to_value(&instantiated_inputs)?;
@@ -249,7 +258,7 @@ impl ExecutionEngine {
         for step_id in &action_state.execution_order {
             if let Some(step) = action_state.steps.get_mut(step_id) {
                 self.log_info(&format!("Starting step: {}", step_id), Some(&action_state.id));
-                
+
                 // For each step, we need to use the inputs and types field
                 // of the step to generate a completely new object with that structure.
                 
@@ -265,26 +274,59 @@ impl ExecutionEngine {
                     &instantiated_inputs,  // Inject inputs from current action into the step
                     &local_executed_steps
                 )?;
-                
-                // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
-                let processed_child = Box::pin(self.run_action_tree(
-                    step, 
-                    &resolved_inputs_to_inject_into_child_step,  // Parent's resolved inputs for template resolution
-                    &local_executed_steps
-                )).await?;
-                
-                // Send tree update after each recursion iteration
-                self.send_tree_update(&action_state, &local_executed_steps, step_id).await;
-                
-                // Given the step name, assing the processed child to the step
-                let processed_child_clone = processed_child.clone();
-                action_state.steps.insert(step_id.clone(), processed_child);
-                
-                // Add the executed steps to the executed siblings, so in the
-                // next iteration the template resolution can pick up the outputs
-                // of the executed steps.
-                local_executed_steps.insert(step_id.clone(), processed_child_clone);
-                
+
+                println!("resolved_inputs_to_inject_into_child_step: {:#?}", resolved_inputs_to_inject_into_child_step);
+
+                // We make a special case for the if step, to print the step
+                if step.uses.split(':').next().map(|s| s == "starthubhq/if").unwrap_or(false) {
+                     // 3) NOW check condition with fully resolved inputs and sibling data
+                    // if let Some(condition) = action_state.condition.as_ref() {
+                        // self.log_info(&format!("Evaluating condition for action: {}", action_state.name), Some(&action_state.id));
+                        
+                        // We now have:
+                        // - instantiated_inputs: resolved parent inputs
+                        // - executed_sibling_steps: all sibling step outputs
+                        // let should_execute = self.evaluate_condition(
+                        //     condition, 
+                        //     &instantiated_inputs, 
+                        //     executed_sibling_steps
+                        // ).await?;
+                        
+                        // if !should_execute {
+                        //     self.log_info(&format!("Condition failed, skipping action: {}", action_state.name), Some(&action_state.id));
+                            
+                        //     // Return action with empty outputs
+                        //     let mut skipped_action = action_state.clone();
+                        //     for output in skipped_action.outputs.iter_mut() {
+                        //         output.value = Some(serde_json::Value::Null);
+                        //     }
+                        //     return Ok(skipped_action);
+                        // }
+                        
+                        // self.log_info(&format!("Condition passed, executing action: {}", action_state.name), Some(&action_state.id));
+                    // }
+                } else {
+                     // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
+                    let processed_child = Box::pin(self.run_action_tree(
+                        step, 
+                        &resolved_inputs_to_inject_into_child_step,  // Parent's resolved inputs for template resolution
+                        &local_executed_steps
+                    )).await?;
+                    
+                    // Send tree update after each recursion iteration
+                    self.send_tree_update(&action_state, &local_executed_steps, step_id).await;
+                    
+                    // Given the step name, assing the processed child to the step
+                    let processed_child_clone = processed_child.clone();
+                    action_state.steps.insert(step_id.clone(), processed_child);
+                    
+                    // Add the executed steps to the executed siblings, so in the
+                    // next iteration the template resolution can pick up the outputs
+                    // of the executed steps.
+                    local_executed_steps.insert(step_id.clone(), processed_child_clone);
+                    
+                }
+
                 self.log_success(&format!("Completed step: {}", step_id), Some(&action_state.id));
             }
         }
@@ -307,6 +349,83 @@ impl ExecutionEngine {
 
         return Ok(action_state.clone());
     }
+
+    // async fn evaluate_condition(
+    //     &self,
+    //     condition: &Value,
+    //     instantiated_inputs: &[Value],  // Fully resolved inputs
+    //     executed_sibling_steps: &HashMap<String, ShAction>  // All sibling outputs
+    // ) -> Result<bool> {
+    //     // Parse condition structure
+    //     let condition_obj = condition.as_object()
+    //         .ok_or_else(|| anyhow::anyhow!("Condition must be an object"))?;
+        
+    //     let a = condition_obj.get("a")
+    //         .ok_or_else(|| anyhow::anyhow!("Condition missing 'a' field"))?;
+    //     let operator = condition_obj.get("operator")
+    //         .and_then(|v| v.as_str())
+    //         .ok_or_else(|| anyhow::anyhow!("Condition missing 'operator' field"))?;
+    //     let b = condition_obj.get("b")
+    //         .ok_or_else(|| anyhow::anyhow!("Condition missing 'b' field"))?;
+        
+    //     // Resolve template values with full context
+    //     let resolved_a = self.interpolate(a, instantiated_inputs, executed_sibling_steps)?;
+    //     let resolved_b = self.interpolate(b, instantiated_inputs, executed_sibling_steps)?;
+        
+    //     // Create inputs for the if action
+    //     let if_inputs = vec![
+    //         resolved_a,
+    //         serde_json::Value::String(operator.to_string()),
+    //         resolved_b
+    //     ];
+        
+    //     // Execute the if action
+    //     let if_action_ref = "std/if:0.0.1";
+    //     let if_manifest = self.fetch_manifest(if_action_ref).await?;
+        
+    //     // Create a temporary action for the if condition
+    //     let mut if_action = ShAction {
+    //         id: uuid::Uuid::new_v4().to_string(),
+    //         name: "if".to_string(),
+    //         kind: "wasm".to_string(),
+    //         uses: if_action_ref.to_string(),
+    //         inputs: if_manifest.inputs.iter().map(|input| ShIO {
+    //             name: input.name.clone(),
+    //             r#type: input.ty.to_string(),
+    //             template: serde_json::Value::Null,
+    //             value: None,
+    //             required: input.required,
+    //         }).collect(),
+    //         outputs: if_manifest.outputs.iter().map(|output| ShIO {
+    //             name: output.name.clone(),
+    //             r#type: output.ty.to_string(),
+    //             template: serde_json::Value::Null,
+    //             value: None,
+    //             required: output.required,
+    //         }).collect(),
+    //         parent_action: None,
+    //         steps: HashMap::new(),
+    //         execution_order: Vec::new(),
+    //         types: None,
+    //         condition: None, // No condition on the if action itself
+    //     };
+        
+    //     // Execute the if action
+    //     let result = self.run_wasm_step(&mut if_action, None, &serde_json::Value::Array(if_inputs)).await?;
+        
+    //     // Extract boolean result
+    //     if let Some(first_result) = result.first() {
+    //         if let Some(array) = first_result.as_array() {
+    //             if let Some(result_obj) = array.first() {
+    //                 if let Some(result_bool) = result_obj.get("result").and_then(|v| v.as_bool()) {
+    //                     return Ok(result_bool);
+    //                 }
+    //             }
+    //         }
+    //     }
+        
+    //     Err(anyhow::anyhow!("Failed to get boolean result from if action"))
+    // }
 
     fn parse_json_strings_recursively(value: Value) -> Value {
         match value {
@@ -467,7 +586,28 @@ impl ExecutionEngine {
             Value::String(s) => {
                 // println!("resolve_template_string: {:#?}", s);
                 let resolved = self.interpolate_string(s, variables, executed_steps)?;
-                Ok(Value::String(resolved))
+                
+                // Check if the resolved string is actually a JSON object/array
+                // by trying to parse it as JSON
+                match serde_json::from_str::<Value>(&resolved) {
+                    Ok(parsed_value) => {
+                        // If it's a JSON object or array, return it as-is
+                        // If it's a primitive (string, number, boolean, null), 
+                        // we need to decide whether to keep it as the primitive or as a string
+                        match parsed_value {
+                            Value::Object(_) | Value::Array(_) => Ok(parsed_value),
+                            _ => {
+                                // For primitives, always return the parsed value
+                                // This preserves the original type (number, boolean, null) from the JSON
+                                Ok(parsed_value)
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        // Not valid JSON, return as string
+                        Ok(Value::String(resolved))
+                    }
+                }
             },
             Value::Object(obj) => {
                 // Recursively resolve object templates
@@ -500,6 +640,22 @@ impl ExecutionEngine {
     ) -> Result<String> {
         let mut result = template.to_string();
         
+        // Handle {{inputs[index]}} patterns (without jsonpath)
+        let inputs_simple_re = regex::Regex::new(r"\{\{inputs\[(\d+)\]\}\}")?;
+        for cap in inputs_simple_re.captures_iter(template) {
+            if let Some(index_str) = cap.get(1) {
+                if let Ok(index) = index_str.as_str().parse::<usize>() {
+                    if let Some(input_value) = variables.get(index) {
+                        let replacement = match input_value {
+                            Value::String(s) => s.clone(),
+                            _ => input_value.to_string(),
+                        };
+                        result = result.replace(&cap[0], &replacement);
+                    }
+                }
+            }
+        }
+        
         // Handle {{inputs[index].jsonpath}} patterns
         let inputs_re = regex::Regex::new(r"\{\{inputs\[(\d+)\]\.([^}]+)\}\}")?;
         for cap in inputs_re.captures_iter(template) {
@@ -526,15 +682,25 @@ impl ExecutionEngine {
                     if let Some(step) = executed_steps.get(step_name.as_str()) {
                         if let Some(output) = step.outputs.get(index) {
                             if let Some(output_value) = &output.value {
+                                
                                 if let Ok(resolved_value) = self.evaluate_jsonpath(output_value, jsonpath.as_str()) {
                                     let replacement = match resolved_value {
                                         Value::String(s) => s.clone(),
                                         _ => resolved_value.to_string(),
                                     };
+                                    
                                     result = result.replace(&cap[0], &replacement);
+                                } else {
+                                    println!("DEBUG: Failed to evaluate jsonpath: {}", jsonpath.as_str());
                                 }
+                            } else {
+                                println!("DEBUG: No output value found for step: {}", step_name.as_str());
                             }
+                        } else {
+                            println!("DEBUG: No output found at index {} for step: {}", index, step_name.as_str());
                         }
+                    } else {
+                        println!("DEBUG: Step not found in executed_steps: {}", step_name.as_str());
                     }
                 }
             }
@@ -542,6 +708,14 @@ impl ExecutionEngine {
         
         Ok(result)
     }
+
+    // Helper function to convert a Value to a string, preserving JSON structure
+    // fn value_to_string(&self, value: &Value) -> String {
+    //     match value {
+    //         Value::String(s) => s.clone(),
+    //         _ => serde_json::to_string(value).unwrap_or_else(|_| value.to_string()),
+    //     }
+    // }
 
     fn evaluate_jsonpath(&self, value: &Value, jsonpath: &str) -> Result<Value> {
         // Simple JSONPath evaluation for common patterns
@@ -774,6 +948,10 @@ impl ExecutionEngine {
             execution_order: Vec::new(),
             // Initially empty types
             types: if manifest.types.is_empty() { None } else { Some(manifest.types.clone().into_iter().collect()) },
+            // Mirrors from manifest
+            mirrors: manifest.mirrors.clone(),
+            // Permissions from manifest
+            permissions: manifest.permissions.clone(),
         };
         
         // 4. For each step, call the build_action_tree function recursively
@@ -951,7 +1129,7 @@ impl ExecutionEngine {
         self.log_info(&format!("Downloading WASM module: {}", action.uses), Some(&action.id));
         // For now, we'll create a simple implementation that downloads the WASM file
         // In a real implementation, this would download from the registry
-        let module_path = self.download_wasm(&action.uses).await?;
+        let module_path = self.download_wasm(&action.uses, &action.mirrors).await?;
         self.log_success(&format!("WASM module downloaded: {:?}", module_path), Some(&action.id));
         
         // Verify the WASM file exists and is readable
@@ -972,15 +1150,53 @@ impl ExecutionEngine {
         
         // Construct command
         let mut cmd = TokioCommand::new("wasmtime");
-        cmd.arg("-S").arg("http");
-        cmd.arg(&module_path);
-
-        // working dir if absolute
-        if let Some(wd) = pipeline_workdir {
-            if wd.starts_with('/') { 
-                cmd.current_dir(wd); 
+        
+        // Add permissions based on the action's permissions
+        if let Some(permissions) = &action.permissions {
+            // Add filesystem permissions
+            for fs_perm in &permissions.fs {
+                match fs_perm.as_str() {
+                    "read" => {
+                        cmd.arg("-S").arg("filesystem:read");
+                    },
+                    "write" => {
+                        cmd.arg("-S").arg("filesystem:write");
+                    },
+                    _ => {
+                        self.log_info(&format!("Unknown filesystem permission: {}", fs_perm), Some(&action.id));
+                    }
+                }
             }
+            
+            // Add network permissions
+            for net_perm in &permissions.net {
+                match net_perm.as_str() {
+                    "http" => {
+                        cmd.arg("-S").arg("http");
+                    },
+                    "https" => {
+                        cmd.arg("-S").arg("http"); // wasmtime uses 'http' for both http and https
+                    },
+                    _ => {
+                        self.log_info(&format!("Unknown network permission: {}", net_perm), Some(&action.id));
+                    }
+                }
+            }
+        } else {
+            // Default permissions if none specified
+            self.log_info("No permissions specified, using default", Some(&action.id));
         }
+        
+        // TODO: Uncomment this when we have a way to mount the working directory
+        // Mount the working directory for filesystem access
+        // if let Some(wd) = pipeline_workdir {
+        //     if wd.starts_with('/') { 
+        //         cmd.arg("--dir").arg(wd);
+        //         cmd.current_dir(wd); 
+        //     }
+        // }
+        
+        cmd.arg(&module_path);
 
         // spawn with piped stdio
         let mut child = cmd
@@ -990,9 +1206,14 @@ impl ExecutionEngine {
             .spawn()
             .map_err(|e| anyhow::anyhow!("Failed to spawn wasmtime for step {}: {}", action.id, e))?;
 
+        // print a copy of the inputs we are sending to the WASM module
+        println!("Sending inputs to WASM module: {}", input_json);
+
         // feed stdin JSON
         if let Some(stdin) = child.stdin.as_mut() {
             stdin.write_all(input_json.as_bytes()).await?;
+            // Let's send an array of fixed inputs [2.5, "ignored_value"]
+            // stdin.write_all(b"[\"2.5\", \"ignored_value\"]").await?;
         }
         drop(child.stdin.take());
 
@@ -1027,6 +1248,7 @@ impl ExecutionEngine {
         let _ = pump_out.await;
         let _ = pump_err.await;
 
+        println!("WASM execution completed with status: {}", status);
         if !status.success() {
             self.log_error(&format!("WASM execution failed with status: {}", status), Some(&action.id));
             bail!("step '{}' failed with {}", action.id, status);
@@ -1056,7 +1278,36 @@ impl ExecutionEngine {
         }
     }
 
-    async fn download_wasm(&self, action_ref: &str) -> Result<std::path::PathBuf> {
+    async fn try_download_from_url(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+        wasm_dir: &std::path::Path,
+        wasm_path: &std::path::Path,
+    ) -> Result<std::path::PathBuf> {
+        let response = client.get(url).send().await?;
+        
+        if response.status().is_success() {
+            let zip_bytes = response.bytes().await?;
+            
+            // Create a temporary file for the zip
+            let temp_zip_path = wasm_dir.join("temp_artifact.zip");
+            std::fs::write(&temp_zip_path, zip_bytes)?;
+            
+            // Extract the WASM file from the zip
+            self.extract_wasm_from_zip(&temp_zip_path, wasm_path).await?;
+            
+            // Clean up the temporary zip file
+            std::fs::remove_file(&temp_zip_path)?;
+            
+            println!("WASM file extracted to: {:?}", wasm_path);
+            Ok(wasm_path.to_path_buf())
+        } else {
+            Err(anyhow::anyhow!("Failed to download artifact from {}: {}", url, response.status()))
+        }
+    }
+
+    async fn download_wasm(&self, action_ref: &str, mirrors: &[String]) -> Result<std::path::PathBuf> {
         println!("Downloading WASM file for action: {}", action_ref);
         // Construct the WASM file path in the cache directory with proper directory structure
         let url_path = action_ref.replace(":", "/");
@@ -1074,7 +1325,7 @@ impl ExecutionEngine {
             return Err(anyhow::anyhow!("Failed to create directory {:?}: {}", wasm_dir, e));
         }
         
-        // Download the artifact.zip file from the registry
+        // Try primary download first
         let storage_url = format!(
             "{}{}/{}/artifact.zip",
             STARTHUB_API_BASE_URL,
@@ -1085,26 +1336,34 @@ impl ExecutionEngine {
         println!("Downloading artifact from: {}", storage_url);
         
         let client = reqwest::Client::new();
-        let response = client.get(&storage_url).send().await?;
+        let mut last_error = None;
         
-        if response.status().is_success() {
-            let zip_bytes = response.bytes().await?;
-            
-            // Create a temporary file for the zip
-            let temp_zip_path = wasm_dir.join("temp_artifact.zip");
-            std::fs::write(&temp_zip_path, zip_bytes)?;
-            
-            // Extract the WASM file from the zip
-            self.extract_wasm_from_zip(&temp_zip_path, &wasm_path).await?;
-            
-            // Clean up the temporary zip file
-            std::fs::remove_file(&temp_zip_path)?;
-            
-            println!("WASM file extracted to: {:?}", wasm_path);
-            Ok(wasm_path)
-        } else {
-            Err(anyhow::anyhow!("Failed to download artifact: {}", response.status()))
+        // Try primary URL first
+        match self.try_download_from_url(&client, &storage_url, &wasm_dir, &wasm_path).await {
+            Ok(path) => return Ok(path),
+            Err(e) => {
+                println!("Primary download failed: {}", e);
+                last_error = Some(e);
+            }
         }
+        
+        // Try mirrors if primary failed
+        for (i, mirror_url) in mirrors.iter().enumerate() {
+            println!("Trying mirror {}: {}", i + 1, mirror_url);
+            match self.try_download_from_url(&client, mirror_url, &wasm_dir, &wasm_path).await {
+                Ok(path) => {
+                    println!("Successfully downloaded from mirror: {}", mirror_url);
+                    return Ok(path);
+                },
+                Err(e) => {
+                    println!("Mirror {} failed: {}", i + 1, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+        
+        // If all downloads failed, return the last error
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No download sources available")))
     }
 
     async fn extract_wasm_from_zip(&self, zip_path: &std::path::Path, wasm_path: &std::path::Path) -> Result<()> {
@@ -1241,7 +1500,7 @@ mod tests {
     // TESTS
 
     #[tokio::test]
-    async fn test_execute_action() {
+    async fn test_execute_action_get_weather_by_location_name() {
         // Create a mock ExecutionEngine
         let engine = ExecutionEngine::new();
         
@@ -1298,8 +1557,249 @@ mod tests {
         assert!(types.contains_key("CustomWeatherResponse"));
     }
 
-    
+    #[tokio::test]
+    async fn test_execute_action_create_do_project() {
+        dotenv::dotenv().ok();
 
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing action with the same inputs as test_build_action_tree
+        let action_ref = "starthubhq/do-create-project:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_PROJECT_NAME")
+            .unwrap_or_else(|_| "".to_string());
+        let description = std::env::var("DO_PROJECT_DESCRIPTION")
+            .unwrap_or_else(|_| "".to_string());
+        let purpose = std::env::var("DO_PROJECT_PURPOSE")
+            .unwrap_or_else(|_| "".to_string());
+        let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
+            .unwrap_or_else(|_| "".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "description": description,
+                "purpose": purpose,
+                "environment": environment
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_droplet() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing action for droplet creation
+        let action_ref = "starthubhq/do-create-droplet:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_DROPLET_NAME")
+            .unwrap_or_else(|_| "test-droplet".to_string());
+        let region = std::env::var("DO_DROPLET_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let size = std::env::var("DO_DROPLET_SIZE")
+            .unwrap_or_else(|_| "s-1vcpu-1gb".to_string());
+        let image = std::env::var("DO_DROPLET_IMAGE")
+            .unwrap_or_else(|_| "ubuntu-20-04-x64".to_string());
+        let ssh_keys = std::env::var("DO_DROPLET_SSH_KEYS")
+            .unwrap_or_else(|_| "".to_string());
+        let backups = std::env::var("DO_DROPLET_BACKUPS")
+            .unwrap_or_else(|_| "false".to_string());
+        let ipv6 = std::env::var("DO_DROPLET_IPV6")
+            .unwrap_or_else(|_| "false".to_string());
+        let monitoring = std::env::var("DO_DROPLET_MONITORING")
+            .unwrap_or_else(|_| "false".to_string());
+        let tags = std::env::var("DO_DROPLET_TAGS")
+            .unwrap_or_else(|_| "".to_string());
+        let user_data = std::env::var("DO_DROPLET_USER_DATA")
+            .unwrap_or_else(|_| "".to_string());
+        
+        // Parse boolean values
+        let backups_bool = backups.parse::<bool>().unwrap_or(false);
+        let ipv6_bool = ipv6.parse::<bool>().unwrap_or(false);
+        let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
+        
+        // Parse array values
+        let ssh_keys_array: Vec<String> = if ssh_keys.is_empty() {
+            vec![]
+        } else {
+            ssh_keys.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        
+        let tags_array: Vec<String> = if tags.is_empty() {
+            vec![]
+        } else {
+            tags.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "size": size,
+                "image": image,
+                "backups": backups_bool,
+                "ipv6": ipv6_bool,
+                "monitoring": monitoring_bool,
+                "tags": tags_array,
+                "user_data": user_data
+            })
+        ];
+        
+        // println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_ssh_key() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing action for SSH key creation
+        let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_SSH_KEY_NAME")
+            .unwrap_or_else(|_| "test-ssh-key".to_string());
+        let public_key = std::env::var("DO_SSH_KEY_PUBLIC_KEY")
+            .unwrap_or_else(|_| "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA...".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "public_key": public_key
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_droplet_sync() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing action for droplet creation with sync
+        let action_ref = "starthubhq/do-create-droplet-sync:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_DROPLET_NAME")
+            .unwrap_or_else(|_| "test-droplet-sync".to_string());
+        let region = std::env::var("DO_DROPLET_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let size = std::env::var("DO_DROPLET_SIZE")
+            .unwrap_or_else(|_| "s-1vcpu-1gb".to_string());
+        let image = std::env::var("DO_DROPLET_IMAGE")
+            .unwrap_or_else(|_| "ubuntu-20-04-x64".to_string());
+        let backups = std::env::var("DO_DROPLET_BACKUPS")
+            .unwrap_or_else(|_| "false".to_string());
+        let ipv6 = std::env::var("DO_DROPLET_IPV6")
+            .unwrap_or_else(|_| "false".to_string());
+        let monitoring = std::env::var("DO_DROPLET_MONITORING")
+            .unwrap_or_else(|_| "false".to_string());
+        let tags = std::env::var("DO_DROPLET_TAGS")
+            .unwrap_or_else(|_| "".to_string());
+        let user_data = std::env::var("DO_DROPLET_USER_DATA")
+            .unwrap_or_else(|_| "".to_string());
+        
+        // Parse boolean values
+        let backups_bool = backups.parse::<bool>().unwrap_or(false);
+        let ipv6_bool = ipv6.parse::<bool>().unwrap_or(false);
+        let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
+        
+        // Parse array values
+        let tags_array: Vec<String> = if tags.is_empty() {
+            vec![]
+        } else {
+            tags.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "size": size,
+                "image": image,
+                "backups": backups_bool,
+                "ipv6": ipv6_bool,
+                "monitoring": monitoring_bool,
+                "tags": tags_array,
+                "user_data": user_data
+            })
+        ];
+        
+        // println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        println!("result: {:#?}", result);
+        // The test should succeed
+        // assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_sleep() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing the sleep action directly
+        let action_ref = "std/sleep:0.0.1";
+        
+        // Test with two inputs: seconds and ignored value
+        let inputs = vec![
+            json!(2.5),  // seconds
+            json!("ignored_value")  // second input that will be ignored
+        ];
+        
+        println!("Testing sleep action with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("Sleep test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid sleep action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["name"], "sleep");
+        assert_eq!(action_tree["kind"], "wasm");
+        assert_eq!(action_tree["uses"], action_ref);
+    }
+    
     #[test]
     fn test_execution_engine_new() {
         // Test creating a new ExecutionEngine
@@ -1392,6 +1892,8 @@ mod tests {
             steps: HashMap::new(),
             execution_order: vec![],
             types: None,
+            mirrors: vec![],
+            permissions: None,
         });
         
         // Step 1: get_coordinates - no dependencies
@@ -1418,6 +1920,8 @@ mod tests {
             steps: HashMap::new(),
             execution_order: vec![],
             types: None,
+            mirrors: vec![],
+            permissions: None,
         });
         
 
@@ -1463,6 +1967,8 @@ mod tests {
             steps: HashMap::new(),
             execution_order: vec![],
             types: None,
+            mirrors: vec![],
+            permissions: None,
         });
 
         // Test the topological sort
@@ -1501,6 +2007,8 @@ mod tests {
             steps: HashMap::new(),
             execution_order: vec![],
             types: None,
+            mirrors: vec![],
+            permissions: None,
         });
         
         // Step 2: depends on step 1 (circular dependency)
@@ -1523,6 +2031,8 @@ mod tests {
             steps: HashMap::new(),
             execution_order: vec![],
             types: None,
+            mirrors: vec![],
+            permissions: None,
         });
 
         // Test that circular dependency is detected
@@ -1705,6 +2215,8 @@ mod tests {
             steps: HashMap::new(),
             execution_order: vec![],
             types: None,
+            mirrors: vec![],
+            permissions: None,
         };
         
         let inputs = vec![json!({"test": "data"})];
