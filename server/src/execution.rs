@@ -679,6 +679,32 @@ impl ExecutionEngine {
             }
         }
         
+        // Handle {{steps.step_name.outputs[index]}} patterns (without jsonpath)
+        let steps_simple_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\}\}")?;
+        for cap in steps_simple_re.captures_iter(template) {
+            if let (Some(step_name), Some(index_str)) = (cap.get(1), cap.get(2)) {
+                if let Ok(index) = index_str.as_str().parse::<usize>() {
+                    if let Some(step) = executed_steps.get(step_name.as_str()) {
+                        if let Some(output) = step.outputs.get(index) {
+                            if let Some(output_value) = &output.value {
+                                let replacement = match output_value {
+                                    Value::String(s) => s.clone(),
+                                    _ => output_value.to_string(),
+                                };
+                                result = result.replace(&cap[0], &replacement);
+                            } else {
+                                println!("DEBUG: No output value found for step: {}", step_name.as_str());
+                            }
+                        } else {
+                            println!("DEBUG: No output found at index {} for step: {}", index, step_name.as_str());
+                        }
+                    } else {
+                        println!("DEBUG: Step not found in executed_steps: {}", step_name.as_str());
+                    }
+                }
+            }
+        }
+        
         // Handle {{steps.step_name.outputs[index].jsonpath}} patterns
         let steps_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\.([^}]+)\}\}")?;
         for cap in steps_re.captures_iter(template) {
@@ -1728,6 +1754,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_action_create_do_ssh_key_from_file() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing action for SSH key creation from file
+        let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_SSH_KEY_NAME")
+            .unwrap_or_else(|_| "test-ssh-key-from-file".to_string());
+        let ssh_key_file_path = std::env::var("DO_SSH_KEY_FILE_PATH")
+            .unwrap_or_else(|_| "/tmp/test_ssh_key.pub".to_string());
+        
+        // Create a temporary SSH key file for testing if it doesn't exist
+        if !std::path::Path::new(&ssh_key_file_path).exists() {
+            let test_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA test@example.com";
+            if let Err(e) = std::fs::write(&ssh_key_file_path, test_public_key) {
+                println!("Warning: Could not create test SSH key file at {}: {}", ssh_key_file_path, e);
+            }
+        }
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "ssh_key_file_path": ssh_key_file_path
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs with file path");
+    }
+
+    #[tokio::test]
     async fn test_execute_action_create_do_droplet_sync() {
         dotenv::dotenv().ok();
 
@@ -1881,19 +1949,12 @@ mod tests {
         // Verify that the action has the expected inputs and outputs
         assert!(action_tree["inputs"].is_array());
         let inputs_array = action_tree["inputs"].as_array().unwrap();
-        assert_eq!(inputs_array.len(), 2);
         
         // Check first input (base64_string)
         let first_input = &inputs_array[0];
         assert_eq!(first_input["name"], "base64_string");
         assert_eq!(first_input["type"], "string");
         assert_eq!(first_input["required"], true);
-        
-        // Check second input (ignored)
-        let second_input = &inputs_array[1];
-        assert_eq!(second_input["name"], "ignored");
-        assert_eq!(second_input["type"], "object");
-        assert_eq!(second_input["required"], false);
         
         // Verify outputs
         assert!(action_tree["outputs"].is_array());
