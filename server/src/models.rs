@@ -32,6 +32,24 @@ pub struct ShManifest {
     #[serde(default)]
     #[serde(skip_serializing_if = "is_default_export")]
     pub export: serde_json::Value,
+    // Mirrors for artifact downloads
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mirrors: Vec<String>,
+    // Permissions for the action
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<ShPermissions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShPermissions {
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fs: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub net: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +77,8 @@ pub struct ShAction {
     
     // Manifest structure fields
     pub types: Option<serde_json::Map<String, Value>>,   // From manifest.types
+    pub mirrors: Vec<String>,           // Mirrors for artifact downloads
+    pub permissions: Option<ShPermissions>, // Permissions for the action
 }
 
 // Helper function to determine if export field should be skipped during serialization
