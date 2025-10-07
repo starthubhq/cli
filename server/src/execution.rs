@@ -4,13 +4,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use dirs;
 use reqwest::{self};
-use petgraph::Graph;
-use petgraph::algo::toposort;
 use tokio::process::Command as TokioCommand;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use which;
-use dotenv::dotenv;
 use zip::ZipArchive;
 use tokio::sync::broadcast;
 
@@ -164,7 +161,8 @@ impl ExecutionEngine {
             None,               // No parent action ID (root)
         ).await?;     
 
-        // println!("root_action: {:#?}", root_action);
+        println!("root_action: {:#?}", root_action);
+        // return Ok(serde_json::to_value(root_action)?);
         self.log_success("Action tree built successfully", Some(&root_action.id));
 
         self.log_info("Executing action tree...", Some(&root_action.id));
@@ -256,10 +254,16 @@ impl ExecutionEngine {
         // Track executed steps as we go
         let mut local_executed_steps = executed_sibling_steps.clone();
         
-        // Run the action tree recursively - DFS
-        for step_id in &action_state.execution_order {
-            if let Some(step) = action_state.steps.get_mut(step_id) {
-                self.log_info(&format!("Starting step: {}", step_id), Some(&action_state.id));
+        // Run the action tree recursively - dynamic step execution with flow control support
+        loop {
+            // Determine the next step to execute based on dependencies
+            let next_step_id = match self.get_next_step_to_execute(&action_state.steps, &local_executed_steps)? {
+                Some(step_id) => step_id,
+                None => break, // All steps completed or no more steps can be executed
+            };
+            
+            if let Some(step) = action_state.steps.get_mut(&next_step_id) {
+                self.log_info(&format!("Starting step: {}", next_step_id), Some(&action_state.id));
 
                 // For each step, we need to use the inputs and types field
                 // of the step to generate a completely new object with that structure.
@@ -279,57 +283,48 @@ impl ExecutionEngine {
 
                 println!("resolved_inputs_to_inject_into_child_step: {:#?}", resolved_inputs_to_inject_into_child_step);
 
-                // We make a special case for the if step, to print the step
-                if step.uses.split(':').next().map(|s| s == "starthubhq/if").unwrap_or(false) {
-                     // 3) NOW check condition with fully resolved inputs and sibling data
-                    // if let Some(condition) = action_state.condition.as_ref() {
-                        // self.log_info(&format!("Evaluating condition for action: {}", action_state.name), Some(&action_state.id));
-                        
-                        // We now have:
-                        // - instantiated_inputs: resolved parent inputs
-                        // - executed_sibling_steps: all sibling step outputs
-                        // let should_execute = self.evaluate_condition(
-                        //     condition, 
-                        //     &instantiated_inputs, 
-                        //     executed_sibling_steps
-                        // ).await?;
-                        
-                        // if !should_execute {
-                        //     self.log_info(&format!("Condition failed, skipping action: {}", action_state.name), Some(&action_state.id));
-                            
-                        //     // Return action with empty outputs
-                        //     let mut skipped_action = action_state.clone();
-                        //     for output in skipped_action.outputs.iter_mut() {
-                        //         output.value = Some(serde_json::Value::Null);
-                        //     }
-                        //     return Ok(skipped_action);
-                        // }
-                        
-                        // self.log_info(&format!("Condition passed, executing action: {}", action_state.name), Some(&action_state.id));
-                    // }
-                } else {
-                     // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
-                    let processed_child = Box::pin(self.run_action_tree(
-                        step, 
-                        &resolved_inputs_to_inject_into_child_step,  // Parent's resolved inputs for template resolution
-                        &local_executed_steps
-                    )).await?;
-                    
-                    // Send tree update after each recursion iteration
-                    self.send_tree_update(&action_state, &local_executed_steps, step_id).await;
-                    
-                    // Given the step name, assing the processed child to the step
-                    let processed_child_clone = processed_child.clone();
-                    action_state.steps.insert(step_id.clone(), processed_child);
-                    
-                    // Add the executed steps to the executed siblings, so in the
-                    // next iteration the template resolution can pick up the outputs
-                    // of the executed steps.
-                    local_executed_steps.insert(step_id.clone(), processed_child_clone);
-                    
-                }
+                // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
+                let processed_child = Box::pin(self.run_action_tree(
+                    step, 
+                    &resolved_inputs_to_inject_into_child_step,  // Parent's resolved inputs for template resolution
+                    &local_executed_steps
+                )).await?;
+                
+                // Send tree update after each recursion iteration
+                self.send_tree_update(&action_state, &local_executed_steps, &next_step_id).await;
+                
+                // Given the step name, assing the processed child to the step
+                let processed_child_clone = processed_child.clone();
+                action_state.steps.insert(next_step_id.clone(), processed_child);
+                
+                // Add the executed steps to the executed siblings, so in the
+                // next iteration the template resolution can pick up the outputs
+                // of the executed steps.
+                local_executed_steps.insert(next_step_id.clone(), processed_child_clone);
 
-                self.log_success(&format!("Completed step: {}", step_id), Some(&action_state.id));
+                self.log_success(&format!("Completed step: {}", next_step_id), Some(&action_state.id));
+                
+                // Check for flow control after step execution
+                if let Some(executed_step) = local_executed_steps.get(&next_step_id) {
+                    // For flow control, we need to check if the executed step indicates
+                    // that we should skip certain steps or jump to a specific step
+                    if let Ok(Some(flow_control_step)) = self.check_flow_control_dynamic(
+                        executed_step, 
+                        &action_state.steps,
+                        &local_executed_steps
+                    ) {
+                        // Flow control detected, mark the specified step as ready to execute
+                        // by removing it from executed steps if it was already executed
+                        if local_executed_steps.contains_key(&flow_control_step) {
+                            local_executed_steps.remove(&flow_control_step);
+                        }
+                        self.log_info(&format!("Flow control: preparing to execute step '{}'", flow_control_step), Some(&action_state.id));
+                    }
+                }
+            } else {
+                // Step not found, this shouldn't happen with dynamic execution
+                self.log_error(&format!("Step '{}' not found in action tree", next_step_id), Some(&action_state.id));
+                break;
             }
         }
 
@@ -975,8 +970,7 @@ impl ExecutionEngine {
                 .unwrap_or_default(),
             parent_action: parent_action_id.map(|s| s.to_string()),
             steps: HashMap::new(),
-            // Initially empty execution order
-            execution_order: Vec::new(),
+            flow_control: manifest.flow_control,
             // Initially empty types
             types: if manifest.types.is_empty() { None } else { Some(manifest.types.clone().into_iter().collect()) },
             // Mirrors from manifest
@@ -1017,13 +1011,7 @@ impl ExecutionEngine {
         }
 
         // At this point we have resolved all the children
-        // 5. Topologically sort steps based on dependencies
-        let sorted_step_ids = self.topological_sort_composition_steps(&action_state.steps).await?;
-
-        // 6. Add the sorted step IDs to the execution order field
-        for step_id in sorted_step_ids {
-            action_state.execution_order.push(step_id);
-        }
+        // Steps will be executed dynamically based on dependencies during runtime
 
         return Ok(action_state);
     }
@@ -1058,52 +1046,6 @@ impl ExecutionEngine {
         }
     }
 
-    async fn topological_sort_composition_steps(&self, steps: &HashMap<String, ShAction>) -> Result<Vec<String>> {
-        // Build dependency graph using petgraph
-        let mut graph = Graph::<String, ()>::new();
-        let mut node_map = HashMap::new();
-        
-        // Nodes
-        // Add all child actions as nodes
-        for (child_id, _) in steps {
-            let node = graph.add_node(child_id.clone());
-            node_map.insert(child_id.clone(), node);
-        }
-        
-        // Edges
-        // Analyze dependencies by looking at template variables in child action inputs
-        for (child_id, child_action) in steps {
-            // Every composite action contains, in its child steps, the mapping of how they use
-            // either the inputs or other steps to get information to use.
-
-            // For each input in the child action
-            // find the template dependencies
-            for input in child_action.inputs.clone() {
-                let step_deps = self.find_sibling_dependencies(&serde_json::to_value(&input.template)?, steps)?;
-                
-                for dep in step_deps {
-                    if let (Some(&current_node), Some(&dep_node)) = (node_map.get(child_id), node_map.get(&dep)) {
-                        graph.add_edge(dep_node, current_node, ());
-                    }
-                }
-            }
-        }
-        
-        // println!("Graph DOT format:");
-        // println!("{:?}", petgraph::dot::Dot::new(&graph));
-        // Perform topological sort
-        let sorted_nodes = toposort(&graph, None)
-            .map_err(|_| anyhow::anyhow!("Circular dependency detected in composition steps"))?;
-        
-        // Convert back to step IDs
-        let mut sorted_step_ids = Vec::new();
-        for node in sorted_nodes {
-            let step_id = &graph[node];
-            sorted_step_ids.push(step_id.clone());
-        }
-        
-        Ok(sorted_step_ids)
-    }
     
     pub fn find_sibling_dependencies(&self, value: &Value, steps: &HashMap<String, ShAction>) -> Result<Vec<String>> {        
                 // Look for patterns like {{steps.step_name.field}}
@@ -1145,6 +1087,95 @@ impl ExecutionEngine {
             },
             _ => Ok(Vec::new())
         }
+    }
+
+    /// Determines the next step to execute based on dependencies and execution state
+    /// Returns None if all steps are completed or if there are no more steps to run
+    fn get_next_step_to_execute(
+        &self,
+        steps: &HashMap<String, ShAction>,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Result<Option<String>> {
+        // Find steps that haven't been executed yet
+        let remaining_steps: Vec<String> = steps.keys()
+            .filter(|step_id| !executed_steps.contains_key(*step_id))
+            .cloned()
+            .collect();
+
+        if remaining_steps.is_empty() {
+            return Ok(None);
+        }
+
+        // For each remaining step, check if its dependencies are satisfied
+        for step_id in remaining_steps {
+            if let Some(step) = steps.get(&step_id) {
+                let dependencies_satisfied = self.check_step_dependencies_satisfied(
+                    step, 
+                    executed_steps
+                )?;
+                
+                if dependencies_satisfied {
+                    return Ok(Some(step_id));
+                }
+            }
+        }
+
+        // If we get here, no step has all its dependencies satisfied
+        // This could indicate a circular dependency or missing dependency
+        Ok(None)
+    }
+
+    /// Checks if all dependencies for a step are satisfied by executed steps
+    fn check_step_dependencies_satisfied(
+        &self,
+        step: &ShAction,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Result<bool> {
+        // Check each input of the step for dependencies
+        for input in &step.inputs {
+            let dependencies = self.find_sibling_dependencies(&input.template, executed_steps)?;
+            
+            // For each dependency, check if the corresponding step has been executed
+            for dep in dependencies {
+                if !executed_steps.contains_key(&dep) {
+                    return Ok(false);
+                }
+            }
+        }
+        
+        Ok(true)
+    }
+
+    /// Dynamic flow control check that works without execution_order
+    fn check_flow_control_dynamic(
+        &self,
+        executed_step: &ShAction,
+        all_steps: &HashMap<String, ShAction>,
+        _executed_steps: &HashMap<String, ShAction>
+    ) -> Result<Option<String>> {
+        // Only check for flow control if the step has flow control enabled
+        if !executed_step.flow_control {
+            return Ok(None);
+        }
+        
+        // Look for flow control output in the step's outputs
+        for output in &executed_step.outputs {
+            if let Some(value) = &output.value {
+                if let Some(flow_control_info) = value.get("flow_control") {
+                    if let Some(next_step_name) = flow_control_info.get("next_step") {
+                        if let Some(next_step_name_str) = next_step_name.as_str() {
+                            // Check if the next step exists in all_steps
+                            if all_steps.contains_key(next_step_name_str) {
+                                self.log_info(&format!("Flow control: next step is '{}'", next_step_name_str), Some(&executed_step.id));
+                                return Ok(Some(next_step_name_str.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
     }
 
 
@@ -1384,14 +1415,14 @@ impl ExecutionEngine {
         println!("Downloading artifact from: {}", storage_url);
         
         let client = reqwest::Client::new();
-        let mut last_error = None;
+        let mut _last_error = None;
         
         // Try primary URL first
         match self.try_download_from_url(&client, &storage_url, &wasm_dir, &wasm_path).await {
             Ok(path) => return Ok(path),
             Err(e) => {
                 println!("Primary download failed: {}", e);
-                last_error = Some(e);
+                _last_error = Some(e);
             }
         }
         
@@ -1405,13 +1436,13 @@ impl ExecutionEngine {
                 },
                 Err(e) => {
                     println!("Mirror {} failed: {}", i + 1, e);
-                    last_error = Some(e);
+                    _last_error = Some(e);
                 }
             }
         }
         
         // If all downloads failed, return the last error
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("No download sources available")))
+        Err(_last_error.unwrap_or_else(|| anyhow::anyhow!("No download sources available")))
     }
 
     async fn extract_wasm_from_zip(&self, zip_path: &std::path::Path, wasm_path: &std::path::Path) -> Result<()> {
@@ -1435,6 +1466,8 @@ impl ExecutionEngine {
         
         Err(anyhow::anyhow!("No .wasm file found in the artifact zip"))
     }
+
+    
 }
 
 #[cfg(test)]
@@ -1442,110 +1475,6 @@ mod tests {
     use super::*;
     
     use serde_json::json;
-
-    // TODO: test_find_template_dependencies to be fixed
-    // #[test]
-    // fn test_find_template_dependencies() {
-    //     // Create a mock ExecutionEngine
-    //     let engine = ExecutionEngine::new();
-        
-    //     // Create mock steps representing the weather composition scenario
-    //     let mut steps = HashMap::new();
-        
-    //     // Step 1: get_coordinates - no dependencies
-    //     let coordinates_id = uuid::Uuid::new_v4().to_string();
-    //     let coordinates_id_clone = coordinates_id.clone();
-    //     steps.insert("get_coordinates".to_string(), ShAction {
-    //         id: coordinates_id,
-    //         name: "get_coordinates".to_string(),
-    //         kind: "wasm".to_string(),
-    //         uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
-    //         inputs: vec![
-    //             ShIO {
-    //                 name: "open_weather_config".to_string(),
-    //                 r#type: "OpenWeatherConfig".to_string(),
-    //                 template: json!({
-    //                     "location_name": "{{inputs[0].location_name}}",
-    //                     "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
-    //                 }),
-    //                 value: None,
-    //             }
-    //         ],
-    //         outputs: vec![
-    //             ShIO {
-    //                 name: "coordinates".to_string(),
-    //                 r#type: "GeocodingResponse".to_string(),
-    //                 template: json!({}),
-    //                 value: None,
-    //             }
-    //         ],
-    //         parent_action: None,
-    //         steps: HashMap::new(),
-    //         execution_order: vec![],
-    //         types: None,
-    //     });
-        
-    //     // Step 2: get_weather - depends on get_coordinates
-    //     let weather_id = uuid::Uuid::new_v4().to_string();
-    //     let weather_id_clone = weather_id.clone();
-    //     steps.insert("get_weather".to_string(), ShAction {
-    //         id: weather_id,
-    //         name: "get_weather".to_string(),
-    //         kind: "wasm".to_string(),
-    //         uses: "starthubhq/openweather-current-weather:0.0.1".to_string(),
-    //         inputs: vec![
-    //             ShIO {
-    //                 name: "weather_config".to_string(),
-    //                 r#type: "WeatherConfig".to_string(),
-    //                 template: json!({
-    //                     "lat": "{{steps.get_coordinates.outputs[0].coordinates.lat}}",
-    //                     "lon": "{{steps.get_coordinates.outputs[0].coordinates.lon}}",
-    //                     "open_weather_api_key": "{{inputs.weather_config.open_weather_api_key}}"
-    //                 }),
-    //                 value: None,
-    //             }
-    //         ],
-    //         outputs: vec![
-    //             ShIO {
-    //                 name: "weather".to_string(),
-    //                 r#type: "WeatherResponse".to_string(),
-    //                 template: json!({}),
-    //                 value: None,
-    //             }
-    //         ],
-    //         parent_action: None,
-    //         steps: HashMap::new(),
-    //         execution_order: vec![],
-    //         types: None,
-    //     });
-
-    //     // Test case 1: Template that references get_coordinates step (like in the weather composition)
-    //     let template_value = json!("{{steps.get_coordinates.outputs[0].coordinates.lat}}");
-    //     let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
-    //     assert_eq!(result, vec![coordinates_id_clone.clone()]);
-
-    //     // Test case 2: Template that references get_coordinates step for longitude
-    //     let template_value = json!("{{steps.get_coordinates.outputs[0].coordinates.lon}}");
-    //     let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
-    //     assert_eq!(result, vec![coordinates_id_clone.clone()]);
-
-    //     // Test case 3: Template that references get_weather step (circular dependency scenario)
-    //     let template_value = json!("{{steps.get_weather.outputs[0].weather.weather[0].description}}");
-    //     let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
-    //     assert_eq!(result, vec![weather_id_clone.clone()]);
-
-    //     // Test case 4: String without template dependencies
-    //     let template_value = json!("regular string without templates");
-    //     let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
-    //     assert_eq!(result, Vec::<String>::new());
-
-    //     // Test case 5: Non-string value
-    //     let template_value = json!(42);
-    //     let result = engine.find_template_dependencies(&template_value, &steps).unwrap();
-    //     assert_eq!(result, Vec::<String>::new());
-    // }
-
-    // TESTS
 
     #[tokio::test]
     async fn test_execute_action_get_weather_by_location_name() {
@@ -1591,12 +1520,7 @@ mod tests {
         assert_eq!(output["name"], "response");
         assert_eq!(output["type"], "CustomWeatherResponse");
         
-        // Verify execution order
-        assert!(action_tree["execution_order"].is_array());
-        let execution_order = action_tree["execution_order"].as_array().unwrap();
-        assert_eq!(execution_order.len(), 2);
-        assert_eq!(execution_order[0], "get_coordinates");
-        assert_eq!(execution_order[1], "get_weather");
+        // Execution order is now determined dynamically at runtime
         
         // Verify types are present
         assert!(action_tree["types"].is_object());
@@ -1685,7 +1609,7 @@ mod tests {
         let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
         
         // Parse array values
-        let ssh_keys_array: Vec<String> = if ssh_keys.is_empty() {
+        let _ssh_keys_array: Vec<String> = if ssh_keys.is_empty() {
             vec![]
         } else {
             ssh_keys.split(',').map(|s| s.trim().to_string()).collect()
@@ -1880,11 +1804,7 @@ mod tests {
         assert_eq!(output["name"], "droplet");
         assert_eq!(output["type"], "DigitalOceanDroplet");
         
-        // Verify execution order (should have one step: get_droplet)
-        assert!(action_tree["execution_order"].is_array());
-        let execution_order = action_tree["execution_order"].as_array().unwrap();
-        assert_eq!(execution_order.len(), 1);
-        assert_eq!(execution_order[0], "get_droplet");
+        // Execution order is now determined dynamically at runtime
         
         // Verify types are present
         assert!(action_tree["types"].is_object());
@@ -2051,12 +1971,7 @@ mod tests {
         assert_eq!(output["name"], "content");
         assert_eq!(output["type"], "string");
         
-        // Verify execution order (should have two steps: read_file and decode_base64)
-        assert!(action_tree["execution_order"].is_array());
-        let execution_order = action_tree["execution_order"].as_array().unwrap();
-        assert_eq!(execution_order.len(), 2);
-        assert_eq!(execution_order[0], "read_file");
-        assert_eq!(execution_order[1], "decode_base64");
+        // Execution order is now determined dynamically at runtime
         
         // Verify types are present
         assert!(action_tree["types"].is_object());
@@ -2116,10 +2031,7 @@ mod tests {
         assert_eq!(output.name, "response");
         assert_eq!(output.r#type, "CustomWeatherResponse");
         
-        // Verify execution order
-        assert_eq!(action_tree.execution_order.len(), 2);
-        assert_eq!(action_tree.execution_order[0], "get_coordinates");
-        assert_eq!(action_tree.execution_order[1], "get_weather");
+        // Execution order is now determined dynamically at runtime
         
         // Verify types are present
         assert!(action_tree.types.is_some());
@@ -2130,190 +2042,8 @@ mod tests {
 
     
 
-    #[tokio::test]
-    async fn test_topological_sort_composition_steps() {
-        // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
-        
-        // Create mock steps with dependencies
-        let mut steps = HashMap::new();
-        
-        // Step 2: get_weather - depends on get_coordinates
-        let weather_id = uuid::Uuid::new_v4().to_string();
-        steps.insert("get_weather".to_string(), ShAction {
-            id: weather_id,
-            name: "get_weather".to_string(),
-            kind: "composition".to_string(),
-            uses: "starthubhq/openweather-current-weather:0.0.1".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "weather_config".to_string(),
-                    r#type: "WeatherConfig".to_string(),
-                    template: json!({
-                        "lat": "{{steps.get_coordinates.outputs[0].coordinates.lat}}",
-                        "lon": "{{steps.get_coordinates.outputs[0].coordinates.lon}}",
-                        "open_weather_api_key": "{{inputs.weather_config.open_weather_api_key}}"
-                    }),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None,
-            mirrors: vec![],
-            permissions: None,
-        });
-        
-        // Step 1: get_coordinates - no dependencies
-        let coordinates_id = uuid::Uuid::new_v4().to_string();
-        steps.insert("get_coordinates".to_string(), ShAction {
-            id: coordinates_id,
-            name: "get_coordinates".to_string(),
-            kind: "composition".to_string(),
-            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "open_weather_config".to_string(),
-                    r#type: "OpenWeatherConfig".to_string(),
-                    template: json!({
-                        "location_name": "{{inputs[0].location_name}}",
-                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
-                    }),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None,
-            mirrors: vec![],
-            permissions: None,
-        });
-        
 
-        // Test the topological sort
-        let sorted_steps = engine.topological_sort_composition_steps(&steps).await.unwrap();
-        
-        println!("Sorted steps: {:#?}", sorted_steps);
-        // Just assert that sorted steps are an array ["get_coordinates", "get_weather"]
-        assert_eq!(sorted_steps, vec!["get_coordinates", "get_weather"]);
-        // Verify all steps are included
-        assert_eq!(sorted_steps.len(), 2);
-    }
 
-    #[tokio::test]
-    async fn test_topological_sort_single_step() {
-        // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
-        
-        // Create mock steps with just one step
-        let mut steps = HashMap::new();
-        
-        // Single step: get_coordinates - no dependencies
-        let coordinates_id = uuid::Uuid::new_v4().to_string();
-        steps.insert("get_coordinates".to_string(), ShAction {
-            id: coordinates_id,
-            name: "get_coordinates".to_string(),
-            kind: "composition".to_string(),
-            uses: "starthubhq/openweather-coordinates-by-location-name:0.0.1".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "open_weather_config".to_string(),
-                    r#type: "OpenWeatherConfig".to_string(),
-                    template: json!({
-                        "location_name": "{{inputs[0].location_name}}",
-                        "open_weather_api_key": "{{inputs[0].open_weather_api_key}}"
-                    }),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None,
-            mirrors: vec![],
-            permissions: None,
-        });
-
-        // Test the topological sort
-        let sorted_steps = engine.topological_sort_composition_steps(&steps).await.unwrap();
-        
-        // Just assert that sorted steps contains only the single step
-        assert_eq!(sorted_steps, vec!["get_coordinates"]);
-        assert_eq!(sorted_steps.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_topological_sort_circular_dependency() {
-        // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
-        
-        // Create mock steps with circular dependency
-        let mut steps = HashMap::new();
-        
-        // Step 1: depends on step 2
-        steps.insert("step1".to_string(), ShAction {
-            id: "step1".to_string(),
-            name: "step1".to_string(),
-            kind: "wasm".to_string(),
-            uses: "test:action1".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "input1".to_string(),
-                    r#type: "string".to_string(),
-                    template: json!("{{steps.step2.outputs[0].result}}"),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None,
-            mirrors: vec![],
-            permissions: None,
-        });
-        
-        // Step 2: depends on step 1 (circular dependency)
-        steps.insert("step2".to_string(), ShAction {
-            id: "step2".to_string(),
-            name: "step2".to_string(),
-            kind: "wasm".to_string(),
-            uses: "test:action2".to_string(),
-            inputs: vec![
-                ShIO {
-                    name: "input2".to_string(),
-                    r#type: "string".to_string(),
-                    template: json!("{{steps.step1.outputs[0].result}}"),
-                    value: None,
-                    required: true,
-                }
-            ],
-            outputs: vec![],
-            parent_action: None,
-            steps: HashMap::new(),
-            execution_order: vec![],
-            types: None,
-            mirrors: vec![],
-            permissions: None,
-        });
-
-        // Test that circular dependency is detected
-        let result = engine.topological_sort_composition_steps(&steps).await;
-        assert!(result.is_err(), "Should detect circular dependency");
-        
-        if let Err(e) = result {
-            assert!(e.to_string().contains("Circular dependency detected"));
-        }
-    }
 
     #[tokio::test]
     async fn test_fetch_manifest() {
@@ -2484,7 +2214,7 @@ mod tests {
             outputs: vec![],
             parent_action: None,
             steps: HashMap::new(),
-            execution_order: vec![],
+            flow_control: false,
             types: None,
             mirrors: vec![],
             permissions: None,
@@ -2893,6 +2623,120 @@ mod tests {
         // This should panic due to unwrap() in the method when trying to access the second value
     }
 
+
+    #[test]
+    fn test_check_flow_control() {
+        let engine = ExecutionEngine::new();
+        
+        // Create a mock executed step with flow control output
+        let executed_step = ShAction {
+            id: "test-step".to_string(),
+            name: "test-step".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test:action".to_string(),
+            inputs: vec![],
+            outputs: vec![
+                ShIO {
+                    name: "result".to_string(),
+                    r#type: "object".to_string(),
+                    template: serde_json::Value::Null,
+                    value: Some(json!({
+                        "result": true,
+                        "next_step": "process_high"
+                    })),
+                    required: true,
+                }
+            ],
+            parent_action: None,
+            steps: std::collections::HashMap::new(),
+            flow_control: true,
+            types: None,
+            mirrors: vec![],
+            permissions: None,
+        };
+        
+        let all_steps = std::collections::HashMap::new();
+        let executed_steps = std::collections::HashMap::new();
+        
+        // Test dynamic flow control detection
+        let result = engine.check_flow_control_dynamic(&executed_step, &all_steps, &executed_steps);
+        assert!(result.is_ok(), "check_flow_control_dynamic should succeed");
+        
+        let next_step = result.unwrap();
+        assert!(next_step.is_some(), "Should find next step");
+        assert_eq!(next_step.unwrap(), "process_high", "Should return 'process_high' step");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_http_get_wasm() {
+        // Create a mock ExecutionEngine
+        let engine = ExecutionEngine::new();
+        
+        // Test executing the http-get-wasm action directly
+        let action_ref = "starthubhq/http-get-wasm:0.0.16";
+        
+        // Test with URL and optional headers
+        let inputs = vec![
+            json!("https://api.restful-api.dev/objects"),  // URL
+            json!({  // Headers
+                "Accept": "application/json"
+            })
+        ];
+        
+        println!("Testing http-get-wasm action with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("http-get-wasm test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid http-get-wasm action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["name"], "http-get-wasm");
+        assert_eq!(action_tree["kind"], "wasm");
+        assert_eq!(action_tree["uses"], action_ref);
+        
+        // Verify that the action has the expected inputs and outputs
+        assert!(action_tree["inputs"].is_array());
+        let inputs_array = action_tree["inputs"].as_array().unwrap();
+        assert_eq!(inputs_array.len(), 2);
+        
+        // Check first input (url)
+        let first_input = &inputs_array[0];
+        assert_eq!(first_input["name"], "url");
+        assert_eq!(first_input["type"], "string");
+        assert_eq!(first_input["required"], true);
+        
+        // Check second input (headers)
+        let second_input = &inputs_array[1];
+        assert_eq!(second_input["name"], "headers");
+        assert_eq!(second_input["type"], "HttpHeaders");
+        assert_eq!(second_input["required"], false);
+        
+        // Verify outputs
+        assert!(action_tree["outputs"].is_array());
+        let outputs_array = action_tree["outputs"].as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        
+        let output = &outputs_array[0];
+        assert_eq!(output["name"], "response");
+        assert_eq!(output["type"], "HttpResponse");
+        
+        // Verify types are present
+        assert!(action_tree["types"].is_object());
+        let types = action_tree["types"].as_object().unwrap();
+        assert!(types.contains_key("HttpHeaders"));
+        assert!(types.contains_key("HttpResponse"));
+        
+        // Verify permissions
+        assert!(action_tree["permissions"].is_object());
+        let permissions = action_tree["permissions"].as_object().unwrap();
+        assert!(permissions.contains_key("net"));
+        let net_permissions = permissions["net"].as_array().unwrap();
+        assert!(net_permissions.contains(&json!("http")));
+        assert!(net_permissions.contains(&json!("https")));
+    }
     
     
 }

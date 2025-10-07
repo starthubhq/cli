@@ -138,6 +138,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         version: version.clone(),
         kind: Some(kind.clone()),
         description: "A StartHub package".to_string(),
+        flow_control: false,
         repository,
         manifest_version: 1,
         image: None,

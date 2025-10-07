@@ -11,6 +11,8 @@ pub struct ShManifest {
     pub description: String,
     pub version: String,
     pub kind: Option<ShKind>,
+    #[serde(default)]
+    pub flow_control: bool,
     pub manifest_version: u32,
     pub repository: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +75,7 @@ pub struct ShAction {
     pub outputs: Vec<ShIO>,             // Array format: [{"name": "...", "type": "...", "value": ...}]
     pub parent_action: Option<String>,   // UUID of parent action (None for root)
     pub steps: HashMap<String, ShAction>, // Nested actions keyed by UUID
-    pub execution_order: Vec<String>,   // Order of execution within this action
+    pub flow_control: bool,               // Flow control capability
     
     // Manifest structure fields
     pub types: Option<serde_json::Map<String, Value>>,   // From manifest.types
