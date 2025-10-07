@@ -261,6 +261,8 @@ impl ExecutionEngine {
                 Some(step_id) => step_id,
                 None => break, // All steps completed or no more steps can be executed
             };
+
+            println!("next_step_id: {}", next_step_id);
             
             if let Some(step) = action_state.steps.get_mut(&next_step_id) {
                 self.log_info(&format!("Starting step: {}", next_step_id), Some(&action_state.id));
@@ -1111,7 +1113,8 @@ impl ExecutionEngine {
             if let Some(step) = steps.get(&step_id) {
                 let dependencies_satisfied = self.check_step_dependencies_satisfied(
                     step, 
-                    executed_steps
+                    executed_steps,
+                    steps
                 )?;
                 
                 if dependencies_satisfied {
@@ -1129,11 +1132,12 @@ impl ExecutionEngine {
     fn check_step_dependencies_satisfied(
         &self,
         step: &ShAction,
-        executed_steps: &HashMap<String, ShAction>
+        executed_steps: &HashMap<String, ShAction>,
+        all_steps: &HashMap<String, ShAction>
     ) -> Result<bool> {
         // Check each input of the step for dependencies
         for input in &step.inputs {
-            let dependencies = self.find_sibling_dependencies(&input.template, executed_steps)?;
+            let dependencies = self.find_sibling_dependencies(&input.template, all_steps)?;
             
             // For each dependency, check if the corresponding step has been executed
             for dep in dependencies {
