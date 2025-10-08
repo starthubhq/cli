@@ -8,6 +8,8 @@ pub struct ShManifest {
     pub description: String,
     pub version: String,
     pub kind: Option<ShKind>,
+    #[serde(default)]
+    pub flow_control: bool,
     pub manifest_version: u32,
     pub repository: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +100,8 @@ pub struct ShLock {
     pub description: String,
     pub version: String,
     pub kind: ShKind,
+    #[serde(default)]
+    pub flow_control: bool,
     pub manifest_version: u32,
     pub repository: String,
     #[serde(skip_serializing_if = "Option::is_none")]
