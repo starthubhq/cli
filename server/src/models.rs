@@ -60,7 +60,6 @@ pub struct ShIO {
     #[serde(rename = "type")]
     pub r#type: String,
     pub template: Value,
-    pub value: Option<Value>,
     pub required: bool,
 }
 
@@ -174,6 +173,20 @@ impl<'de> serde::Deserialize<'de> for ShType {
 pub struct ShWire {
     pub from: ShWireFrom,
     pub to: ShWireTo,
+}
+
+// Execution context structures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShExecutionContext {
+    pub frame: ShExecutionFrame,
+    pub execution_context: Option<Box<ShExecutionContext>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShExecutionFrame {
+    pub action_id: String,
+    pub inputs: std::collections::HashMap<String, serde_json::Value>,
+    pub outputs: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

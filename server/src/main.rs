@@ -38,7 +38,7 @@ struct ServerCli {
 #[derive(Clone)]
 struct AppState {
     ws_sender: broadcast::Sender<String>,
-    execution_engine: Arc<ExecutionEngine>,
+    execution_engine: Arc<Mutex<ExecutionEngine>>,
 }
 
 impl AppState {
@@ -48,7 +48,7 @@ impl AppState {
         // Initialize execution engine
         let mut execution_engine = ExecutionEngine::new();
         execution_engine.set_ws_sender(ws_sender.clone());
-        let execution_engine = Arc::new(execution_engine);
+        let execution_engine = Arc::new(Mutex::new(execution_engine));
         
         Self { 
             ws_sender,
@@ -199,7 +199,8 @@ async fn handle_run(
         .unwrap_or_default();
     
     // Execute the action with array inputs
-    match state.execution_engine.execute_action(action, inputs).await {
+    let mut engine = state.execution_engine.lock().await;
+    match engine.execute_action(action, inputs).await {
         Ok(result) => {
             // Send execution result via WebSocket
             let result_msg = json!({
