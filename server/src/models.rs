@@ -177,16 +177,15 @@ pub struct ShWire {
 
 // Execution context structures
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShExecutionContext {
-    pub frame: ShExecutionFrame,
-    pub execution_context: Option<Box<ShExecutionContext>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShExecutionFrame {
-    pub action_id: String,
-    pub inputs: std::collections::HashMap<String, serde_json::Value>,
-    pub outputs: std::collections::HashMap<String, serde_json::Value>,
+    pub id: String,
+    pub name: String,
+    pub uses: String,
+    pub inputs: Vec<serde_json::Value>,
+    pub outputs: Vec<serde_json::Value>,
+    pub frame: Option<Box<ShExecutionFrame>>,
+    #[serde(skip_serializing, skip_deserializing)]
+    pub parent: Option<std::sync::Weak<ShExecutionFrame>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

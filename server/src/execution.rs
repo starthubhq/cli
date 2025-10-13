@@ -11,7 +11,7 @@ use which;
 use zip::ZipArchive;
 use tokio::sync::broadcast;
 
-use crate::models::{ShManifest, ShKind, ShIO, ShAction, ShExecutionContext, ShExecutionFrame};
+use crate::models::{ShManifest, ShKind, ShIO, ShAction, ShExecutionFrame};
 
 // Constants
 const STARTHUB_API_BASE_URL: &str = "https://api.starthub.so";
@@ -20,7 +20,8 @@ const STARTHUB_MANIFEST_FILENAME: &str = "starthub-lock.json";
 pub struct ExecutionEngine {
     cache_dir: std::path::PathBuf,
     ws_sender: Option<broadcast::Sender<String>>,
-    execution_context: ShExecutionContext,
+    execution_frame: Option<ShExecutionFrame>,
+    frame_stack: Vec<String>, // Stack of frame IDs for navigation
 }
 
 impl ExecutionEngine {
@@ -37,14 +38,8 @@ impl ExecutionEngine {
         Self {
             cache_dir,
             ws_sender: None,
-            execution_context: ShExecutionContext {
-                frame: ShExecutionFrame {
-                    action_id: "root".to_string(),
-                    inputs: std::collections::HashMap::new(),
-                    outputs: std::collections::HashMap::new(),
-                },
-                execution_context: None,
-            },
+            execution_frame: None,
+            frame_stack: Vec::new(),
         }
     }
 
@@ -143,18 +138,6 @@ impl ExecutionEngine {
     pub async fn execute_action(&mut self, action_ref: &str, inputs: Vec<Value>) -> Result<HashMap<String, Value>> {
         self.log_info(&format!("Starting execution of action: {}", action_ref), None);
         
-        // Initialize execution context with root inputs
-        self.execution_context = ShExecutionContext {
-            frame: ShExecutionFrame {
-                action_id: "root".to_string(),
-                inputs: inputs.iter().enumerate().map(|(i, input)| {
-                    (format!("input_{}", i), input.clone())
-                }).collect(),
-                outputs: std::collections::HashMap::new(),
-            },
-            execution_context: None,
-        };
-        
         // Ensure cache directory exists before starting execution.
         // It should already exist, but just in case.
         if let Err(e) = std::fs::create_dir_all(&self.cache_dir) {
@@ -169,31 +152,41 @@ impl ExecutionEngine {
             None,               // No parent action ID (root)
         ).await?;     
 
-        println!("root_action: {:#?}", root_action);
         // return Ok(serde_json::to_value(root_action)?);
         self.log_success("Action tree built successfully", Some(&root_action.id));
 
-        self.log_info("Executing action tree...", Some(&root_action.id));
-        let outputs = self.run_action_tree(&root_action).await?;
-        self.log_success("Action execution completed", Some(&root_action.id));
-
-        // Send final tree update
-        // self.send_tree_update(&root_action, &HashMap::new(), "completed").await;
+        let outputs = self.run_action_tree(&root_action, &inputs).await?;
 
         // Return the outputs
         Ok(outputs)
     }
 
-    async fn run_action_tree(&mut self, action: &ShAction) -> Result<HashMap<String, Value>> {
+    async fn run_action_tree(&mut self, action: &ShAction, inputs: &Vec<Value>) -> Result<HashMap<String, Value>> {
+        // Create a frame for this action with no child frame
+        let action_frame = ShExecutionFrame {
+            id: uuid::Uuid::new_v4().to_string(), // Generate unique UUID for each frame
+            name: action.name.clone(),
+            uses: action.uses.clone(),
+            inputs: inputs.clone(),
+            outputs: Vec::new(),
+            frame: None,
+            parent: None,
+        };
+
+        // Push current frame ID onto stack
+        self.frame_stack.push(action_frame.id.clone());
+
+        // Always add as a child of the current frame (call stack behavior)
+        self.add_frame_to_child_context(action_frame);
+        
         // Base condition
         if action.kind == "wasm" || action.kind == "docker" {
-            println!("Executing {} wasm step: {}", action.kind, action.name);
             self.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
             
-            // Get inputs from the current frame in execution context
-            let inputs_value = serde_json::to_value(&self.execution_context.frame.inputs.values().collect::<Vec<_>>())?;
+            // Get inputs from the current frame
+            let inputs_value = serde_json::to_value(inputs)?;
             let result = self.run_wasm_step(action, &inputs_value).await?;
-            
+
             self.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
 
             // Parse the result into a vector of JSON objects
@@ -213,100 +206,66 @@ impl ExecutionEngine {
 
             let action_state_clone = action.clone();
             
+            // println!("json_objects: {:#?}", json_objects);
             let instantiated_outputs: Vec<Value> = self.instantiate(
                 &action.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
                 &action.outputs,
                 &json_objects
             )?;
 
-            // Store the outputs in the execution context and return them
+            // Store the outputs in the execution frame and return them
             let mut outputs = HashMap::new();
             for (index, output) in action_state_clone.outputs.iter().enumerate() {
                 if let Some(resolved_output) = instantiated_outputs.get(index) {
-                    self.execution_context.frame.outputs.insert(output.name.clone(), resolved_output.clone());
+                    // Store in vector at the same index
+                    let current_frame = self.get_current_frame_mut();
+                    if index >= current_frame.outputs.len() {
+                        current_frame.outputs.resize(index + 1, Value::Null);
+                    }
+                    
+                    current_frame.outputs[index] = resolved_output.clone();
                     outputs.insert(output.name.clone(), resolved_output.clone());
                 }
             }
 
+            self.frame_stack.pop();
             return Ok(outputs);
         }
         
-        // Run the action tree recursively - dynamic step execution with flow control support
+        // This loop is processing all siblings until all of them are completed. It's a loop that
+        // could be going for a long time, depending on whether the siblings are completed or not.
         loop {
-            // Determine the next step to execute based on dependencies
+            // Use the outputs of all the child frames to determine the next step to execute. Child frames
+            // are added to the current frame by recursion.
             let next_step_id = match self.get_next_step_to_execute(&action, &action.steps)? {
                 Some(step_id) => step_id,
                 None => break, // All steps completed or no more steps can be executed
             };
+            println!("next_step_id: {}", next_step_id);
 
+            // println!("next_step_id: {} uses: {}", next_step_id, action.uses.clone());
             // We fetch the step from the action to understand its details (io, kind..)
             if let Some(step) = action.steps.get(&next_step_id) {
                 self.log_info(&format!("Starting step: {}", next_step_id), Some(&action.id));
-
-                // Create a new child execution context
-                let current_inputs = self.execution_context.frame.inputs.values().cloned().collect::<Vec<_>>();
-
-                // Use the inputs of the current action to instantiate the inputs for the new frame
-                let inputs_for_new_frame: Vec<Value> = self.instantiate(
-                    &action.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
-                    &action.inputs,
-                    &current_inputs
-                )?;
                 
-                let mut child_frame = ShExecutionFrame {
-                    action_id: step.id.clone(),
-                    inputs: std::collections::HashMap::new(),
-                    outputs: std::collections::HashMap::new(),
-                };
-                
-                for (index, input) in step.inputs.iter().enumerate() {
-                    if let Some(resolved_input) = inputs_for_new_frame.get(index) {
-                        child_frame.inputs.insert(input.name.clone(), resolved_input.clone());
-                    }
-                }
-                
-                // Create child execution context
-                let child_context = ShExecutionContext {
-                    frame: child_frame,
-                    execution_context: None,
-                };
-                
-                // Store the child context
-                self.execution_context.execution_context = Some(Box::new(child_context));
-                
+                // Get current inputs from the current frame
+                let current_inputs = self.get_current_frame().inputs.clone();                
                 let resolved_inputs_to_inject_into_child_step = self.resolve_into_inputs(
                     &step.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()),
                     &step.inputs,
-                    &current_inputs  // Inject inputs from current action into the step
+                    &current_inputs
                 )?;
 
-                println!("resolved_inputs_to_inject_into_child_step: {:#?}", resolved_inputs_to_inject_into_child_step);
-
-                // Execute the step in the child context
-                if let Some(child_context) = &mut self.execution_context.execution_context {
-                    let mut temp_engine = ExecutionEngine {
-                        cache_dir: self.cache_dir.clone(),
-                        ws_sender: self.ws_sender.clone(),
-                        execution_context: *child_context.clone(),
-                    };
-                    
-                    Box::pin(temp_engine.run_action_tree(step)).await?;
-                    
-                    // Update the child context with results
-                    self.execution_context.execution_context = Some(Box::new(temp_engine.execution_context));
-                }
-                
-                // Send tree update after each recursion iteration
-                self.send_tree_update(&action, &next_step_id).await;
-
-                self.log_success(&format!("Completed step: {}", next_step_id), Some(&action.id));
+                // Execute the step - it will create its own frame and add it as a child to the current frame.
+                let _step_result = Box::pin(self.run_action_tree(step, &resolved_inputs_to_inject_into_child_step)).await?;
             } else {
                 // Step not found, this shouldn't happen with dynamic execution
                 self.log_error(&format!("Step '{}' not found in action tree", next_step_id), Some(&action.id));
                 break;
             }
         }
-
+        
+        println!("resolved output xxx");
         // If we got here, it means that we have executed all the steps in the action tree
         // of a composition action. Now we need to aggregate the outputs back at the higher level.
         let resolved_outputs = self.resolve_into_outputs(
@@ -314,16 +273,138 @@ impl ExecutionEngine {
             &action.outputs,
         )?;
 
-        // Store the resolved outputs in the execution context and return them
+        // Store the outputs in the execution frame and return them
         let mut outputs = HashMap::new();
-        for (index, output) in action.outputs.iter().enumerate() {
+        for (index, output) in action.clone().outputs.iter().enumerate() {
             if let Some(resolved_output) = resolved_outputs.get(index) {
-                self.execution_context.frame.outputs.insert(output.name.clone(), resolved_output.clone());
+                // Store in vector at the same index
+                let current_frame = self.get_current_frame_mut();
+                if index >= current_frame.outputs.len() {
+                    current_frame.outputs.resize(index + 1, Value::Null);
+                }
+                
+                current_frame.outputs[index] = resolved_output.clone();
                 outputs.insert(output.name.clone(), resolved_output.clone());
             }
         }
 
+        println!("reached after loop");
+        println!("current after before popping: {:#?}", self.execution_frame);
+        println!("+++++++++++++++++++++++++++++++++++++++++++++++");
+        // Pop frame from stack when execution completes
+        self.frame_stack.pop();
         return Ok(outputs);
+    }
+
+
+    /// Add a frame to the child frame of the current action (call stack behavior)
+    fn add_frame_to_child_context(&mut self, frame: ShExecutionFrame) {
+        // If the current execution frame is None, set it to the new frame
+        // This is the root frame
+        if self.execution_frame.is_none() {
+            self.execution_frame = Some(frame);
+            return;
+        }
+
+        if let Some(ref mut current_frame) = self.execution_frame {
+            // Recursively find the most recent frame and add the new frame as its child
+            Self::add_frame_to_most_recent_frame_recursive(current_frame, frame);
+        }
+    }
+
+
+    /// Recursively find the most recent frame and add the new frame as its child
+    fn add_frame_to_most_recent_frame_recursive(current_frame: &mut ShExecutionFrame, new_frame: ShExecutionFrame) {
+        if let Some(ref mut child_frame) = current_frame.frame {
+            // Recursively go to the most recent frame
+            Self::add_frame_to_most_recent_frame_recursive(child_frame, new_frame);
+        } else {
+            // No child frame yet, add as child
+            current_frame.frame = Some(Box::new(new_frame));
+        }
+    }
+
+    /// Get the current execution frame (the one on top of the stack)
+    fn get_current_frame(&self) -> &ShExecutionFrame {
+        if let Some(current_frame_id) = self.get_current_frame_id() {
+            if let Some(frame) = self.find_frame_by_id_immutable(current_frame_id) {
+                return frame;
+            }
+        } 
+
+        panic!("No frames on stack");
+    }
+
+    /// Get a mutable reference to the current execution frame (the one on top of the stack)
+    fn get_current_frame_mut(&mut self) -> &mut ShExecutionFrame {
+        // println!("get_current_frame_mut");
+        
+        // Get the current frame ID from the stack
+        let current_frame_id = self.frame_stack.last().cloned();
+        // println!("current_frame_id: {:#?}", current_frame_id);
+        
+        if let Some(frame_id) = current_frame_id {
+            // Use the existing find_frame_by_id method
+            if let Some(frame) = self.find_frame_by_id(&frame_id) {
+                // println!("Found frame by ID: {}", frame_id);
+                frame
+            } else {
+                // println!("Frame not found, returning root frame as fallback");
+                // Throw an error
+                panic!("Frame not found");
+            }
+        } else {
+            // No frames on stack, return root frame
+            self.execution_frame.as_mut().unwrap()
+        }
+    }
+
+    /// Get the current frame ID from the stack
+    fn get_current_frame_id(&self) -> Option<&String> {
+        self.frame_stack.last()
+    }
+
+    /// Find a frame by ID in the execution tree
+    fn find_frame_by_id(&mut self, frame_id: &str) -> Option<&mut ShExecutionFrame> {
+        if let Some(ref mut root_frame) = self.execution_frame {
+            Self::find_frame_by_id_recursive(root_frame, frame_id)
+        } else {
+            None
+        }
+    }
+
+    /// Recursively find a frame by ID
+    fn find_frame_by_id_recursive<'a>(frame: &'a mut ShExecutionFrame, frame_id: &str) -> Option<&'a mut ShExecutionFrame> {
+        if frame.id == frame_id {
+            return Some(frame);
+        }
+        
+        if let Some(ref mut child_frame) = frame.frame {
+            Self::find_frame_by_id_recursive(child_frame, frame_id)
+        } else {
+            None
+        }
+    }
+
+    /// Find a frame by ID in the execution tree (immutable)
+    fn find_frame_by_id_immutable(&self, frame_id: &str) -> Option<&ShExecutionFrame> {
+        if let Some(ref root_frame) = self.execution_frame {
+            Self::find_frame_by_id_recursive_immutable(root_frame, frame_id)
+        } else {
+            None
+        }
+    }
+    /// Recursively find a frame by ID (immutable)
+    fn find_frame_by_id_recursive_immutable<'a>(frame: &'a ShExecutionFrame, frame_id: &str) -> Option<&'a ShExecutionFrame> {
+        if frame.id == frame_id {
+            return Some(frame);
+        }
+        
+        if let Some(ref child_frame) = frame.frame {
+            Self::find_frame_by_id_recursive_immutable(child_frame, frame_id)
+        } else {
+            None
+        }
     }
 
     // async fn evaluate_condition(
@@ -429,8 +510,7 @@ impl ExecutionEngine {
     fn instantiate(&self, types: &Option<HashMap<String, Value>>, 
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<Value>) -> Result<Vec<Value>> {
-        println!("instantiating inputs: {:#?}", io_definitions);
-        println!("io_values: {:#?}", io_values);
+
         let mut values_to_inject: Vec<Value> = Vec::new();
         for (index, input) in io_definitions.iter().enumerate() {
             // For each input definition, we want to fetch the corresponding input value by index
@@ -487,13 +567,14 @@ impl ExecutionEngine {
                 }
             }
         }
+
         Ok(values_to_inject)
     }
 
     // We need both input and output definitions, as long as all steps, since the
     // output values might come from the inputs or the outputs of the steps.
     fn resolve_into_outputs(&self,
-        inputs: &Vec<ShIO>, //Contains both template and values of the inputs
+        _inputs: &Vec<ShIO>, //Contains both template and values of the inputs
         output_definitions: &Vec<ShIO>, //Only contains the template of the outputs
         ) -> Result<Vec<Value>> {        
         // We extract the types from the action state
@@ -504,11 +585,9 @@ impl ExecutionEngine {
         // println!("io_values: {:#?}", io_values);
         // println!("executed_sibling_steps: {:#?}", executed_sibling_steps);
 
-        // We want to create a vector of input by extracting the value from the execution context.
+        // We want to create a vector of input by extracting the value from the execution frame.
         // This is because the outputs might be fetching values from the inputs directly.
-        let inputs_values = inputs.iter().map(|input| {
-            self.execution_context.frame.inputs.get(&input.name).cloned().unwrap_or(Value::Null)
-        }).collect::<Vec<_>>();
+        let inputs_values = self.get_current_frame().inputs.clone();
 
         // For every value, find its corresponding input by index
         for (index, _output) in output_definitions.iter().enumerate() {
@@ -522,8 +601,6 @@ impl ExecutionEngine {
                 resolved_outputs.push(interpolated_template);
             }
         }
-
-        println!("resolved_outputs: {:#?}", resolved_outputs);
 
         Ok(resolved_outputs)
     }
@@ -657,14 +734,14 @@ impl ExecutionEngine {
             if let (Some(step_name), Some(index_str)) = (cap.get(1), cap.get(2)) {
                 if let Ok(index) = index_str.as_str().parse::<usize>() {
                     // Find the frame for this step in the execution context tree
-                    if let Some(output_value) = self.find_output_in_context(&self.execution_context, step_name.as_str(), index) {
+                    if let Some(output_value) = self.find_output_in_context(self.execution_frame.as_ref().unwrap(), step_name.as_str(), index) {
                                 let replacement = match output_value {
                                     Value::String(s) => s.clone(),
                                     _ => output_value.to_string(),
                                 };
                                 result = result.replace(&cap[0], &replacement);
                         } else {
-                            println!("DEBUG: No output found at index {} for step: {}", index, step_name.as_str());
+                            // println!("DEBUG: No output found at index {} for step: {}", index, step_name.as_str());
                     }
                 }
             }
@@ -676,7 +753,7 @@ impl ExecutionEngine {
             if let (Some(step_name), Some(index_str), Some(jsonpath)) = (cap.get(1), cap.get(2), cap.get(3)) {
                 if let Ok(index) = index_str.as_str().parse::<usize>() {
                     // Find the frame for this step in the execution context tree
-                    if let Some(output_value) = self.find_output_in_context(&self.execution_context, step_name.as_str(), index) {
+                    if let Some(output_value) = self.find_output_in_context(self.execution_frame.as_ref().unwrap(), step_name.as_str(), index) {
                                 if let Ok(resolved_value) = self.evaluate_jsonpath(output_value, jsonpath.as_str()) {
                                     let replacement = match resolved_value {
                                         Value::String(s) => s.clone(),
@@ -688,7 +765,7 @@ impl ExecutionEngine {
                                     println!("DEBUG: Failed to evaluate jsonpath: {}", jsonpath.as_str());
                             }
                         } else {
-                            println!("DEBUG: No output found at index {} for step: {}", index, step_name.as_str());
+                            // println!("DEBUG: No output found at index {} for step: {}", index, step_name.as_str());
                     }
                 }
             }
@@ -697,35 +774,63 @@ impl ExecutionEngine {
         Ok(result)
     }
 
-    /// Helper method to find an output in the execution context tree
-    fn find_output_in_context<'a>(&self, context: &'a ShExecutionContext, action_id: &str, index: usize) -> Option<&'a Value> {
-        // Check current frame
-        if context.frame.action_id == action_id {
-            return context.frame.outputs.values().nth(index);
+    /// Helper method to find an output in the execution frame
+    fn find_output_in_context<'a>(&self, frame: &'a ShExecutionFrame, step_name: &str, index: usize) -> Option<&'a Value> {
+        // Check if this frame matches the step_name (not ID, since IDs are unique)
+        if frame.name == step_name {
+            return frame.outputs.get(index);
         }
         
-        // Check child context recursively
-        if let Some(child) = &context.execution_context {
-            return self.find_output_in_context(child, action_id, index);
+        // Search in child frame (call stack)
+        if let Some(child_frame) = &frame.frame {
+            return self.find_output_in_context(child_frame, step_name, index);
         }
         
         None
     }
 
-    /// Helper method to check if an action has been executed in the execution context tree
-    fn has_action_been_executed(&self, context: &ShExecutionContext, action_id: &str) -> bool {
-        // Check current frame
-        if context.frame.action_id == action_id {
+
+    /// Helper method to check if an action has been executed in the execution frame
+    fn has_action_been_executed(&self, frame: &ShExecutionFrame, action_name: &str) -> bool {
+        // Check if this frame matches the action_name (not ID, since IDs are unique)
+        if frame.name == action_name {
             return true;
         }
         
-        // Check child context recursively
-        if let Some(child) = &context.execution_context {
-            return self.has_action_been_executed(child, action_id);
+        // Search in child frame (call stack)
+        if let Some(child_frame) = &frame.frame {
+            return self.has_action_been_executed(child_frame, action_name);
         }
         
         false
     }
+
+    /// Find the latest instance of a step by name and return its outputs
+    fn find_latest_step_outputs(&self, step_name: &str) -> Option<&Vec<serde_json::Value>> {
+        if let Some(ref frame) = self.execution_frame {
+            self.find_latest_step_outputs_recursive(frame, step_name)
+        } else {
+            None
+        }
+    }
+
+    /// Recursively find the latest instance of a step by name
+    fn find_latest_step_outputs_recursive<'a>(&self, frame: &'a ShExecutionFrame, step_name: &str) -> Option<&'a Vec<serde_json::Value>> {
+        // Check if this frame matches the step name
+        if frame.name == step_name {
+            return Some(&frame.outputs);
+        }
+        
+        // Search in child frame (call stack) - this will find the latest instance
+        if let Some(child_frame) = &frame.frame {
+            if let Some(outputs) = self.find_latest_step_outputs_recursive(child_frame, step_name) {
+                return Some(outputs);
+            }
+        }
+        
+        None
+    }
+
 
 
     // Helper function to convert a Value to a string, preserving JSON structure
@@ -1018,8 +1123,6 @@ impl ExecutionEngine {
             url_path,
             STARTHUB_MANIFEST_FILENAME
         );
-
-        println!("storage_url: {}", storage_url);
         
         // Download and parse starthub-lock.json
         let client = reqwest::Client::new();
@@ -1039,8 +1142,8 @@ impl ExecutionEngine {
 
     
     pub fn find_sibling_dependencies(&self, value: &Value, steps: &HashMap<String, ShAction>) -> Result<Vec<String>> {        
-                // Look for patterns like {{steps.step_name.field}}
-                let re = regex::Regex::new(r"\{\{steps\.([^.]+)")?;
+        // Look for patterns like {{steps.step_name.field}}
+        let re = regex::Regex::new(r"\{\{steps\.([^.]+)")?;
         let mut deps = std::collections::HashSet::new();
                 
         match value {
@@ -1088,11 +1191,11 @@ impl ExecutionEngine {
         steps: &HashMap<String, ShAction>
     ) -> Result<Option<String>> {
         // 1. Check if all outputs of the current action can be resolved
-        if self.can_resolve_all_outputs(action, steps)? {
+        if self.can_resolve_all_outputs(action)? {
             return Ok(None); // We're done!
         }
         
-        // 2. Find steps that are ready to execute
+        // 2. Find steps that are ready to execute AND haven't been executed yet
         let mut ready_steps: Vec<String> = Vec::new();
         for step_id in steps.keys() {
             if self.is_step_ready_to_execute(step_id, steps)? {
@@ -1108,29 +1211,173 @@ impl ExecutionEngine {
         }
     }
 
-    /// Checks if all outputs of the current action can be resolved
-    fn can_resolve_all_outputs(&self, action: &ShAction, _steps: &HashMap<String, ShAction>) -> Result<bool> {
-        // Check if we can resolve all the outputs of the current action
+    /// Checks if all outputs of the current frame can be resolved
+    fn can_resolve_all_outputs(&self, action: &ShAction) -> Result<bool> {
+        println!("can_resolve_all_outputs");
+        // Check if we can resolve all the outputs of the current frame
         // This means all the inputs needed for the outputs are available
         // in the execution context
+        println!("current frame: {:#?}", self.get_current_frame());
+        let current_frame = self.get_current_frame();
+        
+        // Check if the current frame already has outputs (meaning it's completed)
+        if !current_frame.outputs.is_empty() {
+            println!("Current frame already has outputs, can resolve");
+            return Ok(true);
+        }
+        
+        // For composition actions, we need to collect outputs from child frames (executed steps)
+        // to resolve the parent's output templates
+        let step_outputs = self.collect_child_frame_outputs(current_frame);
+        println!("step_outputs: {:#?}", step_outputs);
+        
+        // If no outputs yet, check if we can resolve the action's output templates
         for output in &action.outputs {
-            if !self.can_resolve_output_template(&output.template)? {
-                return Ok(false);
+            println!("output: {:#?}", output);
+            // Try to resolve the template using the step outputs
+            match self.interpolate_with_step_outputs(&output.template, &step_outputs) {
+                Ok(result) => {
+                    println!("result: {:#?}", result);
+                    // Check if the result still contains unresolved template variables
+                    if self.contains_unresolved_templates(&result) {
+                        println!("contains_unresolved_templates");
+                        return Ok(false);
+                    }
+                },
+                Err(_) => {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
     }
 
-    /// Checks if an output template can be resolved using the current execution context
-    fn can_resolve_output_template(&self, template: &Value) -> Result<bool> {
-        // Get inputs from the current frame for template resolution
-        let current_inputs = self.execution_context.frame.inputs.values().cloned().collect::<Vec<_>>();
+    /// Collect outputs from all child frames (executed steps) to resolve parent outputs
+    /// Returns a HashMap with action names as keys and their latest outputs as values
+    fn collect_child_frame_outputs(&self, frame: &ShExecutionFrame) -> HashMap<String, Vec<serde_json::Value>> {
+        let mut step_outputs = HashMap::new();
         
-        // Try to resolve the template using the current execution context
-        // If it succeeds, the template can be resolved
-        match self.interpolate(template, &current_inputs) {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
+        // Recursively collect outputs from the call stack
+        self.collect_child_frame_outputs_recursive(frame, &mut step_outputs);
+        
+        step_outputs
+    }
+
+    /// Recursively collect outputs from child frames, keeping only the latest for each action name
+    fn collect_child_frame_outputs_recursive(&self, frame: &ShExecutionFrame, step_outputs: &mut HashMap<String, Vec<serde_json::Value>>) {
+        // Add outputs from this frame (this will overwrite any previous outputs for the same action name)
+        if !frame.outputs.is_empty() {
+            step_outputs.insert(frame.name.clone(), frame.outputs.clone());
+        }
+        
+        // Recursively collect from child frames
+        if let Some(child_frame) = &frame.frame {
+            self.collect_child_frame_outputs_recursive(child_frame, step_outputs);
+        }
+    }
+
+    /// Interpolate template using step outputs from HashMap
+    fn interpolate_with_step_outputs(&self, template: &Value, step_outputs: &HashMap<String, Vec<serde_json::Value>>) -> Result<Value> {
+        match template {
+            Value::String(s) => {
+                let resolved = self.interpolate_string_with_step_outputs(s, step_outputs)?;
+                
+                // Check if the resolved string is actually a JSON object/array
+                match serde_json::from_str::<Value>(&resolved) {
+                    Ok(parsed_value) => {
+                        match parsed_value {
+                            Value::Object(_) | Value::Array(_) => Ok(parsed_value),
+                            _ => Ok(parsed_value)
+                        }
+                    },
+                    Err(_) => {
+                        Ok(Value::String(resolved))
+                    }
+                }
+            },
+            Value::Object(obj) => {
+                // Recursively resolve object templates
+                let mut resolved_obj = serde_json::Map::new();
+                for (key, value) in obj {
+                    let resolved_value = self.interpolate_with_step_outputs(value, step_outputs)?;
+                    resolved_obj.insert(key.clone(), resolved_value);
+                }
+                Ok(Value::Object(resolved_obj))
+            },
+            Value::Array(arr) => {
+                // Recursively resolve array templates
+                let mut resolved_arr = Vec::new();
+                for item in arr {
+                    let resolved_item = self.interpolate_with_step_outputs(item, step_outputs)?;
+                    resolved_arr.push(resolved_item);
+                }
+                Ok(Value::Array(resolved_arr))
+            },
+            _ => Ok(template.clone())
+        }
+    }
+
+    /// Interpolate string template using step outputs from HashMap
+    fn interpolate_string_with_step_outputs(&self, template: &str, step_outputs: &HashMap<String, Vec<serde_json::Value>>) -> Result<String> {
+        let mut result = template.to_string();
+        
+        // Handle {{steps.step_name.outputs[index]}} patterns (without jsonpath)
+        let steps_simple_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\}\}")?;
+        for cap in steps_simple_re.captures_iter(template) {
+            if let (Some(step_name), Some(index_str)) = (cap.get(1), cap.get(2)) {
+                if let Ok(index) = index_str.as_str().parse::<usize>() {
+                    if let Some(outputs) = step_outputs.get(step_name.as_str()) {
+                        if let Some(output_value) = outputs.get(index) {
+                            let replacement = match output_value {
+                                Value::String(s) => s.clone(),
+                                _ => output_value.to_string(),
+                            };
+                            result = result.replace(&cap[0], &replacement);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Handle {{steps.step_name.outputs[index].jsonpath}} patterns
+        let steps_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\.([^}]+)\}\}")?;
+        for cap in steps_re.captures_iter(template) {
+            if let (Some(step_name), Some(index_str), Some(jsonpath)) = (cap.get(1), cap.get(2), cap.get(3)) {
+                if let Ok(index) = index_str.as_str().parse::<usize>() {
+                    if let Some(outputs) = step_outputs.get(step_name.as_str()) {
+                        if let Some(output_value) = outputs.get(index) {
+                            if let Ok(resolved_value) = self.evaluate_jsonpath(output_value, jsonpath.as_str()) {
+                                let replacement = match resolved_value {
+                                    Value::String(s) => s.clone(),
+                                    _ => resolved_value.to_string(),
+                                };
+                                result = result.replace(&cap[0], &replacement);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(result)
+    }
+
+    /// Helper method to check if a value contains unresolved template variables
+    fn contains_unresolved_templates(&self, value: &Value) -> bool {
+        match value {
+            Value::String(s) => {
+                // Check for template patterns like {{...}}
+                s.contains("{{") && s.contains("}}")
+            },
+            Value::Object(obj) => {
+                // Recursively check object values
+                obj.values().any(|v| self.contains_unresolved_templates(v))
+            },
+            Value::Array(arr) => {
+                // Recursively check array elements
+                arr.iter().any(|v| self.contains_unresolved_templates(v))
+            },
+            _ => false, // Primitive values don't contain templates
         }
     }
 
@@ -1154,9 +1401,13 @@ impl ExecutionEngine {
             let dependencies = self.find_sibling_dependencies(&input.template, all_steps)?;
             
             // For each dependency, check if the corresponding step has been executed
-            // by checking if there's a frame in the execution context tree with that action_id
+            // by checking if there's a frame in the execution frame tree with that action_id
             for dep in dependencies {
-                let has_been_executed = self.has_action_been_executed(&self.execution_context, &dep);
+                let has_been_executed = if let Some(ref frame) = self.execution_frame {
+                    self.has_action_been_executed(frame, &dep)
+                } else {
+                    false
+                };
                     
                 if !has_been_executed {
                     return Ok(false);
@@ -1199,6 +1450,7 @@ impl ExecutionEngine {
 
         self.log_info(&format!("Running WASM file: {:?}", module_path), Some(&action.id));
         self.log_info(&format!("Input: {}", input_json), Some(&action.id));
+        
         
         // Construct command
         let mut cmd = TokioCommand::new("wasmtime");
@@ -1313,7 +1565,10 @@ impl ExecutionEngine {
             }
         });
 
+        // Wait for the process to exit first
         let status = child.wait().await?;
+        
+        // Wait for all output to be processed
         let _ = pump_out.await;
         let _ = pump_err.await;
 
@@ -1324,7 +1579,7 @@ impl ExecutionEngine {
         
         self.log_success("WASM execution completed successfully", Some(&action.id));
 
-        // Collect the first result from the WASM module
+        // Now collect all results from the channel
         let mut results = Vec::new();
         while let Ok(v) = rx.try_recv() { 
             results.push(v);
@@ -1376,7 +1631,6 @@ impl ExecutionEngine {
     }
 
     async fn download_wasm(&self, action_ref: &str, mirrors: &[String]) -> Result<std::path::PathBuf> {
-        println!("Downloading WASM file for action: {}", action_ref);
         // Construct the WASM file path in the cache directory with proper directory structure
         let url_path = action_ref.replace(":", "/");
         let wasm_dir = self.cache_dir.join(&url_path);
@@ -1384,7 +1638,6 @@ impl ExecutionEngine {
         
         // If the WASM file already exists, return it
         if wasm_path.exists() {
-            println!("WASM file already exists at: {:?}", wasm_path);
             return Ok(wasm_path);
         }
         
@@ -1465,58 +1718,60 @@ mod tests {
     
     use serde_json::json;
 
-//     #[tokio::test]
-//     async fn test_execute_action_get_weather_by_location_name() {
-//         // Create a mock ExecutionEngine
-//         let engine = ExecutionEngine::new();
+    #[tokio::test]
+    async fn test_execute_action_get_weather_by_location_name() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-//         // Test executing action with the same inputs as test_build_action_tree
-//         let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
-//         let inputs = vec![
-//             json!({
-//                 "location_name": "Rome",
-//                 "open_weather_api_key": "f13e712db9557544db878888528a5e29"
-//             })
-//         ];
+        // Test executing action with the same inputs as test_build_action_tree
+        let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
+        let inputs = vec![
+            json!({
+                "location_name": "Rome",
+                "open_weather_api_key": "f13e712db9557544db878888528a5e29"
+            })
+        ];
         
-//         let result = engine.execute_action(action_ref, inputs).await;
+        let result = engine.execute_action(action_ref, inputs).await;
         
-//         println!("result: {:#?}", result);
-//         // The test should succeed
-//         assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
         
-//         let action_tree = result.unwrap();
+        let outputs = result.unwrap();
         
-//         // Verify the root action structure
-//         assert_eq!(action_tree["name"], "get-weather-by-location-name");
-//         assert_eq!(action_tree["kind"], "composition");
-//         assert_eq!(action_tree["uses"], action_ref);
-//         assert!(action_tree["parent_action"].is_null());
+        // Verify that we got outputs from the execution
+        assert!(outputs.contains_key("response"), "Should contain 'response' output");
         
-//         // Verify inputs
-//         assert!(action_tree["inputs"].is_array());
-//         let inputs_array = action_tree["inputs"].as_array().unwrap();
-//         assert_eq!(inputs_array.len(), 1);
-//         let input = &inputs_array[0];
-//         assert_eq!(input["name"], "weather_config");
-//         assert_eq!(input["type"], "WeatherConfig");
+        let response = &outputs["response"];
+        assert!(response.is_object(), "Response should be an object");
         
-//         // Verify outputs
-//         assert!(action_tree["outputs"].is_array());
-//         let outputs_array = action_tree["outputs"].as_array().unwrap();
-//         assert_eq!(outputs_array.len(), 1);
-//         let output = &outputs_array[0];
-//         assert_eq!(output["name"], "response");
-//         assert_eq!(output["type"], "CustomWeatherResponse");
+        // For composition actions, we expect the output to contain the resolved template structure
+        // The actual weather data will be populated when the steps are executed
+        if let Some(response_obj) = response.as_object() {
+            // Check that we have the expected structure with location_name
+            assert!(response_obj.contains_key("location_name"), "Response should contain location_name");
+            assert_eq!(response_obj["location_name"], "Rome");
+        }
         
-//         // Execution order is now determined dynamically at runtime
+        // Also verify the execution frame was populated correctly
+        let execution_frame = &engine.execution_frame;
         
-//         // Verify types are present
-//         assert!(action_tree["types"].is_object());
-//         let types = action_tree["types"].as_object().unwrap();
-//         assert!(types.contains_key("WeatherConfig"));
-//         assert!(types.contains_key("CustomWeatherResponse"));
-//     }
+        // Verify we have an execution frame
+        assert!(execution_frame.is_some());
+        let frame = execution_frame.as_ref().unwrap();
+        
+        // Verify the frame has the expected action_id
+        assert_eq!(frame.id, "root");
+        
+        // Verify inputs are present in the execution frame
+        assert_eq!(frame.inputs.len(), 1);
+        assert!(frame.inputs[0].is_object());
+        
+        // Verify outputs are present in the execution frame
+        assert_eq!(frame.outputs.len(), 1);
+        assert!(frame.outputs[0].is_object());
+    }
 
 //     #[tokio::test]
 //     async fn test_execute_action_create_do_project() {
@@ -2656,8 +2911,30 @@ mod tests {
 //         assert_eq!(next_step.unwrap(), "process_high", "Should return 'process_high' step");
 //     }
 
+    #[test]
+    fn test_frame_stack_navigation() {
+        let mut engine = ExecutionEngine::new();
+        
+        // Test frame stack navigation
+        assert!(engine.frame_stack.is_empty());
+        
+        // Simulate adding frames to the stack
+        engine.frame_stack.push("frame1".to_string());
+        engine.frame_stack.push("frame2".to_string());
+        engine.frame_stack.push("frame3".to_string());
+        
+        // Test getting current frame ID
+        assert_eq!(engine.get_current_frame_id(), Some(&"frame3".to_string()));
+        
+        // Test frame stack pop
+        let popped = engine.frame_stack.pop();
+        assert_eq!(popped, Some("frame3".to_string()));
+        assert_eq!(engine.get_current_frame_id(), Some(&"frame2".to_string()));
+    }
+
     #[tokio::test]
     async fn test_execute_action_http_get_wasm() {
+        println!("test_execute_action_http_get_wasm");
         // Create a mock ExecutionEngine
         let mut engine = ExecutionEngine::new();
         
@@ -2674,7 +2951,7 @@ mod tests {
         
         let result = engine.execute_action(action_ref, inputs).await;
         
-        println!("http-get-wasm test result: {:#?}", result);
+        println!("execution frame: {:#?}", engine.execution_frame);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid http-get-wasm action_ref and inputs");
         
@@ -2689,16 +2966,20 @@ mod tests {
         assert!(response["status"].is_number());
         assert_eq!(response["status"], 200);
         
-        // Also verify the execution context was populated correctly
-        let execution_context = &engine.execution_context;
+        // Also verify the execution frame was populated correctly
+        let execution_frame = &engine.execution_frame;
+        
+        // Verify we have an execution frame
+        assert!(execution_frame.is_some());
+        let frame = execution_frame.as_ref().unwrap();
         
         // Verify the frame has the expected action_id
-        assert_eq!(execution_context.frame.action_id, "root");
+        assert_eq!(frame.id, "root");
         
         // Verify inputs are present
-        assert_eq!(execution_context.frame.inputs.len(), 2);
-        assert!(execution_context.frame.inputs.contains_key("input_0"));
-        assert!(execution_context.frame.inputs.contains_key("input_1"));
+        assert_eq!(frame.inputs.len(), 2);
+        assert_eq!(frame.inputs[0], json!("https://api.restful-api.dev/objects"));
+        assert_eq!(frame.inputs[1], json!({"Accept": "application/json"}));
     }
     
     
