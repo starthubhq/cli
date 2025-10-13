@@ -220,6 +220,12 @@ pub struct MountSpec {
     pub rw: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShExecutionFrame {
+    pub timestamp: String,
+}
+
+
 
 // API Client for StartHub
 pub struct HubClient;

@@ -11,7 +11,7 @@ use which;
 use zip::ZipArchive;
 use tokio::sync::broadcast;
 
-use crate::models::{ShManifest, ShKind, ShIO, ShAction};
+use crate::models::{ShManifest, ShKind, ShIO, ShAction, ShExecutionFrame};
 
 // Constants
 const STARTHUB_API_BASE_URL: &str = "https://api.starthub.so";
@@ -20,6 +20,7 @@ const STARTHUB_MANIFEST_FILENAME: &str = "starthub-lock.json";
 pub struct ExecutionEngine {
     cache_dir: std::path::PathBuf,
     ws_sender: Option<broadcast::Sender<String>>,
+    execution_frames: Vec<ShExecutionFrame>,
 }
 
 impl ExecutionEngine {
@@ -36,6 +37,7 @@ impl ExecutionEngine {
         Self {
             cache_dir,
             ws_sender: None,
+            execution_frames: Vec::new(),
         }
     }
 
@@ -144,7 +146,7 @@ impl ExecutionEngine {
     }
 
     // Main flow
-    pub async fn execute_action(&self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
+    pub async fn execute_action(&mut self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
         self.log_info(&format!("Starting execution of action: {}", action_ref), None);
         
         // Ensure cache directory exists before starting execution.
@@ -161,7 +163,6 @@ impl ExecutionEngine {
             None,               // No parent action ID (root)
         ).await?;     
 
-        println!("root_action: {:#?}", root_action);
         // return Ok(serde_json::to_value(root_action)?);
         self.log_success("Action tree built successfully", Some(&root_action.id));
 
@@ -177,22 +178,25 @@ impl ExecutionEngine {
         Ok(serde_json::to_value(result)?)
     }
 
-    async fn run_action_tree(&self,
+    async fn run_action_tree(&mut self,
         action_state: &mut ShAction,
         parent_inputs: &Vec<Value>,
-        executed_sibling_steps: &HashMap<String, ShAction>) -> Result<ShAction> {
-        
-        println!("Executing {} step 1: {}", action_state.kind, action_state.name);
-        println!("Just before instantiating inputs");
+        _executed_sibling_steps: &HashMap<String, ShAction>) -> Result<ShAction> {
+    
         println!("parent_inputs: {:#?}", parent_inputs);
+        
+        // Create and push execution frame
+        let frame = ShExecutionFrame {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
+        self.execution_frames.push(frame);
+        
         // 1) Instantiate the inputs according to the types specified
         let instantiated_inputs: Vec<Value> = self.instantiate(
             &action_state.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()), 
             &action_state.inputs,
             &parent_inputs
         )?;
-        println!("Just after instantiating inputs");
-        println!("instantiated_inputs: {:#?}", instantiated_inputs);
 
         // 2) Assign the instantiated inputs to the action state inputs
         for (index, input) in action_state.inputs.iter_mut().enumerate() {
@@ -200,9 +204,6 @@ impl ExecutionEngine {
                 input.value = Some(resolved_input.clone());
             }
         }
-
-        // println!("instantiated_inputs: {:#?}", instantiated_inputs);
-        println!("updated action_state inputs: {:#?}", action_state.inputs);
 
         // Base condition
         if action_state.kind == "wasm" || action_state.kind == "docker" {
@@ -246,83 +247,69 @@ impl ExecutionEngine {
                 }
             }
 
-            println!("action_state_clone: {:#?}", action_state_clone);
-
             return Ok(action_state_clone);
         }
 
-        // Track executed steps as we go
-        let mut local_executed_steps = executed_sibling_steps.clone();
+        // Simple output-driven execution loop using the action tree directly
+        let mut iteration_count = 0;
+        let max_iterations = 1000; // Prevent infinite loops
         
-        // Run the action tree recursively - dynamic step execution with flow control support
         loop {
-            // Determine the next step to execute based on dependencies
-            let next_step_id = match self.get_next_step_to_execute(&action_state.steps, &local_executed_steps)? {
+            iteration_count += 1;
+            if iteration_count > max_iterations {
+                return Err(anyhow::anyhow!("Maximum iterations exceeded"));
+            }
+            
+            println!("Checking if all parent outputs can be resolved");
+            // 1. Check if all parent outputs can be resolved
+            if self.can_resolve_all_final_outputs(action_state)? {
+                println!("All parent outputs can be resolved");
+                break; // We're done!
+            }
+
+            println!("Finding next executable step");
+            
+            // 2. Find next executable step
+            let next_step_id = match self.find_next_executable_step(&action_state.steps)? {
                 Some(step_id) => step_id,
-                None => break, // All steps completed or no more steps can be executed
+                None => {
+                    // No more steps can be executed
+                    return Err(anyhow::anyhow!("Deadlock: no steps can be executed"));
+                }
             };
 
             println!("next_step_id: {}", next_step_id);
             
+            // Clone action state to avoid borrowing issues
+            let action_state_clone = action_state.clone();
+            
             if let Some(step) = action_state.steps.get_mut(&next_step_id) {
                 self.log_info(&format!("Starting step: {}", next_step_id), Some(&action_state.id));
 
-                // For each step, we need to use the inputs and types field
-                // of the step to generate a completely new object with that structure.
-                
-                // The inputs field determines not only the order of the inputs, but
-                // also the structure of the input, along with how the inputs from the
-                // current action or sibling need to be injected into each child step input.
-
-                // 2) Generate the inputs object that are going to be passed to the next recursion.
-                // Resolve inputs for this step using the same logic as the main resolve_inputs function
-                let resolved_inputs_to_inject_into_child_step = self.resolve_into_inputs(
+                // Resolve inputs for this step using the action tree
+                let resolved_inputs_to_inject_into_child_step = self.resolve_into_inputs_with_tree(
                     &step.types.as_ref().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<HashMap<_, _>>()),
                     &step.inputs,
-                    &instantiated_inputs,  // Inject inputs from current action into the step
-                    &local_executed_steps
+                    &action_state_clone
                 )?;
 
                 println!("resolved_inputs_to_inject_into_child_step: {:#?}", resolved_inputs_to_inject_into_child_step);
 
-                // Execute the step with its own raw inputs, parent inputs for template resolution, and executed steps
+                // Execute the step
                 let processed_child = Box::pin(self.run_action_tree(
                     step, 
-                    &resolved_inputs_to_inject_into_child_step,  // Parent's resolved inputs for template resolution
-                    &local_executed_steps
+                    &resolved_inputs_to_inject_into_child_step,
+                    &HashMap::new() // We don't need executed_steps anymore
                 )).await?;
                 
-                // Send tree update after each recursion iteration
-                self.send_tree_update(&action_state, &local_executed_steps, &next_step_id).await;
-                
-                // Given the step name, assing the processed child to the step
-                let processed_child_clone = processed_child.clone();
+                // Update the action state with the processed child
                 action_state.steps.insert(next_step_id.clone(), processed_child);
                 
-                // Add the executed steps to the executed siblings, so in the
-                // next iteration the template resolution can pick up the outputs
-                // of the executed steps.
-                local_executed_steps.insert(next_step_id.clone(), processed_child_clone);
-
+                // Send tree update
+                self.send_tree_update(&action_state, &HashMap::new(), &next_step_id).await;
+                
                 self.log_success(&format!("Completed step: {}", next_step_id), Some(&action_state.id));
                 
-                // Check for flow control after step execution
-                if let Some(executed_step) = local_executed_steps.get(&next_step_id) {
-                    // For flow control, we need to check if the executed step indicates
-                    // that we should skip certain steps or jump to a specific step
-                    if let Ok(Some(flow_control_step)) = self.check_flow_control_dynamic(
-                        executed_step, 
-                        &action_state.steps,
-                        &local_executed_steps
-                    ) {
-                        // Flow control detected, mark the specified step as ready to execute
-                        // by removing it from executed steps if it was already executed
-                        if local_executed_steps.contains_key(&flow_control_step) {
-                            local_executed_steps.remove(&flow_control_step);
-                        }
-                        self.log_info(&format!("Flow control: preparing to execute step '{}'", flow_control_step), Some(&action_state.id));
-                    }
-                }
             } else {
                 // Step not found, this shouldn't happen with dynamic execution
                 self.log_error(&format!("Step '{}' not found in action tree", next_step_id), Some(&action_state.id));
@@ -576,6 +563,7 @@ impl ExecutionEngine {
 
         Ok(resolved_inputs)
     }
+
 
     // Since the variables might becoming from the parent or the siblings, this
     // function needs to know the parent inputs and the steps that have already been executed.
@@ -1029,8 +1017,6 @@ impl ExecutionEngine {
             url_path,
             STARTHUB_MANIFEST_FILENAME
         );
-
-        println!("storage_url: {}", storage_url);
         
         // Download and parse starthub-lock.json
         let client = reqwest::Client::new();
@@ -1096,58 +1082,216 @@ impl ExecutionEngine {
     fn get_next_step_to_execute(
         &self,
         steps: &HashMap<String, ShAction>,
+        current_action_inputs: &Vec<Value>,
         executed_steps: &HashMap<String, ShAction>
     ) -> Result<Option<String>> {
-        // Find steps that haven't been executed yet
-        let remaining_steps: Vec<String> = steps.keys()
-            .filter(|step_id| !executed_steps.contains_key(*step_id))
-            .cloned()
-            .collect();
-
-        if remaining_steps.is_empty() {
-            return Ok(None);
+        // First check if all outputs of the current action can be resolved
+        if self.can_all_outputs_be_resolved(steps, current_action_inputs, executed_steps)? {
+            return Ok(None); // All outputs can be resolved, no need to execute more steps
         }
 
-        // For each remaining step, check if its dependencies are satisfied
-        for step_id in remaining_steps {
-            if let Some(step) = steps.get(&step_id) {
-                let dependencies_satisfied = self.check_step_dependencies_satisfied(
-                    step, 
-                    executed_steps,
-                    steps
-                )?;
-                
-                if dependencies_satisfied {
-                    return Ok(Some(step_id));
-                }
+        // If not all outputs can be resolved, find a step whose inputs can be resolved
+        for (step_id, step) in steps {
+            if self.can_step_inputs_be_resolved(step, current_action_inputs, executed_steps)? {
+                return Ok(Some(step_id.clone()));
             }
         }
 
-        // If we get here, no step has all its dependencies satisfied
-        // This could indicate a circular dependency or missing dependency
+        // No step has resolvable inputs
         Ok(None)
     }
 
-    /// Checks if all dependencies for a step are satisfied by executed steps
-    fn check_step_dependencies_satisfied(
+    /// Checks if all outputs of the current action can be resolved
+    fn can_all_outputs_be_resolved(
+        &self,
+        steps: &HashMap<String, ShAction>,
+        _current_action_inputs: &Vec<Value>,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Result<bool> {
+        // For now, we'll assume outputs can be resolved if all steps have been executed
+        // This is a simplified implementation - in the future, we might want to check
+        // if the output templates can actually be resolved with the current state
+        Ok(steps.is_empty() || steps.iter().all(|(step_id, _)| executed_steps.contains_key(step_id)))
+    }
+
+    /// Checks if all inputs of a step can be resolved
+    fn can_step_inputs_be_resolved(
         &self,
         step: &ShAction,
-        executed_steps: &HashMap<String, ShAction>,
-        all_steps: &HashMap<String, ShAction>
+        current_action_inputs: &Vec<Value>,
+        executed_steps: &HashMap<String, ShAction>
     ) -> Result<bool> {
-        // Check each input of the step for dependencies
+        // Check if all inputs of the step can be resolved
         for input in &step.inputs {
-            let dependencies = self.find_sibling_dependencies(&input.template, all_steps)?;
-            
-            // For each dependency, check if the corresponding step has been executed
-            for dep in dependencies {
-                if !executed_steps.contains_key(&dep) {
-                    return Ok(false);
-                }
+            // Try to resolve the input template
+            let resolved = self.interpolate(&input.template, current_action_inputs, executed_steps);
+            if resolved.is_err() {
+                return Ok(false);
             }
         }
         Ok(true)
     }
+
+    /// Checks if all parent outputs can be resolved using the action tree
+    fn can_resolve_all_final_outputs(
+        &self,
+        action: &ShAction,
+    ) -> Result<bool> {
+        // Use the existing resolve_into_outputs function to get the resolved outputs
+        let resolved_outputs = match self.resolve_into_outputs(
+            &action.inputs,
+            &action.outputs,
+            &action.steps
+        ) {
+            Ok(outputs) => outputs,
+            Err(_) => return Ok(false), // Cannot resolve outputs yet
+        };
+        
+        // Check if any resolved output still contains template syntax ({{ or }})
+        for output in resolved_outputs {
+            if self.contains_unresolved_templates(&output) {
+                return Ok(false); // Found unresolved templates
+            }
+        }
+        
+        Ok(true) // All outputs are fully resolved
+    }
+    
+    /// Checks if a value contains unresolved template syntax
+    fn contains_unresolved_templates(&self, value: &Value) -> bool {
+        match value {
+            Value::String(s) => s.contains("{{") || s.contains("}}"),
+            Value::Object(obj) => {
+                for (_, v) in obj {
+                    if self.contains_unresolved_templates(v) {
+                        return true;
+                    }
+                }
+                false
+            },
+            Value::Array(arr) => {
+                for item in arr {
+                    if self.contains_unresolved_templates(item) {
+                        return true;
+                    }
+                }
+                false
+            },
+            _ => false, // Numbers, booleans, null don't contain templates
+        }
+    }
+
+    /// Tries to resolve an output template using the action tree
+    fn try_resolve_output_template_with_tree(
+        &self,
+        template: &Value,
+        action_tree: &ShAction
+    ) -> Result<Option<Value>> {
+        // Try to interpolate the template using the action tree
+        match self.interpolate_template_with_tree(template, action_tree) {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(_) => Ok(None), // Cannot resolve yet
+        }
+    }
+
+    /// Interpolates template using the action tree
+    fn interpolate_template_with_tree(
+        &self,
+        template: &Value,
+        action_tree: &ShAction
+    ) -> Result<Value> {
+        // Use the action tree's inputs and steps for interpolation
+        let input_values: Vec<Value> = action_tree.inputs.iter()
+            .map(|input| input.value.clone().unwrap_or(Value::Null))
+            .collect();
+        
+        self.interpolate(template, &input_values, &action_tree.steps)
+    }
+
+    /// Finds the next executable step using the action tree
+    fn find_next_executable_step(
+        &self,
+        steps: &HashMap<String, ShAction>,
+    ) -> Result<Option<String>> {
+        // First, check steps that haven't been executed yet (no outputs)
+        for (step_id, step) in steps {
+            if self.is_step_unexecuted(step) && self.can_resolve_step_inputs_with_tree(step, steps)? {
+                return Ok(Some(step_id.clone()));
+            }
+        }
+        
+        // If no unexecuted steps can be executed, check steps that can be re-executed
+        for (step_id, step) in steps {
+            if self.can_resolve_step_inputs_with_tree(step, steps)? {
+                return Ok(Some(step_id.clone()));
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// Checks if a step has not been executed yet (no outputs with values)
+    fn is_step_unexecuted(&self, step: &ShAction) -> bool {
+        // A step is unexecuted if none of its outputs have values
+        step.outputs.iter().all(|output| output.value.is_none())
+    }
+
+    /// Checks if step inputs can be resolved using the action tree
+    fn can_resolve_step_inputs_with_tree(
+        &self,
+        step: &ShAction,
+        all_steps: &HashMap<String, ShAction>
+    ) -> Result<bool> {
+        // Check if all inputs of the step can be resolved
+        for input in &step.inputs {
+            // Try to resolve the input template using the action tree
+            let resolved = self.interpolate_template_with_steps(&input.template, all_steps);
+            if resolved.is_err() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Interpolates template using steps
+    fn interpolate_template_with_steps(
+        &self,
+        template: &Value,
+        steps: &HashMap<String, ShAction>
+    ) -> Result<Value> {
+        // Create input values from steps that have outputs
+        let input_values: Vec<Value> = steps.values()
+            .flat_map(|step| step.inputs.iter().map(|input| input.value.clone().unwrap_or(Value::Null)))
+            .collect();
+        
+        self.interpolate(template, &input_values, steps)
+    }
+
+    /// Resolves inputs using the action tree
+    fn resolve_into_inputs_with_tree(
+        &self,
+        _types: &Option<HashMap<String, Value>>, 
+        io_definitions: &Vec<ShIO>,
+        action_tree: &ShAction
+    ) -> Result<Vec<Value>> {
+        let mut resolved_inputs: Vec<Value> = Vec::new();
+
+        // For every value, find its corresponding input by index
+        for (index, _input) in io_definitions.iter().enumerate() {
+            if let Some(input) = io_definitions.get(index) {
+                // First, resolve the template to get the actual input value
+                let interpolated_template = self.interpolate_template_with_tree(
+                    &input.template, 
+                    action_tree
+                )?;
+
+                resolved_inputs.push(interpolated_template);
+            }
+        }
+
+        Ok(resolved_inputs)
+    }
+
 
     /// Dynamic flow control check that works without execution_order
     fn check_flow_control_dynamic(
@@ -1482,7 +1626,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_action_get_weather_by_location_name() {
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing action with the same inputs as test_build_action_tree
         let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
@@ -1495,7 +1639,7 @@ mod tests {
         
         let result = engine.execute_action(action_ref, inputs).await;
         
-        println!("result: {:#?}", result);
+        // println!("result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
         
@@ -1537,7 +1681,7 @@ mod tests {
         dotenv::dotenv().ok();
 
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing action with the same inputs as test_build_action_tree
         let action_ref = "starthubhq/do-create-project:0.0.1";
@@ -1577,7 +1721,7 @@ mod tests {
         dotenv::dotenv().ok();
 
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing action for droplet creation
         let action_ref = "starthubhq/do-create-droplet:0.0.1";
@@ -1651,7 +1795,7 @@ mod tests {
         dotenv::dotenv().ok();
 
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing action for SSH key creation from file
         let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
@@ -1693,7 +1837,7 @@ mod tests {
         dotenv::dotenv().ok();
 
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing action for droplet creation with sync
         let action_ref = "starthubhq/do-create-droplet-sync:0.0.1";
@@ -1759,7 +1903,7 @@ mod tests {
         dotenv::dotenv().ok();
 
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing action for droplet retrieval
         let action_ref = "starthubhq/do-get-droplet:0.0.1";
@@ -1827,7 +1971,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_action_std_read_file() {
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing the std/read-file action
         let action_ref = "std/read-file:0.0.1";
@@ -1855,7 +1999,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_action_sleep() {
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing the sleep action directly
         let action_ref = "std/sleep:0.0.1";
@@ -1884,7 +2028,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_action_base64_to_text() {
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing the base64-to-text action directly
         let action_ref = "starthubhq/base64-to-text:0.0.1";
@@ -1932,7 +2076,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_action_file_to_string() {
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing the file-to-string composition
         let action_ref = "starthubhq/file-to-string:0.0.1";
@@ -2206,7 +2350,7 @@ mod tests {
     #[tokio::test]
     async fn test_run_action_tree_wasm_early_return() {
         // Test that WASM actions return early without processing
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         let mut wasm_action = ShAction {
             id: "test-wasm".to_string(),
@@ -2673,7 +2817,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_action_http_get_wasm() {
         // Create a mock ExecutionEngine
-        let engine = ExecutionEngine::new();
+        let mut engine = ExecutionEngine::new();
         
         // Test executing the http-get-wasm action directly
         let action_ref = "starthubhq/http-get-wasm:0.0.16";
