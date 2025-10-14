@@ -11,7 +11,7 @@ use std::io::Read;
 
 /// Executes a WASM step by downloading and running the WASM module
 pub async fn run_wasm_step(
-    action: &mut ShAction,
+    action: &ShAction,
     inputs: &Value,
     cache_dir: &PathBuf,
     log_info: &(dyn Fn(&str, Option<&str>) + Send + Sync),
