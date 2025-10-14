@@ -7,7 +7,7 @@ use tokio::sync::broadcast;
 
 use crate::models::{ShManifest, ShKind, ShIO, ShAction, ShExecutionFrame, ShType};
 use crate::wasm;
-use crate::logger::{Logger, Loggable};
+use crate::logger::{Logger};
 
 // Constants
 const STARTHUB_API_BASE_URL: &str = "https://api.starthub.so";
@@ -86,15 +86,12 @@ impl ExecutionEngine {
         if action.kind == "wasm" || action.kind == "docker" {
             println!("Executing {} wasm step: {}", action.kind, action.name);
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
-            
-            // Serialize the instantiated inputs
-            let inputs_value = serde_json::to_value(&action.inputs)?;
 
             let mut result = Vec::new();
             if   action.kind == "wasm" {
                 result = wasm::run_wasm_step(
                     action, 
-                    &inputs_value, 
+                    &serde_json::to_value(inputs)?, 
                     &self.cache_dir,
                     &|msg, id| self.logger.log_info(msg, id),
                     &|msg, id| self.logger.log_success(msg, id),
@@ -142,7 +139,6 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Maximum iterations exceeded"));
             }
             
-            println!("Checking if all parent outputs can be resolved");
             // 1. Check if all parent outputs can be resolved
             // if self.can_resolve_all_final_outputs(action)? {
             //     println!("All outputs can be resolved");
@@ -2066,8 +2062,6 @@ mod tests {
         let _result = engine.cast(&None, &io_definitions, &io_values);
         // This should panic due to unwrap() in the method when trying to access the second value
     }
-
-
 
     #[tokio::test]
     async fn test_execute_action_http_get_wasm() {
