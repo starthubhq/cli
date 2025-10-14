@@ -46,8 +46,7 @@ impl AppState {
         let (ws_sender, _) = broadcast::channel(100);
         
         // Initialize execution engine
-        let mut execution_engine = ExecutionEngine::new();
-        execution_engine.set_ws_sender(ws_sender.clone());
+        let execution_engine = ExecutionEngine::new(Some(ws_sender.clone()));
         let execution_engine = Arc::new(Mutex::new(execution_engine));
         
         Self { 
@@ -170,6 +169,7 @@ async fn serve_spa() -> Html<String> {
     }
 }
 
+#[axum::debug_handler]
 async fn handle_run(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(payload): Json<Value>

@@ -132,6 +132,7 @@ pub enum ShType {
     Boolean,
     Object,
     Array,
+    Id,
     // Custom types are allowed
     Custom(String),
 }
@@ -143,6 +144,7 @@ impl serde::Serialize for ShType {
     {
         let s = match self {
             ShType::String => "string",
+            ShType::Id => "id",
             ShType::Number => "number",
             ShType::Boolean => "boolean",
             ShType::Object => "object",
