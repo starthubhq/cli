@@ -27,6 +27,11 @@ impl Logger {
         self.ws_sender = Some(sender);
     }
 
+    /// Get the WebSocket sender
+    pub fn get_ws_sender(&self) -> Option<broadcast::Sender<String>> {
+        self.ws_sender.clone()
+    }
+
     /// Core logging function that sends messages via WebSocket
     pub fn log(&self, level: &str, message: &str, action_id: Option<&str>) {
         if let Some(sender) = &self.ws_sender {

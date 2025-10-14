@@ -19,7 +19,7 @@ pub struct ExecutionEngine {
 }
 
 impl ExecutionEngine {
-    pub fn new(ws_sender: Option<broadcast::Sender<String>>) -> Self {
+    pub fn new() -> Self {
         let cache_dir = dirs::cache_dir()
             .unwrap_or(std::env::temp_dir())
             .join("starthub/oci");
@@ -29,10 +29,18 @@ impl ExecutionEngine {
             eprintln!("Warning: Failed to create cache directory {:?}: {}", cache_dir, e);
         }
         
+        // Create WebSocket sender internally
+        let (ws_sender, _) = broadcast::channel(100);
+        
         Self {
             cache_dir,
-            logger: Logger::new_with_ws_sender(ws_sender),
+            logger: Logger::new_with_ws_sender(Some(ws_sender)),
         }
+    }
+
+    /// Get the WebSocket sender for external use
+    pub fn get_ws_sender(&self) -> Option<broadcast::Sender<String>> {
+        self.logger.get_ws_sender()
     }
 
     // Main flow
@@ -72,24 +80,32 @@ impl ExecutionEngine {
         siblings: &HashMap<String, ShAction>) -> Result<ShAction> {
         
         // 1) Instantiate and assign the inputs according to the types specified
-        self.instantiate_and_assign_io(&mut action.inputs, &inputs, &action.types)?;
+        self.assign_io(&mut action.inputs, &inputs, &action.types)?;
 
         // Base condition.
-        // Interesting to note that flow control actions are also considered to be wasm or docker actions.
-        if action.kind == "wasm" || action.kind == "docker" || action.flow_control {
+        if action.kind == "wasm" || action.kind == "docker" {
             println!("Executing {} wasm step: {}", action.kind, action.name);
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
             
             // Serialize the instantiated inputs
             let inputs_value = serde_json::to_value(&action.inputs)?;
-            let result = wasm::run_wasm_step(
-                action, 
-                &inputs_value, 
-                &self.cache_dir,
-                &|msg, id| self.logger.log_info(msg, id),
-                &|msg, id| self.logger.log_success(msg, id),
-                &|msg, id| self.logger.log_error(msg, id),
-            ).await?;
+
+            let mut result = Vec::new();
+            if   action.kind == "wasm" {
+                result = wasm::run_wasm_step(
+                    action, 
+                    &inputs_value, 
+                    &self.cache_dir,
+                    &|msg, id| self.logger.log_info(msg, id),
+                    &|msg, id| self.logger.log_success(msg, id),
+                    &|msg, id| self.logger.log_error(msg, id),
+                ).await?;
+            } else if action.kind == "docker" {
+                // TODO: Implement docker step execution
+                return Err(anyhow::anyhow!("Docker step execution not implemented"));
+            } else {
+                return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
+            }
             
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
 
@@ -99,9 +115,9 @@ impl ExecutionEngine {
             } else {
                 if let Some(first_result) = result.first() {
                     if let Some(array) = first_result.as_array() {
-                        array.iter().map(|item| Self::parse_json_strings(item.clone())).collect()
+                        array.iter().map(|item| Self::parse(item.clone())).collect()
                     } else {
-                        vec![Self::parse_json_strings(first_result.clone())]
+                        vec![Self::parse(first_result.clone())]
                     }
                 } else {
                     Vec::new()
@@ -111,7 +127,7 @@ impl ExecutionEngine {
             let mut action_state_clone = action.clone();
             
             // Instantiate and assign the outputs
-            self.instantiate_and_assign_io(&mut action_state_clone.outputs, &json_objects, &action.types)?;
+            self.assign_io(&mut action_state_clone.outputs, &json_objects, &action.types)?;
 
             return Ok(action_state_clone);
         }
@@ -128,10 +144,10 @@ impl ExecutionEngine {
             
             println!("Checking if all parent outputs can be resolved");
             // 1. Check if all parent outputs can be resolved
-            if self.can_resolve_all_final_outputs(action)? {
-                println!("All outputs can be resolved");
-                break; // We're done!
-            }
+            // if self.can_resolve_all_final_outputs(action)? {
+            //     println!("All outputs can be resolved");
+            //     break; // We're done!
+            // }
 
             println!("Finding next executable step");
             
@@ -170,7 +186,6 @@ impl ExecutionEngine {
                 // Update the action state with the processed child
                 action.steps.insert(next_step_id.clone(), processed_child);
                 
-                
                 self.logger.log_success(&format!("Completed step: {}", next_step_id), Some(&action.id));
                 
             } else {
@@ -190,26 +205,27 @@ impl ExecutionEngine {
         )?;
 
         // Assign resolved outputs to their corresponding fields
-        self.instantiate_and_assign_io(&mut action.outputs, &resolved_outputs, &action.types)?;
+        self.assign_io(&mut action.outputs, &resolved_outputs, &action.types)?;
 
         return Ok(action.clone());
     }
 
-    fn parse_json_strings(value: Value) -> Value {
+    /// Parses a value to a JSON object or array
+    fn parse(value: Value) -> Value {
         match value {
             Value::Object(mut obj) => {
                 for (_, val) in obj.iter_mut() {
-                    *val = Self::parse_json_strings(val.clone());
+                    *val = Self::parse(val.clone());
                 }
                 Value::Object(obj)
             },
             Value::Array(arr) => {
-                Value::Array(arr.into_iter().map(Self::parse_json_strings).collect())
+                Value::Array(arr.into_iter().map(Self::parse).collect())
             },
             Value::String(s) => {
                 // Try to parse as JSON
                 if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
-                    Self::parse_json_strings(parsed)
+                    Self::parse(parsed)
                 } else {
                     Value::String(s)
                 }
@@ -219,20 +235,20 @@ impl ExecutionEngine {
     }
 
     /// Instantiates and assigns values to IO fields in one operation
-    fn instantiate_and_assign_io(
+    fn assign_io(
         &self,
         io_fields: &mut Vec<ShIO>,
         input_values: &Vec<Value>,
         types: &Option<serde_json::Map<String, Value>>
     ) -> Result<()> {
-        let instantiated_values = self.instantiate(
+        let cast_values = self.cast(
             types,
             io_fields,
             input_values
         )?;
 
         for (index, io_field) in io_fields.iter_mut().enumerate() {
-            if let Some(resolved_value) = instantiated_values.get(index) {
+            if let Some(resolved_value) = cast_values.get(index) {
                 io_field.value = Some(resolved_value.clone());
             }
         }
@@ -240,7 +256,8 @@ impl ExecutionEngine {
         Ok(())
     }
 
-    fn instantiate(&self, types: &Option<serde_json::Map<String, Value>>, 
+    /// Casts values to the appropriate type
+    fn cast(&self, types: &Option<serde_json::Map<String, Value>>, 
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<Value>) -> Result<Vec<Value>> {
         let mut values_to_inject: Vec<Value> = Vec::new();
@@ -1743,7 +1760,7 @@ mod tests {
         let io_values = vec![json!("hello world")];
         let types = None;
         
-        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        let result = engine.cast(&types, &io_definitions, &io_values);
         assert!(result.is_ok(), "instantiate should succeed for string type");
         let instantiated = result.unwrap();
         assert_eq!(instantiated.len(), 1);
@@ -1761,7 +1778,7 @@ mod tests {
         ];
         let io_values = vec![json!(false)];
         
-        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        let result = engine.cast(&types, &io_definitions, &io_values);
         assert!(result.is_ok(), "instantiate should succeed for bool type");
         let instantiated = result.unwrap();
         assert_eq!(instantiated.len(), 1);
@@ -1779,7 +1796,7 @@ mod tests {
         ];
         let io_values = vec![json!(3.14)];
         
-        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        let result = engine.cast(&types, &io_definitions, &io_values);
         assert!(result.is_ok(), "instantiate should succeed for number type");
         let instantiated = result.unwrap();
         assert_eq!(instantiated.len(), 1);
@@ -1797,7 +1814,7 @@ mod tests {
         ];
         let io_values = vec![json!({"key": "value", "nested": {"inner": 123}})];
         
-        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        let result = engine.cast(&types, &io_definitions, &io_values);
         assert!(result.is_ok(), "instantiate should succeed for object type");
         let instantiated = result.unwrap();
         assert_eq!(instantiated.len(), 1);
@@ -2017,7 +2034,7 @@ mod tests {
         let io_values = vec![];
         let types = None;
         
-        let result = engine.instantiate(&types, &io_definitions, &io_values);
+        let result = engine.cast(&types, &io_definitions, &io_values);
         assert!(result.is_ok(), "instantiate should succeed for empty inputs");
         let instantiated = result.unwrap();
         assert_eq!(instantiated.len(), 0);
@@ -2046,7 +2063,7 @@ mod tests {
         ];
         let io_values = vec![json!("only_one_value")]; // Only one value for two definitions
         
-        let _result = engine.instantiate(&None, &io_definitions, &io_values);
+        let _result = engine.cast(&None, &io_definitions, &io_values);
         // This should panic due to unwrap() in the method when trying to access the second value
     }
 

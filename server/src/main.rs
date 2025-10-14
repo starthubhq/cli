@@ -43,10 +43,9 @@ struct AppState {
 
 impl AppState {
     fn new() -> Self {
-        let (ws_sender, _) = broadcast::channel(100);
-        
         // Initialize execution engine
-        let execution_engine = ExecutionEngine::new(Some(ws_sender.clone()));
+        let execution_engine = ExecutionEngine::new();
+        let ws_sender = execution_engine.get_ws_sender().unwrap();
         let execution_engine = Arc::new(Mutex::new(execution_engine));
         
         Self { 
