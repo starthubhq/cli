@@ -61,37 +61,47 @@ impl ExecutionEngine {
         ).await?;     
 
         // 1) Instantiate and assign the inputs according to the types specified
-        let injected_inputs = self.inject_values(
+        let inputs_to_inject = self.instantiate_io(
             &root_action.inputs,
             &inputs, 
             &root_action.types)?;
         
         // Create a new action with injected inputs (avoiding deep clone)
-        let mut new_root_action = ShAction {
-            inputs: injected_inputs,
+        let new_root_action = ShAction {
+            inputs: inputs_to_inject,
             ..root_action
-        };
+        };        
 
         self.logger.log_success("Action tree built successfully", Some(&new_root_action.id));
 
         self.logger.log_info("Executing action tree...", Some(&new_root_action.id));
-        let outputs = self.run_action_tree(&mut new_root_action).await?;
+        let executed_action = self.run_action_tree(&new_root_action).await?;
         self.logger.log_success("Action execution completed", Some(&new_root_action.id));
+
+        // Extract outputs from the executed action
+        let outputs: Vec<Value> = executed_action.outputs.iter()
+            .map(|io| io.value.clone().unwrap_or(Value::Null))
+            .collect();
 
         // Return the outputs directly
         Ok(serde_json::to_value(outputs)?)
     }
 
-    async fn run_action_tree(&mut self, action: &ShAction) -> Result<Vec<Value>> {
+    async fn run_action_tree(&mut self, action: &ShAction) -> Result<ShAction> {
+        println!("Running recursive call for : {:?}", action.name);
         // Base condition.
         if action.kind == "wasm" || action.kind == "docker" {
-            println!("Executing {} wasm step: {}", action.kind, action.name);
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
+
+            // Extract values from inputs before serializing
+            let input_values: Vec<Value> = action.inputs.iter()
+                .map(|io| io.value.clone().unwrap_or(Value::Null))
+                .collect();
 
             let result = if action.kind == "wasm" {
                 wasm::run_wasm_step(
                     action, 
-                    &serde_json::to_value(action.inputs.clone())?, 
+                    &serde_json::to_value(input_values)?, 
                     &self.cache_dir,
                     &|msg, id| self.logger.log_info(msg, id),
                     &|msg, id| self.logger.log_success(msg, id),
@@ -121,10 +131,19 @@ impl ExecutionEngine {
                 }
             };
 
-            self.inject_values(&action.outputs, &json_objects, &action.types)?;
+            // inject the outputs into the action
+            let updated_outputs = self.instantiate_io(
+                &action.outputs,
+                &json_objects,
+                &action.types
+            )?;
 
-            // Return the outputs directly
-            return Ok(json_objects);
+            let updated_action = ShAction {
+                outputs: updated_outputs,
+                ..action.clone()
+            };
+            
+            return Ok(updated_action);
         }
 
         
@@ -139,7 +158,7 @@ impl ExecutionEngine {
                     &action.inputs,
                     &action.steps
                 ) {
-                    let inputs_to_inject = self.inject_values(
+                    let inputs_to_inject = self.instantiate_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
                         &step.types).ok();
@@ -160,71 +179,75 @@ impl ExecutionEngine {
                     (step_id.clone(), step.clone())
                 }
             })
-            .collect();
+            .collect();        
 
         // Create a new action with the updated steps
-        let updated_action = ShAction {
+        let action_with_inputs_resolved_into_steps = ShAction {
             steps: updated_steps,
             ..action.clone()
         };
-
+        
         // Now that we have injected the input values into the steps wherever it's possible, we
         // also want to find the ready steps for the first iteration. Since it's the
         // first iteration, there is no "current step id" yet.
-        let ready_steps = self.find_ready_steps(&updated_action.steps)?;
+        let ready_step_ids = self.find_ready_step_ids(&action_with_inputs_resolved_into_steps.steps)?;
+        
+        // TODO: find a way to make this immutable.
+        execution_buffer.extend(ready_step_ids);
 
-        // We add the steps to the execution buffer, which is therefore seeded.
-        execution_buffer.extend(ready_steps);
-
-        return Ok(Vec::new());
+        
         
         // Now we can start the loop that will execute the steps starting
         // from the ones we have just found.
-        // let mut current_step_id = String::new();
-        // loop {
-        //     // If the execution buffer is empty, we break the loop. We are done
-        //     // processing all siblings within the same action.
-        //     if execution_buffer.is_empty() {
-        //         break;
-        //     }
+        let mut current_step_id = String::new();
+        loop {
+            // If the execution buffer is empty, we break the loop. We are done
+            // processing all siblings within the same action.
+            if execution_buffer.is_empty() {
+                break;
+            }
 
-        //     // Pop the first step from the execution buffer. FIFO.
-        //     current_step_id = execution_buffer.pop().unwrap();
-        //     println!("Processing step: {}", current_step_id);
-            
-        //     // Execute the step recursively
-        //     if let Some(step) = action.steps.get_mut(&current_step_id) {
-        //         // Since the step is coming from the execution buffer, it means that
-        //         // it is ready to be executed.
-        //         Box::pin(self.run_action_tree(step)).await?;
+            // Pop the first step from the execution buffer. FIFO.
+            current_step_id = execution_buffer.pop().unwrap();
+            // println!("Processing step: {}", current_step_id);
+
+            // Execute the step recursively
+            if let Some(step) = action_with_inputs_resolved_into_steps.steps.get(&current_step_id) {
+                // Since the step is coming from the execution buffer, it means that
+                // it is ready to be executed.
+                let executed_step = Box::pin(self.run_action_tree(step)).await?;
               
-        //         // For regular steps, find dependent steps and add ready ones to buffer
-        //         let dependent_ready_steps = self.find_dependent_ready_steps(&action.steps, &current_step_id, &action.inputs)?;
-        //         println!("Found dependent steps: {:?}", dependent_ready_steps);
+                // println!("Executed step: {:#?}", executed_step);
                 
+                // For regular steps, find dependent steps and add ready ones to buffer
+                let dependent_ready_steps = self.find_dependent_ready_steps_ids(&executed_step.steps,
+                    &current_step_id,
+                    &action.inputs)?;                
+                
+                // Run action tree updates the action tree with the outputs of the step.
+                let dependent_step_ids: Vec<String> = action.steps.iter()
+                    .filter(|(_, step)| self.step_depends_on(step, &current_step_id))
+                    .map(|(step_id, _)| step_id.clone())
+                    .collect();
+                
+                // For each dependent step, we want to inject the outputs of the step
+                // we have just executed into the inputs of the dependent step.
+                // for dep_step_id in dependent_step_ids {
+                //     if let Some(sibling) = action.steps.get(&dep_step_id) {
+                //         if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_io(
+                //             &sibling.inputs,
+                //             &action.inputs,
+                //             &action.steps
+                //         ) {                
+                //             // Only inject if resolution was successful
+                //             if let Some(step) = action.steps.get_mut(&dep_step_id) {
+                //                 self.inject_values(&mut step.inputs, &resolved_inputs_to_inject_into_child_step, &step.types)?;
+                //             }
+                //         }
+                //     }
+                // }
 
-        //         // Run action tree updates the action tree with the outputs of the step.
-        //         let dependent_step_ids: Vec<String> = action.steps.iter()
-        //             .filter(|(_, step)| self.step_depends_on(step, &current_step_id))
-        //             .map(|(step_id, _)| step_id.clone())
-        //             .collect();
-                
-        //         // For each dependent step, we want to inject the outputs of the step
-        //         // we have just executed into the inputs of the dependent step.
-        //         for dep_step_id in dependent_step_ids {
-        //             if let Some(sibling) = action.steps.get(&dep_step_id) {
-        //                 if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_io(
-        //                     &sibling.inputs,
-        //                     &action.inputs,
-        //                     &action.steps
-        //                 ) {                
-        //                     // Only inject if resolution was successful
-        //                     if let Some(step) = action.steps.get_mut(&dep_step_id) {
-        //                         self.inject_values(&mut step.inputs, &resolved_inputs_to_inject_into_child_step, &step.types)?;
-        //                     }
-        //                 }
-        //             }
-        //         }
+                return Ok(executed_step);
 
         //         // If it's a flow control step, find the next step to execute
         //         // among the dependent steps and add it to the execution buffer.
@@ -240,25 +263,28 @@ impl ExecutionEngine {
         //             // Otherwise, add add dependent steps to the execution buffer.
         //             execution_buffer.extend(dependent_ready_steps);
         //         }
-        //     }
+            }
             
         //     // Find dependent steps that are now ready and that depend on the step we have just executed.
         //     let dependent_ready_steps = self.find_dependent_ready_steps(&action.steps, &current_step_id, &action.inputs)?;
         //     execution_buffer.extend(dependent_ready_steps);
-        // }
+        }
 
         // // If we got here, it means that we have executed all the steps in the action tree.
         // // Now we need to aggregate the outputs back at the higher level.
-        // let resolved_outputs = self.resolve_io(
-        //     &action.outputs,
-        //     &action.inputs,
-        //     &action.steps
-        // ).ok_or_else(|| anyhow::anyhow!("Cannot resolve final outputs"))?;
+        let resolved_outputs = self.resolve_io(
+            &action.outputs,
+            &action.inputs,
+            &action.steps
+        ).ok_or_else(|| anyhow::anyhow!("Cannot resolve final outputs"))?;
 
-        // // Assign resolved outputs to their corresponding fields
-        // self.inject_values(&mut action.outputs, &resolved_outputs, &action.types)?;
+        // Create a new action with resolved outputs
+        let updated_action = ShAction {
+            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types)?,
+            ..action.clone()
+        };
 
-        // return Ok(resolved_outputs);
+        return Ok(updated_action);
     }
 
     /// Parses a value to a JSON object or array
@@ -286,16 +312,16 @@ impl ExecutionEngine {
     }
 
     /// Instantiates and assigns values to IO fields in one operation
-    fn inject_values(
+    fn instantiate_io(
         &self,
         io_fields: &Vec<ShIO>,
-        input_values: &Vec<Value>,
+        io_values: &Vec<Value>,
         types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Vec<ShIO>> {
         let cast_values = self.cast(
             types,
             io_fields,
-            input_values
+            io_values
         )?;
 
         let result = io_fields.iter()
@@ -316,7 +342,8 @@ impl ExecutionEngine {
     }
 
     /// Casts values to the appropriate type
-    fn cast(&self, types: &Option<serde_json::Map<String, Value>>, 
+    fn cast(&self,
+        types: &Option<serde_json::Map<String, Value>>, 
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<Value>) -> Result<Vec<Value>> {
         let mut values_to_inject: Vec<Value> = Vec::new();
@@ -985,7 +1012,7 @@ impl ExecutionEngine {
 
 
     /// Finds all ready steps - steps where all inputs are resolved and at least one output is not populated
-    fn find_ready_steps(
+    fn find_ready_step_ids(
         &self,
         steps: &HashMap<String, ShAction>,
     ) -> Result<Vec<String>> {
@@ -1011,28 +1038,31 @@ impl ExecutionEngine {
     }
 
     /// Finds steps that depend on a completed step and are now ready to execute
-    fn find_dependent_ready_steps(
+    fn find_dependent_ready_steps_ids(
         &self,
         steps: &HashMap<String, ShAction>,
-        completed_step_id: &str,
+        previous_step_id: &str,
         parent_inputs: &Vec<ShIO>,
     ) -> Result<Vec<String>> {
-        let mut dependent_ready_steps = Vec::new();
+        println!("Finding dependent ready steps ids for step: {}", previous_step_id);
+        println!("Steps: {:#?}", steps);
+        println!("Parent inputs: {:#?}", parent_inputs);
+        let mut dependent_ready_step_ids = Vec::new();
         
         for (step_id, step) in steps {
             // Skip if this is the step we just completed
-            if step_id == completed_step_id {
+            if step_id == previous_step_id {
                 continue;
             }
             
             // Check if this step depends on the completed step and is now ready
-            if self.step_depends_on(step, completed_step_id) && 
+            if self.step_depends_on(step, previous_step_id) && 
                self.can_resolve_step_inputs(step, parent_inputs, steps)? {
-                dependent_ready_steps.push(step_id.clone());
+                dependent_ready_step_ids.push(step_id.clone());
             }
         }
         
-        Ok(dependent_ready_steps)
+        Ok(dependent_ready_step_ids)
     }
 
     /// Checks if a step's inputs can be resolved
@@ -4072,7 +4102,7 @@ mod tests {
         ];
         let types1 = None;
         
-        let result1 = engine.inject_values(&io_fields1, &input_values1, &types1);
+        let result1 = engine.instantiate_io(&io_fields1, &input_values1, &types1);
         assert!(result1.is_ok());
         
         // Check that values were injected
@@ -4106,7 +4136,7 @@ mod tests {
             })
         ];
         
-        let result2 = engine.inject_values(&io_fields2, &input_values2, &types1);
+        let result2 = engine.instantiate_io(&io_fields2, &input_values2, &types1);
         assert!(result2.is_ok());
         
         // Check that values were injected
@@ -4152,7 +4182,7 @@ mod tests {
             user_obj
         })];
         
-        let result3 = engine.inject_values(&io_fields3, &input_values3, &types3);
+        let result3 = engine.instantiate_io(&io_fields3, &input_values3, &types3);
         assert!(result3.is_ok());
         
         // Check that value was injected
@@ -4186,7 +4216,7 @@ mod tests {
             })
         ];
         
-        let result4 = engine.inject_values(&io_fields4, &input_values4, &types3);
+        let result4 = engine.instantiate_io(&io_fields4, &input_values4, &types3);
         assert!(result4.is_ok());
         
         // Check that both values were injected
@@ -4211,7 +4241,7 @@ mod tests {
             user_obj
         })];
         
-        let result5 = engine.inject_values(&io_fields5, &input_values5, &types3);
+        let result5 = engine.instantiate_io(&io_fields5, &input_values5, &types3);
         assert!(result5.is_err());
         assert!(result5.unwrap_err().to_string().contains("Value 0 is invalid"));
         
@@ -4233,7 +4263,7 @@ mod tests {
         ];
         let input_values6 = vec![Value::String("test".to_string())];
         
-        let result6 = engine.inject_values(&io_fields6, &input_values6, &types6);
+        let result6 = engine.instantiate_io(&io_fields6, &input_values6, &types6);
         assert!(result6.is_err());
         assert!(result6.unwrap_err().to_string().contains("Failed to compile schema for type 'InvalidType'"));
         
@@ -4241,7 +4271,7 @@ mod tests {
         let io_fields7 = vec![];
         let input_values7 = vec![];
         
-        let result7 = engine.inject_values(&io_fields7, &input_values7, &types1);
+        let result7 = engine.instantiate_io(&io_fields7, &input_values7, &types1);
         assert!(result7.is_ok());
         
         // Test case 8: Unknown type (should pass through)
@@ -4256,7 +4286,7 @@ mod tests {
         ];
         let input_values8 = vec![Value::String("test_value".to_string())];
         
-        let result8 = engine.inject_values(&io_fields8, &input_values8, &types3);
+        let result8 = engine.instantiate_io(&io_fields8, &input_values8, &types3);
         assert!(result8.is_ok());
         
         // Check that value was injected (pass through behavior)
@@ -4303,7 +4333,7 @@ mod tests {
             })
         ])];
         
-        let result9 = engine.inject_values(&io_fields9, &input_values9, &types9);
+        let result9 = engine.instantiate_io(&io_fields9, &input_values9, &types9);
         assert!(result9.is_ok());
         
         // Check that value was injected
@@ -4322,7 +4352,7 @@ mod tests {
         ];
         let input_values10 = vec![Value::Null];
         
-        let result10 = engine.inject_values(&io_fields10, &input_values10, &types1);
+        let result10 = engine.instantiate_io(&io_fields10, &input_values10, &types1);
         assert!(result10.is_ok());
         
         // Check that null value was injected
@@ -4330,59 +4360,58 @@ mod tests {
         assert_eq!(injected_fields10[0].value, Some(Value::Null));
     }
 
-    // #[tokio::test]
-    // async fn test_execute_action_get_weather_by_location_name() {
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+    #[tokio::test]
+    async fn test_execute_action_get_weather_by_location_name() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing action with the same inputs as test_build_action_tree
-    //     let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
-    //     let inputs = vec![
-    //         json!({
-    //             "location_name": "Rome",
-    //             "open_weather_api_key": "f13e712db9557544db878888528a5e29"
-    //         })
-    //     ];
+        // Test executing action with the same inputs as test_build_action_tree
+        let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
+        let inputs = vec![
+            json!({
+                "location_name": "Rome",
+                "open_weather_api_key": "f13e712db9557544db878888528a5e29"
+            })
+        ];
         
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("result: {:#?}", result);
-    //     // println!("result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+        // println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
         
-    //     let action_tree = result.unwrap();
+        let action_tree = result.unwrap();
         
-    //     // Verify the root action structure
-    //     assert_eq!(action_tree["name"], "get-weather-by-location-name");
-    //     assert_eq!(action_tree["kind"], "composition");
-    //     assert_eq!(action_tree["uses"], action_ref);
-    //     assert!(action_tree["parent_action"].is_null());
+        // Verify the root action structure
+        assert_eq!(action_tree["name"], "get-weather-by-location-name");
+        assert_eq!(action_tree["kind"], "composition");
+        assert_eq!(action_tree["uses"], action_ref);
+        assert!(action_tree["parent_action"].is_null());
         
-    //     // Verify inputs
-    //     assert!(action_tree["inputs"].is_array());
-    //     let inputs_array = action_tree["inputs"].as_array().unwrap();
-    //     assert_eq!(inputs_array.len(), 1);
-    //     let input = &inputs_array[0];
-    //     assert_eq!(input["name"], "weather_config");
-    //     assert_eq!(input["type"], "WeatherConfig");
+        // Verify inputs
+        assert!(action_tree["inputs"].is_array());
+        let inputs_array = action_tree["inputs"].as_array().unwrap();
+        assert_eq!(inputs_array.len(), 1);
+        let input = &inputs_array[0];
+        assert_eq!(input["name"], "weather_config");
+        assert_eq!(input["type"], "WeatherConfig");
         
-    //     // Verify outputs
-    //     assert!(action_tree["outputs"].is_array());
-    //     let outputs_array = action_tree["outputs"].as_array().unwrap();
-    //     assert_eq!(outputs_array.len(), 1);
-    //     let output = &outputs_array[0];
-    //     assert_eq!(output["name"], "response");
-    //     assert_eq!(output["type"], "CustomWeatherResponse");
+        // Verify outputs
+        assert!(action_tree["outputs"].is_array());
+        let outputs_array = action_tree["outputs"].as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        let output = &outputs_array[0];
+        assert_eq!(output["name"], "response");
+        assert_eq!(output["type"], "CustomWeatherResponse");
         
-    //     // Execution order is now determined dynamically at runtime
+        // Execution order is now determined dynamically at runtime
         
-    //     // Verify types are present
-    //     assert!(action_tree["types"].is_object());
-    //     let types = action_tree["types"].as_object().unwrap();
-    //     assert!(types.contains_key("WeatherConfig"));
-    //     assert!(types.contains_key("CustomWeatherResponse"));
-    // }
+        // Verify types are present
+        assert!(action_tree["types"].is_object());
+        let types = action_tree["types"].as_object().unwrap();
+        assert!(types.contains_key("WeatherConfig"));
+        assert!(types.contains_key("CustomWeatherResponse"));
+    }
 
     // #[tokio::test]
     // async fn test_execute_action_create_do_project() {
