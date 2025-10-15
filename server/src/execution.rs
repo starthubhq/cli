@@ -76,9 +76,7 @@ impl ExecutionEngine {
 
         self.logger.log_info("Executing action tree...", Some(&new_root_action.id));
         let executed_action = self.run_action_tree(&new_root_action).await?;
-        println!("returned from recursive call xxx");
-        println!("executed_action: {:#?}", executed_action);
-        println!("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&");
+        
         self.logger.log_success("Action execution completed", Some(&new_root_action.id));
 
         // Extract outputs from the executed action
@@ -91,7 +89,6 @@ impl ExecutionEngine {
     }
 
     async fn run_action_tree(&mut self, action: &ShAction) -> Result<ShAction> {
-        println!("Running recursive call for : {:?} with kind: {}", action.name, action.kind);
         // Base condition.
         if action.kind == "wasm" || action.kind == "docker" {
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
@@ -100,7 +97,6 @@ impl ExecutionEngine {
             let input_values: Vec<Value> = action.inputs.iter()
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
                 .collect();
-            println!("Input values: {:#?}", input_values);
 
             let result = if action.kind == "wasm" {
                 wasm::run_wasm_step(
@@ -182,7 +178,6 @@ impl ExecutionEngine {
         // At this point we have executed all the steps of the current action.
         // Since now we returned to the parent, we need to aggregate the outputs back at the higher level.
 
-        print!("action name: {}", action.name);
         // The outputs could be coming from the parent inputs or the sibling steps.
         let resolved_outputs = self.resolve_outputs(
             &action.outputs,
@@ -212,9 +207,7 @@ impl ExecutionEngine {
         execution_buffer: Vec<String>,
     ) -> Result<HashMap<String, ShAction>> {
         // Functional execution using a recursive approach
-        println!("DEBUG: iterate_through_siblings called with buffer: {:?}", execution_buffer);
         if execution_buffer.is_empty() {
-            println!("DEBUG: Buffer is empty, returning steps");
             Ok(action.steps)
         } else {
             // Get the first step and create a new buffer without it
@@ -227,9 +220,7 @@ impl ExecutionEngine {
             if let Some(step) = action.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
-                println!("just before executing the step with id: {}", current_step_id);
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
-                println!("just after executing the step with id: {}", current_step_id);
                 // Once we have executed the step, we want to update the corresponding step
                 // in the current action.
                 let updated_steps: HashMap<String, ShAction> = action.steps.iter()
@@ -267,10 +258,8 @@ impl ExecutionEngine {
                 let new_execution_buffer = [remaining_buffer, downstream_ready_step_keys].concat();
                 
                  // Recursively continue with the updated state
-                 println!("DEBUG: Recursing with new buffer: {:?}", new_execution_buffer);
                  Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await
              } else {
-                 println!("DEBUG: No step found, recursing with remaining buffer: {:?}", remaining_buffer);
                  Box::pin(self.process_steps(action, remaining_buffer)).await
              }
         }
@@ -434,11 +423,7 @@ impl ExecutionEngine {
         output_definitions: &Vec<ShIO>,
         action_inputs: &Vec<ShIO>,
         executed_steps: &HashMap<String, ShAction>
-    ) -> Result<Vec<Value>, anyhow::Error> {
-        println!("Resolving outputs: {:#?}", output_definitions);
-        println!("Action inputs: {:#?}", action_inputs);
-        println!("Executed steps: {:#?}", executed_steps);
-        
+    ) -> Result<Vec<Value>, anyhow::Error> {        
         // Extract values from action inputs
         let input_values: Vec<Value> = action_inputs.iter()
             .map(|io| io.value.clone().unwrap_or(Value::Null))
@@ -461,32 +446,6 @@ impl ExecutionEngine {
         resolved_outputs
     }
 
-    fn resolve_from_sibling_outputs(
-        &self,
-        io_definitions: &Vec<ShIO>,
-        executed_steps: &HashMap<String, ShAction>
-    ) -> Option<Vec<Value>> {
-        // println!("Resolving from sibling outputs: {:#?}", io_definitions);
-        // println!("Executed steps: {:#?}", executed_steps);
-        // For every definition, resolve its template using executed steps
-        let resolved_values: Result<Vec<Value>, ()> = io_definitions.iter()
-            .map(|definition| {
-                // Resolve the template using executed steps (no parent inputs needed)
-                self.interpolate_from_sibling_outputs(&definition.template, executed_steps)
-                    .map_err(|_| ()) // Convert interpolation errors to () first
-                    .and_then(|interpolated_template| {
-                        // Check if the resolved template still contains unresolved templates
-                        if self.contains_unresolved_templates(&interpolated_template) {
-                            Err(()) // Cannot resolve this step yet
-                        } else {
-                            Ok(interpolated_template)
-                        }
-                    })
-            })
-            .collect();
-
-        resolved_values.ok()
-    }
 
     fn resolve_parent_input_or_sibling_output_into_steps(
         &self,
@@ -597,59 +556,6 @@ impl ExecutionEngine {
         }
     }
 
-    fn interpolate_from_sibling_outputs(&self, 
-        template: &Value, 
-        executed_steps: &HashMap<String, ShAction>
-    ) -> Result<Value> {
-        match template {
-            Value::String(s) => {
-                // Use interpolate_steps_string to handle step outputs only
-                let resolved = self.interpolate_string_from_sibling_output(s, executed_steps)?;
-                
-                // Check if the resolved string is actually a JSON object/array
-                // by trying to parse it as JSON
-                match serde_json::from_str::<Value>(&resolved) {
-                    Ok(parsed_value) => {
-                        // If it's a JSON object or array, return it as-is
-                        // If it's a primitive (string, number, boolean, null), 
-                        // we need to decide whether to keep it as the primitive or as a string
-                        match parsed_value {
-                            Value::Object(_) | Value::Array(_) => Ok(parsed_value),
-                            _ => {
-                                // For primitives, always return the parsed value
-                                // This preserves the original type (number, boolean, null) from the JSON
-                                Ok(parsed_value)
-                            }
-                        }
-                    },
-                    Err(_) => {
-                        // Not valid JSON, return as string
-                        Ok(Value::String(resolved))
-                    }
-                }
-            },
-            Value::Object(obj) => {
-                // Recursively resolve object templates
-                let mut resolved_obj = serde_json::Map::new();
-                for (key, value) in obj {
-                    let resolved_value = self.interpolate_from_sibling_outputs(value, executed_steps)?;
-                    resolved_obj.insert(key.clone(), resolved_value);
-                }
-                
-                Ok(Value::Object(resolved_obj))
-            },
-            Value::Array(arr) => {
-                // Recursively resolve array templates
-                let mut resolved_arr = Vec::new();
-                for item in arr {
-                    let resolved_item = self.interpolate_from_sibling_outputs(item, executed_steps)?;
-                    resolved_arr.push(resolved_item);
-                }
-                Ok(Value::Array(resolved_arr))
-            },
-            _ => Ok(template.clone())
-        }
-    }
 
     fn interpolate_string_from_parent_input(&self, 
         template: &str, 
@@ -1159,29 +1065,6 @@ impl ExecutionEngine {
         }
     }
 
-    /// Checks if all parent outputs can be resolved using the action tree
-    fn can_resolve_all_final_outputs(
-        &self,
-        action: &ShAction,
-    ) -> Result<bool> {
-        // Use resolve_io to get the resolved outputs
-        let resolved_outputs = match self.resolve_from_parent_inputs(
-            &action.outputs,
-            &action.inputs,
-        ) {
-            Some(outputs) => outputs,
-            None => return Ok(false), // Cannot resolve outputs yet
-        };
-        
-        // Check if any resolved output still contains template syntax ({{ or }})
-        for output in resolved_outputs {
-            if self.contains_unresolved_templates(&output) {
-                return Ok(false); // Found unresolved templates
-            }
-        }
-        
-        Ok(true) // All outputs are fully resolved
-    }
     
     /// Checks if a value contains unresolved template syntax
     fn contains_unresolved_templates(&self, value: &Value) -> bool {
@@ -1208,29 +1091,6 @@ impl ExecutionEngine {
     }
 
 
-    /// Finds ready siblings - steps where all inputs are resolved and at least one output is not populated
-    fn find_ready_siblings(
-        &self,
-        steps: &HashMap<String, ShAction>,
-    ) -> Result<Option<String>> {
-        for (step_id, step) in steps {
-            // Check if all inputs have been resolved (every input has a "value" field populated)
-            let all_inputs_resolved = step.inputs.iter().all(|input| {
-                input.value.is_some()
-            });
-
-            // Check if at least one output has not been populated yet
-            let has_unresolved_outputs = step.outputs.iter().any(|output| {
-                output.value.is_none()
-            });
-
-            if all_inputs_resolved && has_unresolved_outputs {
-                return Ok(Some(step_id.clone()));
-            }
-        }
-        
-        Ok(None)
-    }
 
 
     /// Finds all ready steps - steps where all inputs are resolved and at least one output is not populated
@@ -1399,36 +1259,6 @@ impl ExecutionEngine {
             .collect()
     }
 
-    fn refresh_sibling_io_resolution(&self, steps: &HashMap<String, ShAction>) -> HashMap<String, ShAction> {
-        steps.iter()
-            .map(|(step_id, step)| {
-                if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_from_sibling_outputs(
-                    &step.inputs,
-                    steps
-                ) {
-                    let inputs_to_inject = self.instantiate_io(
-                        &step.inputs, 
-                        &resolved_inputs_to_inject_into_child_step,
-                        &step.types).ok();
-                    
-                    if let Some(inputs_to_inject) = inputs_to_inject {
-                        // Create new step with injected inputs
-                        let new_step = ShAction {
-                            inputs: inputs_to_inject,
-                            ..step.clone()
-                        };
-                        (step_id.clone(), new_step)
-                    } else {
-                        // Keep original step if injection failed
-                        (step_id.clone(), step.clone())
-                    }
-                } else {
-                    // Keep original step if resolution failed
-                    (step_id.clone(), step.clone())
-                }
-            })
-            .collect()
-    }
 }
 
 #[cfg(test)]
@@ -4964,37 +4794,24 @@ mod tests {
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
         
-        let action_tree = result.unwrap();
+        let outputs = result.unwrap();
         
-        // Verify the root action structure
-        assert_eq!(action_tree["name"], "get-weather-by-location-name");
-        assert_eq!(action_tree["kind"], "composition");
-        assert_eq!(action_tree["uses"], action_ref);
-        assert!(action_tree["parent_action"].is_null());
-        
-        // Verify inputs
-        assert!(action_tree["inputs"].is_array());
-        let inputs_array = action_tree["inputs"].as_array().unwrap();
-        assert_eq!(inputs_array.len(), 1);
-        let input = &inputs_array[0];
-        assert_eq!(input["name"], "weather_config");
-        assert_eq!(input["type"], "WeatherConfig");
-        
-        // Verify outputs
-        assert!(action_tree["outputs"].is_array());
-        let outputs_array = action_tree["outputs"].as_array().unwrap();
+        // The function returns an array of output values directly
+        assert!(outputs.is_array());
+        let outputs_array = outputs.as_array().unwrap();
         assert_eq!(outputs_array.len(), 1);
+        
         let output = &outputs_array[0];
-        assert_eq!(output["name"], "response");
-        assert_eq!(output["type"], "CustomWeatherResponse");
+        assert!(output.is_object());
+        let output_obj = output.as_object().unwrap();
         
-        // Execution order is now determined dynamically at runtime
-        
-        // Verify types are present
-        assert!(action_tree["types"].is_object());
-        let types = action_tree["types"].as_object().unwrap();
-        assert!(types.contains_key("WeatherConfig"));
-        assert!(types.contains_key("CustomWeatherResponse"));
+        // Verify the output has the expected structure with location_name and weather
+        assert!(output_obj.contains_key("location_name"));
+        assert!(output_obj.contains_key("weather"));
+        assert_eq!(output_obj["location_name"], "Rome");
+        // Weather description can vary, just check it's a non-empty string
+        assert!(output_obj["weather"].is_string());
+        assert!(!output_obj["weather"].as_str().unwrap().is_empty());
     }
 
     // #[tokio::test]
