@@ -76,6 +76,9 @@ impl ExecutionEngine {
 
         self.logger.log_info("Executing action tree...", Some(&new_root_action.id));
         let executed_action = self.run_action_tree(&new_root_action).await?;
+        println!("returned from recursive call xxx");
+        println!("executed_action: {:#?}", executed_action);
+        println!("&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&");
         self.logger.log_success("Action execution completed", Some(&new_root_action.id));
 
         // Extract outputs from the executed action
@@ -88,7 +91,7 @@ impl ExecutionEngine {
     }
 
     async fn run_action_tree(&mut self, action: &ShAction) -> Result<ShAction> {
-        println!("Running recursive call for : {:?}", action.name);
+        println!("Running recursive call for : {:?} with kind: {}", action.name, action.kind);
         // Base condition.
         if action.kind == "wasm" || action.kind == "docker" {
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
@@ -97,6 +100,7 @@ impl ExecutionEngine {
             let input_values: Vec<Value> = action.inputs.iter()
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
                 .collect();
+            println!("Input values: {:#?}", input_values);
 
             let result = if action.kind == "wasm" {
                 wasm::run_wasm_step(
@@ -148,11 +152,10 @@ impl ExecutionEngine {
 
         
         let mut execution_buffer: Vec<String> = Vec::new();
-        let mut current_action = action.clone();
 
         // Initially, we want to inject the input values into the inputs of the steps.
         // This will help us understand what steps are ready to be executed.
-        let steps_with_injected_inputs = self.resolve_parent_inputs_into_steps(&action.inputs, &action.steps);
+        let steps_with_injected_inputs: HashMap<String, ShAction> = self.resolve_parent_inputs_into_steps(&action.inputs, &action.steps);
         let action_with_inputs_resolved_into_steps = ShAction {
             steps: steps_with_injected_inputs,
             ..action.clone()
@@ -166,27 +169,70 @@ impl ExecutionEngine {
         // TODO: find a way to make this immutable.
         execution_buffer.extend(ready_step_ids);
         
-        // Now we can start the loop that will execute the steps starting
-        // from the ones we have just found.
-        let mut current_step_id = String::new();
-        loop {
-            // If the execution buffer is empty, we break the loop. We are done
-            // processing all siblings within the same action.
-            if execution_buffer.is_empty() {
-                break;
-            }
+        // Now we can start the functional execution of steps
+        // Using a functional approach with a helper function
+        let processed_steps = self.process_steps(
+            action_with_inputs_resolved_into_steps.clone(),
+            execution_buffer,
+        ).await?;
 
-            // Pop the first step from the execution buffer. FIFO.
-            current_step_id = execution_buffer.pop().unwrap();
+        // println!("DEBUG: iterate_through_siblings returned successfully for step: {}", action.name);
+        
+        // println!("Processed steps: {:#?}", processed_steps);
+        // At this point we have executed all the steps of the current action.
+        // Since now we returned to the parent, we need to aggregate the outputs back at the higher level.
 
+        print!("action name: {}", action.name);
+        // The outputs could be coming from the parent inputs or the sibling steps.
+        let resolved_outputs = self.resolve_outputs(
+            &action.outputs,
+            &action.inputs,
+            &processed_steps
+        )?;
+
+        // println!("Resolved outputs: {:#?}", resolved_outputs);
+        // Create a new action with resolved outputs
+        let updated_action = ShAction {
+            steps: processed_steps,
+            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types)?,
+            ..action.clone()
+        };
+
+        // println!("Processed action: {:#?}", updated_action);
+        // println!("*********************************");
+        // // println!("Processed action: {:#?}", updated_action);
+        // println!("11111111111");
+        // println!("DEBUG: About to return from run_action_tree for step: ");
+        Ok(updated_action)
+    }
+
+    async fn process_steps(
+        &mut self,
+        action: ShAction,
+        execution_buffer: Vec<String>,
+    ) -> Result<HashMap<String, ShAction>> {
+        // Functional execution using a recursive approach
+        println!("DEBUG: iterate_through_siblings called with buffer: {:?}", execution_buffer);
+        if execution_buffer.is_empty() {
+            println!("DEBUG: Buffer is empty, returning steps");
+            Ok(action.steps)
+        } else {
+            // Get the first step and create a new buffer without it
+            let current_step_id = execution_buffer.first().unwrap().clone();
+
+            // We create a new buffer without the first step.
+            let remaining_buffer = execution_buffer.into_iter().skip(1).collect();
+            
             // Execute the step recursively
-            if let Some(step) = action_with_inputs_resolved_into_steps.steps.get(&current_step_id) {
+            if let Some(step) = action.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
+                println!("just before executing the step with id: {}", current_step_id);
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
+                println!("just after executing the step with id: {}", current_step_id);
                 // Once we have executed the step, we want to update the corresponding step
                 // in the current action.
-                let updated_steps: HashMap<String, ShAction> = action_with_inputs_resolved_into_steps.steps.iter()
+                let updated_steps: HashMap<String, ShAction> = action.steps.iter()
                     .map(|(id, step)| {
                         if id == &current_step_id {
                             (id.clone(), executed_step.clone())
@@ -196,75 +242,38 @@ impl ExecutionEngine {
                     })
                     .collect();
 
-                let action_with_executed_step = ShAction {
+                let action_with_udpated_steps = ShAction {
                     steps: updated_steps,
-                    ..action_with_inputs_resolved_into_steps.clone()
+                    ..action.clone()
                 };
-                                
-                // Run action tree updates the action tree with the outputs of the step.
-                // let dependent_step_ids: Vec<String> = action_with_executed_step.steps.iter()
-                //     .filter(|(_, step)| self.step_depends_on(step, &current_step_id))
-                //     .map(|(step_id, _)| step_id.clone())
-                //     .collect();
                                 
                 // For each dependent step, we want to inject the outputs of the step
                 // we have just executed into the inputs of the dependent step. This way,
                 // we collect all the updated steps and create a new action instance.
-                let updated_siblings: HashMap<String, ShAction> = self.resolve_parent_input_or_sibling_output_into_steps(&action_with_executed_step.inputs, &action_with_executed_step.steps);
-                current_action = ShAction {
+                let updated_siblings: HashMap<String, ShAction> = self.resolve_parent_input_or_sibling_output_into_steps(&action_with_udpated_steps.inputs, &action_with_udpated_steps.steps);
+                let updated_current_action = ShAction {
                     steps: updated_siblings,
-                    ..action_with_executed_step.clone()
+                    ..action_with_udpated_steps.clone()
                 };
 
                 // Now that we have injected all the possible parent/sibling values into
                 // the other siblings, we find the ready steps that are directly downstream of the
                 // step we have just executed and see if they are ready.
-                let downstream_ready_steps = self.find_downstream_ready_steps_keys(&current_action.steps,
+                let downstream_ready_step_keys = self.find_downstream_ready_steps_keys(&updated_current_action.steps,
                     &current_step_id,
-                    &current_action.inputs)?;                
+                    &updated_current_action.inputs)?;
 
-        //         // If it's a flow control step, find the next step to execute
-        //         // among the dependent steps and add it to the execution buffer.
-        //         if step.flow_control {
-        //             if let Some(first_output) = step.outputs.first() {
-        //                 if let Some(output_value) = &first_output.value {
-        //                     if let Some(output_id) = output_value.as_str() {
-        //                         execution_buffer.push(output_id.to_string());
-        //                     }
-        //                 }
-        //             }
-        //         } else {
-        //             // Otherwise, add add dependent steps to the execution buffer.
-        //             execution_buffer.extend(dependent_ready_steps);
-        //         }
-        //     // Find dependent steps that are now ready and that depend on the step we have just executed.
-                // let dependent_ready_steps = self.find_dependent_ready_steps(&action.steps, &current_step_id, &action.inputs)?;
-
-                execution_buffer.extend(downstream_ready_steps);
-                println!("New execution buffer: {:#?}", execution_buffer);
-            }
+                // Create new buffer by combining remaining steps with new downstream steps
+                let new_execution_buffer = [remaining_buffer, downstream_ready_step_keys].concat();
+                
+                 // Recursively continue with the updated state
+                 println!("DEBUG: Recursing with new buffer: {:?}", new_execution_buffer);
+                 Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await
+             } else {
+                 println!("DEBUG: No step found, recursing with remaining buffer: {:?}", remaining_buffer);
+                 Box::pin(self.process_steps(action, remaining_buffer)).await
+             }
         }
-
-        println!("Execution buffer: {:#?}", execution_buffer);
-        println!("Current step id: {}", current_step_id);
-
-        // If we got here, it means that we have executed all the steps in the action tree.
-        // Now we need to aggregate the outputs back at the higher level.
-
-        // The outputs could be coming from the parent inputs or the sibling steps.
-        let resolved_outputs = self.resolve_outputs(
-            &action.outputs,
-            &current_action.inputs,
-            &current_action.steps
-        ).ok_or_else(|| anyhow::anyhow!("Cannot resolve final outputs"))?;
-
-        // Create a new action with resolved outputs
-        let updated_action = ShAction {
-            outputs: self.instantiate_io(&current_action.outputs, &resolved_outputs, &current_action.types)?,
-            ..current_action.clone()
-        };
-
-        return Ok(updated_action);
     }
 
     /// Parses a value to a JSON object or array
@@ -422,32 +431,34 @@ impl ExecutionEngine {
 
     fn resolve_outputs(
         &self,
-        io_definitions: &Vec<ShIO>,
+        output_definitions: &Vec<ShIO>,
         action_inputs: &Vec<ShIO>,
         executed_steps: &HashMap<String, ShAction>
-    ) -> Option<Vec<Value>> {
-        // First try to resolve from parent inputs
-        if let Some(parent_resolved) = self.resolve_from_parent_inputs(io_definitions, action_inputs) {
-            // Then try to resolve any remaining sibling references
-            if let Some(sibling_resolved) = self.resolve_from_sibling_outputs(io_definitions, executed_steps) {
-                // Combine both resolutions - parent inputs take precedence, then sibling outputs
-                Some(parent_resolved.into_iter().zip(sibling_resolved.into_iter())
-                    .map(|(parent_val, sibling_val)| {
-                        // If parent resolved to a non-template value, use it; otherwise use sibling
-                        if self.contains_unresolved_templates(&parent_val) {
-                            sibling_val
+    ) -> Result<Vec<Value>, anyhow::Error> {
+        println!("Resolving outputs: {:#?}", output_definitions);
+        println!("Action inputs: {:#?}", action_inputs);
+        println!("Executed steps: {:#?}", executed_steps);
+        
+        // Extract values from action inputs
+        let input_values: Vec<Value> = action_inputs.iter()
+            .map(|io| io.value.clone().unwrap_or(Value::Null))
+            .collect();
+
+        // Try to resolve each output using both parent inputs and sibling outputs
+        let resolved_outputs: Result<Vec<Value>, anyhow::Error> = output_definitions.iter()
+            .map(|output_io| {
+                self.interpolate_from_parent_input_or_sibling_output(&output_io.template, &input_values, executed_steps)
+                    .and_then(|interpolated_template| {
+                        if self.contains_unresolved_templates(&interpolated_template) {
+                            Err(anyhow::anyhow!("Unresolved templates in output: {}", output_io.name))
                         } else {
-                            parent_val
+                            Ok(interpolated_template)
                         }
                     })
-                    .collect())
-            } else {
-                Some(parent_resolved)
-            }
-        } else {
-            // Fall back to sibling outputs only
-            self.resolve_from_sibling_outputs(io_definitions, executed_steps)
-        }
+            })
+            .collect();
+
+        resolved_outputs
     }
 
     fn resolve_from_sibling_outputs(
@@ -505,7 +516,6 @@ impl ExecutionEngine {
                     .collect();
 
                 if let Ok(resolved_inputs_to_inject_into_child_step) = resolved_inputs {
-                    println!("Resolved inputs to inject into child step: {:#?}", resolved_inputs_to_inject_into_child_step);
                     let inputs_to_inject = self.instantiate_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
@@ -534,6 +544,8 @@ impl ExecutionEngine {
         template: &Value, 
         variables: &Vec<Value>, 
     ) -> Result<Value> {
+        // println!("Interpolating from parent inputs: {:#?}", template);
+        // println!("Variables: {:#?}", variables);
         match template {
             Value::String(s) => {
                 // println!("resolve_template_string: {:#?}", s);
@@ -1265,12 +1277,8 @@ impl ExecutionEngine {
             
             let depends_on = self.step_depends_on(step, previous_step_id);
             let is_ready = self.are_all_inputs_ready(step, parent_inputs)?;
-            println!("Step: {:#?}", step);
-            println!("Depends on: {}", depends_on);
-            println!("Can resolve: {}", is_ready);
             // Check if this step depends on the completed step and is now ready
             if depends_on && is_ready {
-                println!("Dependent ready step id: {}", step_id);
                 dependent_ready_steps.push(step_id.clone());
             }
         }
@@ -1288,9 +1296,6 @@ impl ExecutionEngine {
         let all_inputs_resolved = step.inputs.iter().all(|input| {
             input.value.is_some()
         });
-        
-        println!("Step inputs: {:#?}", step.inputs);
-        println!("All inputs resolved: {}", all_inputs_resolved);
         
         Ok(all_inputs_resolved)
     }
@@ -1369,7 +1374,7 @@ impl ExecutionEngine {
                     &step.inputs,
                     action_inputs
                 ) {
-                    println!("Resolved inputs to inject into child step: {:#?}", resolved_inputs_to_inject_into_child_step);
+
                     let inputs_to_inject = self.instantiate_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
@@ -1401,7 +1406,6 @@ impl ExecutionEngine {
                     &step.inputs,
                     steps
                 ) {
-                    println!("Resolved inputs to inject into sibling step: {:#?}", resolved_inputs_to_inject_into_child_step);
                     let inputs_to_inject = self.instantiate_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
@@ -6087,50 +6091,50 @@ mod tests {
     //     // This should panic due to unwrap() in the method when trying to access the second value
     // }
 
-    // #[tokio::test]
-    // async fn test_execute_action_http_get_wasm() {
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+    #[tokio::test]
+    async fn test_execute_action_http_get_wasm() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing the http-get-wasm action directly
-    //     let action_ref = "starthubhq/http-get-wasm:0.0.16";
+        // Test executing the http-get-wasm action directly
+        let action_ref = "starthubhq/http-get-wasm:0.0.16";
         
-    //     // Test with URL and optional headers
-    //     let inputs = vec![
-    //         json!("https://api.restful-api.dev/objects"),  // URL
-    //         json!({  // Headers
-    //             "Accept": "application/json"
-    //         })
-    //     ];
+        // Test with URL and optional headers
+        let inputs = vec![
+            json!("https://api.restful-api.dev/objects"),  // URL
+            json!({  // Headers
+                "Accept": "application/json"
+            })
+        ];
         
-    //     println!("Testing http-get-wasm action with inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        println!("Testing http-get-wasm action with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("http-get-wasm test result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid http-get-wasm action_ref and inputs");
+        println!("http-get-wasm test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid http-get-wasm action_ref and inputs");
         
-    //     // let outputs = result.unwrap();
+        // let outputs = result.unwrap();
         
-    //     // // Verify that we got outputs
-    //     // assert!(outputs.is_array(), "execute_action should return an array of outputs");
-    //     // let outputs_array = outputs.as_array().unwrap();
+        // // Verify that we got outputs
+        // assert!(outputs.is_array(), "execute_action should return an array of outputs");
+        // let outputs_array = outputs.as_array().unwrap();
         
-    //     // // For a WASM action, we expect at least one output
-    //     // assert!(!outputs_array.is_empty(), "WASM action should produce outputs");
+        // // For a WASM action, we expect at least one output
+        // assert!(!outputs_array.is_empty(), "WASM action should produce outputs");
         
-    //     // // Verify the output structure - should be an HTTP response
-    //     // let first_output = &outputs_array[0];
-    //     // assert!(first_output.is_object(), "Output should be an object");
+        // // Verify the output structure - should be an HTTP response
+        // let first_output = &outputs_array[0];
+        // assert!(first_output.is_object(), "Output should be an object");
         
-    //     // // Check if it's a valid HTTP response structure
-    //     // if let Some(response_obj) = first_output.as_object() {
-    //     //     // HTTP response should have status, headers, and body
-    //     //     assert!(response_obj.contains_key("status") || response_obj.contains_key("body") || 
-    //     //            response_obj.contains_key("headers"), 
-    //     //            "HTTP response should contain status, body, or headers");
-    //     // }
-    // }
+        // // Check if it's a valid HTTP response structure
+        // if let Some(response_obj) = first_output.as_object() {
+        //     // HTTP response should have status, headers, and body
+        //     assert!(response_obj.contains_key("status") || response_obj.contains_key("body") || 
+        //            response_obj.contains_key("headers"), 
+        //            "HTTP response should contain status, body, or headers");
+        // }
+    }
     
     
 }
