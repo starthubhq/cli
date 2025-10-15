@@ -220,25 +220,28 @@ impl ExecutionEngine {
             if let Some(step) = action.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
+
+                // We exeute the step recursively
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
+
                 // Once we have executed the step, we want to update the corresponding step
                 // in the current action.
                 let updated_steps: HashMap<String, ShAction> = action.steps.iter()
-                    .map(|(id, step)| {
-                        if id == &current_step_id {
-                            (id.clone(), executed_step.clone())
-                        } else {
-                            (id.clone(), step.clone())
-                        }
-                    })
-                    .collect();
+                .map(|(id, step)| {
+                    if id == &current_step_id {
+                        (id.clone(), executed_step.clone())
+                    } else {
+                        (id.clone(), step.clone())
+                    }
+                })
+                .collect();
 
                 let action_with_udpated_steps = ShAction {
                     steps: updated_steps,
                     ..action.clone()
                 };
-                                
-                // For each dependent step, we want to inject the outputs of the step
+
+                // For each sibling, we want to inject the outputs of the step
                 // we have just executed into the inputs of the dependent step. This way,
                 // we collect all the updated steps and create a new action instance.
                 let updated_siblings: HashMap<String, ShAction> = self.resolve_parent_input_or_sibling_output_into_steps(&action_with_udpated_steps.inputs, &action_with_udpated_steps.steps);
@@ -247,18 +250,46 @@ impl ExecutionEngine {
                     ..action_with_udpated_steps.clone()
                 };
 
-                // Now that we have injected all the possible parent/sibling values into
-                // the other siblings, we find the ready steps that are directly downstream of the
-                // step we have just executed and see if they are ready.
-                let downstream_ready_step_keys = self.find_downstream_ready_steps_keys(&updated_current_action.steps,
-                    &current_step_id,
-                    &updated_current_action.inputs)?;
+                // If the step we have just executed is a flow control step, we want to
+                // find the next step by using the first output of the step we have just executed.
+                if step.flow_control {
+                    if let Some(output) = executed_step.outputs.first() {
+                        if let Some(output_value) = &output.value {
+                            if let Some(output_value_str) = output_value.as_str() {
+                                let next_step_id = output_value_str;
 
-                // Create new buffer by combining remaining steps with new downstream steps
-                let new_execution_buffer = [remaining_buffer, downstream_ready_step_keys].concat();
-                
-                 // Recursively continue with the updated state
-                 Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await
+                                 // since steps are a HashMap, we can find the next step by using the next_step_id
+                                if let Some(_next_step) = action.steps.get(next_step_id) {
+                                    let new_execution_buffer = [remaining_buffer, vec![next_step_id.to_string()]].concat();
+                                    // Recursively continue with the updated state
+                                    Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await 
+                                } else {
+                                    Box::pin(self.process_steps(action, remaining_buffer)).await
+                                } 
+                            } else {
+                                Box::pin(self.process_steps(action, remaining_buffer)).await
+                            }
+                        } else {
+                            Box::pin(self.process_steps(action, remaining_buffer)).await
+                        }
+                    } else {
+                        Box::pin(self.process_steps(action, remaining_buffer)).await
+                    }
+                } else {
+                    // Now that we have injected all the possible parent/sibling values into
+                    // the other siblings, we find the ready steps that are directly downstream of the
+                    // step we have just executed and see if they are ready.
+                    let downstream_ready_step_keys = self.find_downstream_ready_steps_keys(
+                        &updated_current_action.steps,
+                        &current_step_id,
+                        &updated_current_action.inputs)?;
+
+                    // Create new buffer by combining remaining steps with new downstream steps
+                    let new_execution_buffer = [remaining_buffer, downstream_ready_step_keys].concat();
+                    
+                    // Recursively continue with the updated state
+                    Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await
+                }
              } else {
                  Box::pin(self.process_steps(action, remaining_buffer)).await
              }
