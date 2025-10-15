@@ -212,11 +212,38 @@ pub async fn download_wasm(
         return Ok(wasm_path);
     }
     
-    // Try to download from mirrors
     let client = reqwest::Client::new();
     
+    // First try the default registry
+    let parts: Vec<&str> = action_ref.split(':').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("Invalid action reference format: {}", action_ref));
+    }
+    
+    let (namespace_slug, version) = (parts[0], parts[1]);
+    let namespace_parts: Vec<&str> = namespace_slug.split('/').collect();
+    if namespace_parts.len() != 2 {
+        return Err(anyhow::anyhow!("Invalid namespace format: {}", namespace_slug));
+    }
+    
+    let (namespace, slug) = (namespace_parts[0], namespace_parts[1]);
+    let default_url = format!("https://api.starthub.so/storage/v1/object/public/artifacts/{}/{}/{}/artifact.zip", namespace, slug, version);
+    println!("Trying to download from default registry: {}", default_url);
+    
+    match try_download_from_url(&client, &default_url, &wasm_dir, &wasm_path).await {
+        Ok(path) => {
+            println!("Successfully downloaded from default registry");
+            return Ok(path);
+        },
+        Err(e) => {
+            println!("Failed to download from default registry: {}", e);
+        }
+    }
+    
+    // If default registry failed, try mirrors
     for mirror in mirrors {
-        let url = format!("{}/{}", mirror, action_ref);
+        // Use the mirror URL as-is since it already contains the full path
+        let url = mirror.clone();
         println!("Trying to download from mirror: {}", url);
         
         match try_download_from_url(&client, &url, &wasm_dir, &wasm_path).await {
@@ -231,19 +258,7 @@ pub async fn download_wasm(
         }
     }
     
-    // If all mirrors failed, try the default registry
-    let default_url = format!("https://registry.starthub.so/{}", action_ref);
-    println!("Trying to download from default registry: {}", default_url);
-    
-    match try_download_from_url(&client, &default_url, &wasm_dir, &wasm_path).await {
-        Ok(path) => {
-            println!("Successfully downloaded from default registry");
-            Ok(path)
-        },
-        Err(e) => {
-            Err(anyhow::anyhow!("Failed to download WASM file from all sources: {}", e))
-        }
-    }
+    Err(anyhow::anyhow!("Failed to download WASM file from all sources"))
 }
 
 /// Tries to download a WASM file from a specific URL

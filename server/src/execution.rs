@@ -148,42 +148,13 @@ impl ExecutionEngine {
 
         
         let mut execution_buffer: Vec<String> = Vec::new();
+        let mut current_action = action.clone();
 
         // Initially, we want to inject the input values into the inputs of the steps.
         // This will help us understand what steps are ready to be executed.
-        let updated_steps: HashMap<String, ShAction> = action.steps.iter()
-            .map(|(step_id, step)| {
-                if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_io(
-                    &step.inputs,
-                    &action.inputs,
-                    &action.steps
-                ) {
-                    let inputs_to_inject = self.instantiate_io(
-                        &step.inputs, 
-                        &resolved_inputs_to_inject_into_child_step,
-                        &step.types).ok();
-                    
-                    if let Some(inputs_to_inject) = inputs_to_inject {
-                        // Create new step with injected inputs
-                        let new_step = ShAction {
-                            inputs: inputs_to_inject,
-                            ..step.clone()
-                        };
-                        (step_id.clone(), new_step)
-                    } else {
-                        // Keep original step if injection failed
-                        (step_id.clone(), step.clone())
-                    }
-                } else {
-                    // Keep original step if resolution failed
-                    (step_id.clone(), step.clone())
-                }
-            })
-            .collect();        
-
-        // Create a new action with the updated steps
+        let steps_with_injected_inputs = self.resolve_parent_inputs_into_steps(&action.inputs, &action.steps);
         let action_with_inputs_resolved_into_steps = ShAction {
-            steps: updated_steps,
+            steps: steps_with_injected_inputs,
             ..action.clone()
         };
         
@@ -194,8 +165,6 @@ impl ExecutionEngine {
         
         // TODO: find a way to make this immutable.
         execution_buffer.extend(ready_step_ids);
-
-        
         
         // Now we can start the loop that will execute the steps starting
         // from the ones we have just found.
@@ -209,45 +178,50 @@ impl ExecutionEngine {
 
             // Pop the first step from the execution buffer. FIFO.
             current_step_id = execution_buffer.pop().unwrap();
-            // println!("Processing step: {}", current_step_id);
 
             // Execute the step recursively
             if let Some(step) = action_with_inputs_resolved_into_steps.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
-              
-                // println!("Executed step: {:#?}", executed_step);
-                
-                // For regular steps, find dependent steps and add ready ones to buffer
-                let dependent_ready_steps = self.find_dependent_ready_steps_ids(&executed_step.steps,
-                    &current_step_id,
-                    &action.inputs)?;                
-                
-                // Run action tree updates the action tree with the outputs of the step.
-                let dependent_step_ids: Vec<String> = action.steps.iter()
-                    .filter(|(_, step)| self.step_depends_on(step, &current_step_id))
-                    .map(|(step_id, _)| step_id.clone())
+                // Once we have executed the step, we want to update the corresponding step
+                // in the current action.
+                let updated_steps: HashMap<String, ShAction> = action_with_inputs_resolved_into_steps.steps.iter()
+                    .map(|(id, step)| {
+                        if id == &current_step_id {
+                            (id.clone(), executed_step.clone())
+                        } else {
+                            (id.clone(), step.clone())
+                        }
+                    })
                     .collect();
-                
-                // For each dependent step, we want to inject the outputs of the step
-                // we have just executed into the inputs of the dependent step.
-                // for dep_step_id in dependent_step_ids {
-                //     if let Some(sibling) = action.steps.get(&dep_step_id) {
-                //         if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_io(
-                //             &sibling.inputs,
-                //             &action.inputs,
-                //             &action.steps
-                //         ) {                
-                //             // Only inject if resolution was successful
-                //             if let Some(step) = action.steps.get_mut(&dep_step_id) {
-                //                 self.inject_values(&mut step.inputs, &resolved_inputs_to_inject_into_child_step, &step.types)?;
-                //             }
-                //         }
-                //     }
-                // }
 
-                return Ok(executed_step);
+                let action_with_executed_step = ShAction {
+                    steps: updated_steps,
+                    ..action_with_inputs_resolved_into_steps.clone()
+                };
+                                
+                // Run action tree updates the action tree with the outputs of the step.
+                // let dependent_step_ids: Vec<String> = action_with_executed_step.steps.iter()
+                //     .filter(|(_, step)| self.step_depends_on(step, &current_step_id))
+                //     .map(|(step_id, _)| step_id.clone())
+                //     .collect();
+                                
+                // For each dependent step, we want to inject the outputs of the step
+                // we have just executed into the inputs of the dependent step. This way,
+                // we collect all the updated steps and create a new action instance.
+                let updated_siblings: HashMap<String, ShAction> = self.resolve_parent_input_or_sibling_output_into_steps(&action_with_executed_step.inputs, &action_with_executed_step.steps);
+                current_action = ShAction {
+                    steps: updated_siblings,
+                    ..action_with_executed_step.clone()
+                };
+
+                // Now that we have injected all the possible parent/sibling values into
+                // the other siblings, we find the ready steps that are directly downstream of the
+                // step we have just executed and see if they are ready.
+                let downstream_ready_steps = self.find_downstream_ready_steps_keys(&current_action.steps,
+                    &current_step_id,
+                    &current_action.inputs)?;                
 
         //         // If it's a flow control step, find the next step to execute
         //         // among the dependent steps and add it to the execution buffer.
@@ -263,25 +237,31 @@ impl ExecutionEngine {
         //             // Otherwise, add add dependent steps to the execution buffer.
         //             execution_buffer.extend(dependent_ready_steps);
         //         }
-            }
-            
         //     // Find dependent steps that are now ready and that depend on the step we have just executed.
-        //     let dependent_ready_steps = self.find_dependent_ready_steps(&action.steps, &current_step_id, &action.inputs)?;
-        //     execution_buffer.extend(dependent_ready_steps);
+                // let dependent_ready_steps = self.find_dependent_ready_steps(&action.steps, &current_step_id, &action.inputs)?;
+
+                execution_buffer.extend(downstream_ready_steps);
+                println!("New execution buffer: {:#?}", execution_buffer);
+            }
         }
 
-        // // If we got here, it means that we have executed all the steps in the action tree.
-        // // Now we need to aggregate the outputs back at the higher level.
-        let resolved_outputs = self.resolve_io(
+        println!("Execution buffer: {:#?}", execution_buffer);
+        println!("Current step id: {}", current_step_id);
+
+        // If we got here, it means that we have executed all the steps in the action tree.
+        // Now we need to aggregate the outputs back at the higher level.
+
+        // The outputs could be coming from the parent inputs or the sibling steps.
+        let resolved_outputs = self.resolve_outputs(
             &action.outputs,
-            &action.inputs,
-            &action.steps
+            &current_action.inputs,
+            &current_action.steps
         ).ok_or_else(|| anyhow::anyhow!("Cannot resolve final outputs"))?;
 
         // Create a new action with resolved outputs
         let updated_action = ShAction {
-            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types)?,
-            ..action.clone()
+            outputs: self.instantiate_io(&current_action.outputs, &resolved_outputs, &current_action.types)?,
+            ..current_action.clone()
         };
 
         return Ok(updated_action);
@@ -410,11 +390,10 @@ impl ExecutionEngine {
     }
 
     /// Resolves IO definitions using input values and steps context
-    fn resolve_io(
+    fn resolve_from_parent_inputs(
         &self,
         io_definitions: &Vec<ShIO>,
         io_values: &Vec<ShIO>,
-        steps: &HashMap<String, ShAction>
     ) -> Option<Vec<Value>> {
         // Extract values from the input values vector
         let values: Vec<Value> = io_values.iter()
@@ -425,7 +404,7 @@ impl ExecutionEngine {
         let resolved_values: Result<Vec<Value>, ()> = io_definitions.iter()
             .map(|definition| {
                 // Resolve the template to get the actual value
-                self.interpolate(&definition.template, &values, steps)
+                self.interpolate_from_parent_inputs(&definition.template, &values)
                     .map_err(|_| ()) // Convert interpolation errors to () first
                     .and_then(|interpolated_template| {
                         // Check if the resolved template still contains unresolved templates
@@ -441,17 +420,124 @@ impl ExecutionEngine {
         resolved_values.ok()
     }
 
-    // Since the variables might becoming from the parent or the siblings, this
-    // function needs to know the parent inputs and the steps that have already been executed.
-    fn interpolate(&self, 
+    fn resolve_outputs(
+        &self,
+        io_definitions: &Vec<ShIO>,
+        action_inputs: &Vec<ShIO>,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Option<Vec<Value>> {
+        // First try to resolve from parent inputs
+        if let Some(parent_resolved) = self.resolve_from_parent_inputs(io_definitions, action_inputs) {
+            // Then try to resolve any remaining sibling references
+            if let Some(sibling_resolved) = self.resolve_from_sibling_outputs(io_definitions, executed_steps) {
+                // Combine both resolutions - parent inputs take precedence, then sibling outputs
+                Some(parent_resolved.into_iter().zip(sibling_resolved.into_iter())
+                    .map(|(parent_val, sibling_val)| {
+                        // If parent resolved to a non-template value, use it; otherwise use sibling
+                        if self.contains_unresolved_templates(&parent_val) {
+                            sibling_val
+                        } else {
+                            parent_val
+                        }
+                    })
+                    .collect())
+            } else {
+                Some(parent_resolved)
+            }
+        } else {
+            // Fall back to sibling outputs only
+            self.resolve_from_sibling_outputs(io_definitions, executed_steps)
+        }
+    }
+
+    fn resolve_from_sibling_outputs(
+        &self,
+        io_definitions: &Vec<ShIO>,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Option<Vec<Value>> {
+        // println!("Resolving from sibling outputs: {:#?}", io_definitions);
+        // println!("Executed steps: {:#?}", executed_steps);
+        // For every definition, resolve its template using executed steps
+        let resolved_values: Result<Vec<Value>, ()> = io_definitions.iter()
+            .map(|definition| {
+                // Resolve the template using executed steps (no parent inputs needed)
+                self.interpolate_from_sibling_outputs(&definition.template, executed_steps)
+                    .map_err(|_| ()) // Convert interpolation errors to () first
+                    .and_then(|interpolated_template| {
+                        // Check if the resolved template still contains unresolved templates
+                        if self.contains_unresolved_templates(&interpolated_template) {
+                            Err(()) // Cannot resolve this step yet
+                        } else {
+                            Ok(interpolated_template)
+                        }
+                    })
+            })
+            .collect();
+
+        resolved_values.ok()
+    }
+
+    fn resolve_parent_input_or_sibling_output_into_steps(
+        &self,
+        action_inputs: &Vec<ShIO>,
+        action_steps: &HashMap<String, ShAction>
+    ) -> HashMap<String, ShAction> {
+        // Extract values from action inputs
+        let input_values: Vec<Value> = action_inputs.iter()
+            .map(|io| io.value.clone().unwrap_or(Value::Null))
+            .collect();
+
+        action_steps.iter()
+            .map(|(step_id, step)| {
+                // Try to resolve each step's inputs using both parent inputs and sibling outputs
+                let resolved_inputs: Result<Vec<Value>, ()> = step.inputs.iter()
+                    .map(|input_io| {
+                        self.interpolate_from_parent_input_or_sibling_output(&input_io.template, &input_values, action_steps)
+                            .map_err(|_| ())
+                            .and_then(|interpolated_template| {
+                                if self.contains_unresolved_templates(&interpolated_template) {
+                                    Err(())
+                                } else {
+                                    Ok(interpolated_template)
+                                }
+                            })
+                    })
+                    .collect();
+
+                if let Ok(resolved_inputs_to_inject_into_child_step) = resolved_inputs {
+                    println!("Resolved inputs to inject into child step: {:#?}", resolved_inputs_to_inject_into_child_step);
+                    let inputs_to_inject = self.instantiate_io(
+                        &step.inputs, 
+                        &resolved_inputs_to_inject_into_child_step,
+                        &step.types).ok();
+                    
+                    if let Some(inputs_to_inject) = inputs_to_inject {
+                        // Create new step with injected inputs
+                        let new_step = ShAction {
+                            inputs: inputs_to_inject,
+                            ..step.clone()
+                        };
+                        (step_id.clone(), new_step)
+                    } else {
+                        // Keep original step if injection failed
+                        (step_id.clone(), step.clone())
+                    }
+                } else {
+                    // Keep original step if resolution failed
+                    (step_id.clone(), step.clone())
+                }
+            })
+            .collect()
+    }
+
+    fn interpolate_from_parent_inputs(&self, 
         template: &Value, 
         variables: &Vec<Value>, 
-        executed_steps: &HashMap<String, ShAction>
     ) -> Result<Value> {
         match template {
             Value::String(s) => {
                 // println!("resolve_template_string: {:#?}", s);
-                let resolved = self.interpolate_string(s, variables, executed_steps)?;
+                let resolved = self.interpolate_string_from_parent_input(s, variables)?;
                 
                 // Check if the resolved string is actually a JSON object/array
                 // by trying to parse it as JSON
@@ -479,7 +565,7 @@ impl ExecutionEngine {
                 // Recursively resolve object templates
                 let mut resolved_obj = serde_json::Map::new();
                 for (key, value) in obj {
-                    let resolved_value = self.interpolate(value, variables, executed_steps)?;
+                    let resolved_value = self.interpolate_from_parent_inputs(value, variables)?;
                     resolved_obj.insert(key.clone(), resolved_value);
                 }
                 
@@ -490,7 +576,7 @@ impl ExecutionEngine {
                 // Recursively resolve array templates
                 let mut resolved_arr = Vec::new();
                 for item in arr {
-                    let resolved_item = self.interpolate(item, variables, executed_steps)?;
+                    let resolved_item = self.interpolate_from_parent_inputs(item, variables)?;
                     resolved_arr.push(resolved_item);
                 }
                 Ok(Value::Array(resolved_arr))
@@ -499,10 +585,63 @@ impl ExecutionEngine {
         }
     }
 
-    fn interpolate_string(&self, 
-        template: &str, 
-        variables: &Vec<Value>, 
+    fn interpolate_from_sibling_outputs(&self, 
+        template: &Value, 
         executed_steps: &HashMap<String, ShAction>
+    ) -> Result<Value> {
+        match template {
+            Value::String(s) => {
+                // Use interpolate_steps_string to handle step outputs only
+                let resolved = self.interpolate_string_from_sibling_output(s, executed_steps)?;
+                
+                // Check if the resolved string is actually a JSON object/array
+                // by trying to parse it as JSON
+                match serde_json::from_str::<Value>(&resolved) {
+                    Ok(parsed_value) => {
+                        // If it's a JSON object or array, return it as-is
+                        // If it's a primitive (string, number, boolean, null), 
+                        // we need to decide whether to keep it as the primitive or as a string
+                        match parsed_value {
+                            Value::Object(_) | Value::Array(_) => Ok(parsed_value),
+                            _ => {
+                                // For primitives, always return the parsed value
+                                // This preserves the original type (number, boolean, null) from the JSON
+                                Ok(parsed_value)
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        // Not valid JSON, return as string
+                        Ok(Value::String(resolved))
+                    }
+                }
+            },
+            Value::Object(obj) => {
+                // Recursively resolve object templates
+                let mut resolved_obj = serde_json::Map::new();
+                for (key, value) in obj {
+                    let resolved_value = self.interpolate_from_sibling_outputs(value, executed_steps)?;
+                    resolved_obj.insert(key.clone(), resolved_value);
+                }
+                
+                Ok(Value::Object(resolved_obj))
+            },
+            Value::Array(arr) => {
+                // Recursively resolve array templates
+                let mut resolved_arr = Vec::new();
+                for item in arr {
+                    let resolved_item = self.interpolate_from_sibling_outputs(item, executed_steps)?;
+                    resolved_arr.push(resolved_item);
+                }
+                Ok(Value::Array(resolved_arr))
+            },
+            _ => Ok(template.clone())
+        }
+    }
+
+    fn interpolate_string_from_parent_input(&self, 
+        template: &str, 
+        variables: &Vec<Value>
     ) -> Result<String> {
         // Handle {{inputs[index]}} patterns (without jsonpath)
         let inputs_simple_re = regex::Regex::new(r"\{\{inputs\[(\d+)\]\}\}")?;
@@ -542,10 +681,17 @@ impl ExecutionEngine {
                 acc
             });
         
+        Ok(result)
+    }
+
+    fn interpolate_string_from_sibling_output(&self, 
+        template: &str, 
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Result<String> {
         // Handle {{steps.step_name.outputs[index]}} patterns (without jsonpath)
         let steps_simple_re = regex::Regex::new(r"\{\{steps\.([^.]+)\.outputs\[(\d+)\]\}\}")?;
-        let result = steps_simple_re.captures_iter(&result.clone())
-            .fold(result, |acc, cap| {
+        let result = steps_simple_re.captures_iter(template)
+            .fold(template.to_string(), |acc, cap| {
                 if let (Some(step_name), Some(index_str)) = (cap.get(1), cap.get(2)) {
                     if let Ok(index) = index_str.as_str().parse::<usize>() {
                         if let Some(step) = executed_steps.get(step_name.as_str()) {
@@ -603,6 +749,71 @@ impl ExecutionEngine {
             });
         
         Ok(result)
+    }
+
+    fn interpolate_string_from_parent_input_or_sibling_output(&self, 
+        template: &str, 
+        variables: &Vec<Value>,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Result<String> {
+        // First resolve parent inputs
+        let parent_resolved = self.interpolate_string_from_parent_input(template, variables)?;
+        
+        // Then resolve sibling outputs
+        let fully_resolved = self.interpolate_string_from_sibling_output(&parent_resolved, executed_steps)?;
+        
+        Ok(fully_resolved)
+    }
+
+    fn interpolate_from_parent_input_or_sibling_output(&self, 
+        template: &Value, 
+        variables: &Vec<Value>,
+        executed_steps: &HashMap<String, ShAction>
+    ) -> Result<Value> {
+        match template {
+            Value::String(s) => {
+                let resolved = self.interpolate_string_from_parent_input_or_sibling_output(s, variables, executed_steps)?;
+                
+                // Check if the resolved string is actually a JSON object/array
+                // by trying to parse it as JSON
+                match serde_json::from_str::<Value>(&resolved) {
+                    Ok(parsed_value) => {
+                        // If it's a JSON object or array, return it as-is
+                        // If it's a primitive (string, number, boolean, null), 
+                        // we need to decide whether to keep it as the primitive or as a string
+                        match parsed_value {
+                            Value::Object(_) | Value::Array(_) => Ok(parsed_value),
+                            _ => {
+                                // For primitives, always return the parsed value
+                                // This preserves the original type (number, boolean, null) from the JSON
+                                Ok(parsed_value)
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        // Not valid JSON, return as string
+                        Ok(Value::String(resolved))
+                    }
+                }
+            },
+            Value::Object(obj) => {
+                // Recursively resolve object templates
+                let mut resolved_obj = serde_json::Map::new();
+                for (key, value) in obj {
+                    let resolved_value = self.interpolate_from_parent_input_or_sibling_output(value, variables, executed_steps)?;
+                    resolved_obj.insert(key.to_string(), resolved_value);
+                }
+                Ok(Value::Object(resolved_obj))
+            },
+            Value::Array(arr) => {
+                // Recursively resolve array templates
+                let resolved_arr: Result<Vec<Value>> = arr.iter()
+                    .map(|item| self.interpolate_from_parent_input_or_sibling_output(item, variables, executed_steps))
+                    .collect();
+                Ok(Value::Array(resolved_arr?))
+            },
+            _ => Ok(template.clone())
+        }
     }
 
     fn evaluate_jsonpath(&self, value: &Value, jsonpath: &str) -> Result<Value> {
@@ -942,10 +1153,9 @@ impl ExecutionEngine {
         action: &ShAction,
     ) -> Result<bool> {
         // Use resolve_io to get the resolved outputs
-        let resolved_outputs = match self.resolve_io(
+        let resolved_outputs = match self.resolve_from_parent_inputs(
             &action.outputs,
             &action.inputs,
-            &action.steps
         ) {
             Some(outputs) => outputs,
             None => return Ok(false), // Cannot resolve outputs yet
@@ -1038,16 +1248,13 @@ impl ExecutionEngine {
     }
 
     /// Finds steps that depend on a completed step and are now ready to execute
-    fn find_dependent_ready_steps_ids(
+    fn find_downstream_ready_steps_keys(
         &self,
         steps: &HashMap<String, ShAction>,
         previous_step_id: &str,
         parent_inputs: &Vec<ShIO>,
     ) -> Result<Vec<String>> {
-        println!("Finding dependent ready steps ids for step: {}", previous_step_id);
-        println!("Steps: {:#?}", steps);
-        println!("Parent inputs: {:#?}", parent_inputs);
-        let mut dependent_ready_step_ids = Vec::new();
+        let mut dependent_ready_steps: Vec<String> = Vec::new();
         
         for (step_id, step) in steps {
             // Skip if this is the step we just completed
@@ -1055,28 +1262,37 @@ impl ExecutionEngine {
                 continue;
             }
             
+            
+            let depends_on = self.step_depends_on(step, previous_step_id);
+            let is_ready = self.are_all_inputs_ready(step, parent_inputs)?;
+            println!("Step: {:#?}", step);
+            println!("Depends on: {}", depends_on);
+            println!("Can resolve: {}", is_ready);
             // Check if this step depends on the completed step and is now ready
-            if self.step_depends_on(step, previous_step_id) && 
-               self.can_resolve_step_inputs(step, parent_inputs, steps)? {
-                dependent_ready_step_ids.push(step_id.clone());
+            if depends_on && is_ready {
+                println!("Dependent ready step id: {}", step_id);
+                dependent_ready_steps.push(step_id.clone());
             }
         }
         
-        Ok(dependent_ready_step_ids)
+        Ok(dependent_ready_steps)
     }
 
-    /// Checks if a step's inputs can be resolved
-    fn can_resolve_step_inputs(
+    /// Checks if all step inputs are ready (have values)
+    fn are_all_inputs_ready(
         &self,
         step: &ShAction,
-        parent_inputs: &Vec<ShIO>,
-        steps: &HashMap<String, ShAction>,
+        _parent_inputs: &Vec<ShIO>,
     ) -> Result<bool> {
-        // Try to resolve inputs for this step
-        match self.resolve_io(&step.inputs, parent_inputs, steps) {
-            Some(_) => Ok(true),
-            None => Ok(false),
-        }
+        // Check if all input values are populated (not null)
+        let all_inputs_resolved = step.inputs.iter().all(|input| {
+            input.value.is_some()
+        });
+        
+        println!("Step inputs: {:#?}", step.inputs);
+        println!("All inputs resolved: {}", all_inputs_resolved);
+        
+        Ok(all_inputs_resolved)
     }
 
     /// Checks if a step depends on another step (simplified dependency check)
@@ -1144,6 +1360,70 @@ impl ExecutionEngine {
         } else {
             Err(anyhow::anyhow!("Failed to download starthub-lock.json: {}", response.status()))
         }
+    }
+
+    fn resolve_parent_inputs_into_steps(&self, action_inputs: &Vec<ShIO>, action_steps: &HashMap<String, ShAction>) -> HashMap<String, ShAction> {
+        action_steps.iter()
+            .map(|(step_id, step)| {
+                if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_from_parent_inputs(
+                    &step.inputs,
+                    action_inputs
+                ) {
+                    println!("Resolved inputs to inject into child step: {:#?}", resolved_inputs_to_inject_into_child_step);
+                    let inputs_to_inject = self.instantiate_io(
+                        &step.inputs, 
+                        &resolved_inputs_to_inject_into_child_step,
+                        &step.types).ok();
+                    
+                    if let Some(inputs_to_inject) = inputs_to_inject {
+                        // Create new step with injected inputs
+                        let new_step = ShAction {
+                            inputs: inputs_to_inject,
+                            ..step.clone()
+                        };
+                        (step_id.clone(), new_step)
+                    } else {
+                        // Keep original step if injection failed
+                        (step_id.clone(), step.clone())
+                    }
+                } else {
+                    // Keep original step if resolution failed
+                    (step_id.clone(), step.clone())
+                }
+            })
+            .collect()
+    }
+
+    fn refresh_sibling_io_resolution(&self, steps: &HashMap<String, ShAction>) -> HashMap<String, ShAction> {
+        steps.iter()
+            .map(|(step_id, step)| {
+                if let Some(resolved_inputs_to_inject_into_child_step) = self.resolve_from_sibling_outputs(
+                    &step.inputs,
+                    steps
+                ) {
+                    println!("Resolved inputs to inject into sibling step: {:#?}", resolved_inputs_to_inject_into_child_step);
+                    let inputs_to_inject = self.instantiate_io(
+                        &step.inputs, 
+                        &resolved_inputs_to_inject_into_child_step,
+                        &step.types).ok();
+                    
+                    if let Some(inputs_to_inject) = inputs_to_inject {
+                        // Create new step with injected inputs
+                        let new_step = ShAction {
+                            inputs: inputs_to_inject,
+                            ..step.clone()
+                        };
+                        (step_id.clone(), new_step)
+                    } else {
+                        // Keep original step if injection failed
+                        (step_id.clone(), step.clone())
+                    }
+                } else {
+                    // Keep original step if resolution failed
+                    (step_id.clone(), step.clone())
+                }
+            })
+            .collect()
     }
 }
 
@@ -2131,8 +2411,8 @@ mod tests {
         // Test case 1: Simple input interpolation without jsonpath
         let template1 = "Hello {{inputs[0]}} world!";
         let variables1 = vec![Value::String("John".to_string())];
-        let executed_steps1 = HashMap::new();
-        let result1 = engine.interpolate_string(template1, &variables1, &executed_steps1).unwrap();
+        let executed_steps1: HashMap<String, ShAction> = HashMap::new();
+        let result1 = engine.interpolate_string_from_parent_input(template1, &variables1).unwrap();
         assert_eq!(result1, "Hello John world!");
         
         // Test case 2: Multiple input interpolations
@@ -2141,29 +2421,29 @@ mod tests {
             Value::String("Alice".to_string()),
             Value::String("Bob".to_string())
         ];
-        let executed_steps2 = HashMap::new();
-        let result2 = engine.interpolate_string(template2, &variables2, &executed_steps2).unwrap();
+        let executed_steps2: HashMap<String, ShAction> = HashMap::new();
+        let result2 = engine.interpolate_string_from_parent_input(template2, &variables2).unwrap();
         assert_eq!(result2, "Alice and Bob are friends");
         
         // Test case 3: Input interpolation with non-string values
         let template3 = "The number is {{inputs[0]}}";
         let variables3 = vec![Value::Number(serde_json::Number::from(42))];
-        let executed_steps3 = HashMap::new();
-        let result3 = engine.interpolate_string(template3, &variables3, &executed_steps3).unwrap();
+        let executed_steps3: HashMap<String, ShAction> = HashMap::new();
+        let result3 = engine.interpolate_string_from_parent_input(template3, &variables3).unwrap();
         assert_eq!(result3, "The number is 42");
         
         // Test case 4: Input interpolation with boolean values
         let template4 = "Status: {{inputs[0]}}";
         let variables4 = vec![Value::Bool(true)];
-        let executed_steps4 = HashMap::new();
-        let result4 = engine.interpolate_string(template4, &variables4, &executed_steps4).unwrap();
+        let executed_steps4: HashMap<String, ShAction> = HashMap::new();
+        let result4 = engine.interpolate_string_from_parent_input(template4, &variables4).unwrap();
         assert_eq!(result4, "Status: true");
         
         // Test case 5: Input interpolation with null values
         let template5 = "Value: {{inputs[0]}}";
         let variables5 = vec![Value::Null];
-        let executed_steps5 = HashMap::new();
-        let result5 = engine.interpolate_string(template5, &variables5, &executed_steps5).unwrap();
+        let executed_steps5: HashMap<String, ShAction> = HashMap::new();
+        let result5 = engine.interpolate_string_from_parent_input(template5, &variables5).unwrap();
         assert_eq!(result5, "Value: null");
         
         // Test case 6: Input interpolation with JSONPath
@@ -2174,8 +2454,8 @@ mod tests {
             map.insert("age".to_string(), Value::Number(serde_json::Number::from(30)));
             map
         })];
-        let executed_steps6 = HashMap::new();
-        let result6 = engine.interpolate_string(template6, &variables6, &executed_steps6).unwrap();
+        let executed_steps6: HashMap<String, ShAction> = HashMap::new();
+        let result6 = engine.interpolate_string_from_parent_input(template6, &variables6).unwrap();
         assert_eq!(result6, "Name: Charlie");
         
         // Test case 7: Input interpolation with nested JSONPath
@@ -2191,8 +2471,8 @@ mod tests {
             }));
             map
         })];
-        let executed_steps7 = HashMap::new();
-        let result7 = engine.interpolate_string(template7, &variables7, &executed_steps7).unwrap();
+        let executed_steps7: HashMap<String, ShAction> = HashMap::new();
+        let result7 = engine.interpolate_string_from_parent_input(template7, &variables7).unwrap();
         assert_eq!(result7, "City: New York");
         
         // Test case 8: Input interpolation with array access
@@ -2205,13 +2485,12 @@ mod tests {
             ]));
             map
         })];
-        let executed_steps8 = HashMap::new();
-        let result8 = engine.interpolate_string(template8, &variables8, &executed_steps8).unwrap();
+        let executed_steps8: HashMap<String, ShAction> = HashMap::new();
+        let result8 = engine.interpolate_string_from_parent_input(template8, &variables8).unwrap();
         assert_eq!(result8, "First item: apple");
         
         // Test case 9: Step output interpolation without jsonpath
         let template9 = "Result: {{steps.step1.outputs[0]}}";
-        let variables9 = vec![];
         let executed_steps9 = {
             let mut map = HashMap::new();
             let step1 = ShAction {
@@ -2239,12 +2518,11 @@ mod tests {
             map.insert("step1".to_string(), step1);
             map
         };
-        let result9 = engine.interpolate_string(template9, &variables9, &executed_steps9).unwrap();
+        let result9 = engine.interpolate_string_from_sibling_output(template9, &executed_steps9).unwrap();
         assert_eq!(result9, "Result: Hello from step1");
         
         // Test case 10: Step output interpolation with jsonpath
         let template10 = "Name: {{steps.step2.outputs[0].name}}";
-        let variables10 = vec![];
         let executed_steps10 = {
             let mut map = HashMap::new();
             let step2 = ShAction {
@@ -2277,7 +2555,7 @@ mod tests {
             map.insert("step2".to_string(), step2);
             map
         };
-        let result10 = engine.interpolate_string(template10, &variables10, &executed_steps10).unwrap();
+        let result10 = engine.interpolate_string_from_sibling_output(template10, &executed_steps10).unwrap();
         assert_eq!(result10, "Name: Eve");
         
         // Test case 11: Mixed input and step interpolation
@@ -2310,40 +2588,39 @@ mod tests {
             map.insert("step3".to_string(), step3);
             map
         };
-        let result11 = engine.interpolate_string(template11, &variables11, &executed_steps11).unwrap();
+        let result11 = engine.interpolate_string_from_parent_input(template11, &variables11).unwrap();
+        let result11 = engine.interpolate_string_from_sibling_output(&result11, &executed_steps11).unwrap();
         assert_eq!(result11, "Frank used hammer");
         
         // Test case 12: Template with no interpolation (should return unchanged)
         let template12 = "Hello world!";
         let variables12 = vec![];
-        let executed_steps12 = HashMap::new();
-        let result12 = engine.interpolate_string(template12, &variables12, &executed_steps12).unwrap();
+        let executed_steps12: HashMap<String, ShAction> = HashMap::new();
+        let result12 = engine.interpolate_string_from_parent_input(template12, &variables12).unwrap();
         assert_eq!(result12, "Hello world!");
         
         // Test case 13: Template with malformed interpolation (should leave unchanged)
         let template13 = "Hello {{inputs[0 world!";
         let variables13 = vec![Value::String("John".to_string())];
-        let executed_steps13 = HashMap::new();
-        let result13 = engine.interpolate_string(template13, &variables13, &executed_steps13).unwrap();
+        let executed_steps13: HashMap<String, ShAction> = HashMap::new();
+        let result13 = engine.interpolate_string_from_parent_input(template13, &variables13).unwrap();
         assert_eq!(result13, "Hello {{inputs[0 world!");
         
         // Test case 14: Input index out of bounds (should leave unchanged)
         let template14 = "Hello {{inputs[5]}} world!";
         let variables14 = vec![Value::String("John".to_string())];
-        let executed_steps14 = HashMap::new();
-        let result14 = engine.interpolate_string(template14, &variables14, &executed_steps14).unwrap();
+        let executed_steps14: HashMap<String, ShAction> = HashMap::new();
+        let result14 = engine.interpolate_string_from_parent_input(template14, &variables14).unwrap();
         assert_eq!(result14, "Hello {{inputs[5]}} world!");
         
         // Test case 15: Step not found (should leave unchanged)
         let template15 = "Result: {{steps.nonexistent.outputs[0]}}";
-        let variables15 = vec![];
         let executed_steps15 = HashMap::new();
-        let result15 = engine.interpolate_string(template15, &variables15, &executed_steps15).unwrap();
+        let result15 = engine.interpolate_string_from_sibling_output(template15, &executed_steps15).unwrap();
         assert_eq!(result15, "Result: {{steps.nonexistent.outputs[0]}}");
         
         // Test case 16: Step output index out of bounds (should leave unchanged)
         let template16 = "Result: {{steps.step1.outputs[5]}}";
-        let variables16 = vec![];
         let executed_steps16 = {
             let mut map = HashMap::new();
             let step1 = ShAction {
@@ -2371,12 +2648,11 @@ mod tests {
             map.insert("step1".to_string(), step1);
             map
         };
-        let result16 = engine.interpolate_string(template16, &variables16, &executed_steps16).unwrap();
+        let result16 = engine.interpolate_string_from_sibling_output(template16, &executed_steps16).unwrap();
         assert_eq!(result16, "Result: {{steps.step1.outputs[5]}}");
         
         // Test case 17: Step output with no value (should leave unchanged)
         let template17 = "Result: {{steps.step4.outputs[0]}}";
-        let variables17 = vec![];
         let executed_steps17 = {
             let mut map = HashMap::new();
             let step4 = ShAction {
@@ -2404,7 +2680,7 @@ mod tests {
             map.insert("step4".to_string(), step4);
             map
         };
-        let result17 = engine.interpolate_string(template17, &variables17, &executed_steps17).unwrap();
+        let result17 = engine.interpolate_string_from_sibling_output(template17, &executed_steps17).unwrap();
         assert_eq!(result17, "Result: {{steps.step4.outputs[0]}}");
         
         // Test case 18: Complex nested JSONPath
@@ -2423,23 +2699,328 @@ mod tests {
             }));
             map
         })];
-        let executed_steps18 = HashMap::new();
-        let result18 = engine.interpolate_string(template18, &variables18, &executed_steps18).unwrap();
+        let executed_steps18: HashMap<String, ShAction> = HashMap::new();
+        let result18 = engine.interpolate_string_from_parent_input(template18, &variables18).unwrap();
         assert_eq!(result18, "User: Grace");
         
         // Test case 19: Multiple interpolations of same pattern
         let template19 = "{{inputs[0]}} and {{inputs[0]}} are the same";
         let variables19 = vec![Value::String("Henry".to_string())];
-        let executed_steps19 = HashMap::new();
-        let result19 = engine.interpolate_string(template19, &variables19, &executed_steps19).unwrap();
+        let result19 = engine.interpolate_string_from_parent_input(template19, &variables19).unwrap();
         assert_eq!(result19, "Henry and Henry are the same");
         
         // Test case 20: Empty template
         let template20 = "";
         let variables20 = vec![];
-        let executed_steps20 = HashMap::new();
-        let result20 = engine.interpolate_string(template20, &variables20, &executed_steps20).unwrap();
+        let result20 = engine.interpolate_string_from_parent_input(template20, &variables20).unwrap();
         assert_eq!(result20, "");
+    }
+
+    #[test]
+    fn test_interpolate_string_from_parent_input_or_sibling_output() {
+        let engine = ExecutionEngine::new();
+        
+        // Test case 1: Only parent inputs (no sibling outputs)
+        let template1 = "Hello {{inputs[0]}} world!";
+        let variables1 = vec![Value::String("John".to_string())];
+        let executed_steps1: HashMap<String, ShAction> = HashMap::new();
+        let result1 = engine.interpolate_string_from_parent_input_or_sibling_output(template1, &variables1, &executed_steps1).unwrap();
+        assert_eq!(result1, "Hello John world!");
+        
+        // Test case 2: Only sibling outputs (no parent inputs)
+        let template2 = "Result from {{steps.step1.outputs[0]}}";
+        let variables2 = vec![];
+        let mut executed_steps2: HashMap<String, ShAction> = HashMap::new();
+        let step1 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("test_result".to_string()),
+                value: Some(Value::String("test_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps2.insert("step1".to_string(), step1);
+        let result2 = engine.interpolate_string_from_parent_input_or_sibling_output(template2, &variables2, &executed_steps2).unwrap();
+        assert_eq!(result2, "Result from test_result");
+        
+        // Test case 3: Mixed parent inputs and sibling outputs
+        let template3 = "Hello {{inputs[0]}} from {{steps.step1.outputs[0]}}";
+        let variables3 = vec![Value::String("John".to_string())];
+        let mut executed_steps3: HashMap<String, ShAction> = HashMap::new();
+        let step1_3 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("step1_result".to_string()),
+                value: Some(Value::String("step1_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps3.insert("step1".to_string(), step1_3);
+        let result3 = engine.interpolate_string_from_parent_input_or_sibling_output(template3, &variables3, &executed_steps3).unwrap();
+        assert_eq!(result3, "Hello John from step1_result");
+        
+        // Test case 4: Multiple parent inputs and sibling outputs
+        let template4 = "{{inputs[0]}} and {{inputs[1]}} from {{steps.step1.outputs[0]}} and {{steps.step2.outputs[0]}}";
+        let variables4 = vec![
+            Value::String("Alice".to_string()),
+            Value::String("Bob".to_string())
+        ];
+        let mut executed_steps4: HashMap<String, ShAction> = HashMap::new();
+        let step1_4 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("step1_result".to_string()),
+                value: Some(Value::String("step1_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        let step2_4 = ShAction {
+            id: "step2".to_string(),
+            name: "step2".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("step2_result".to_string()),
+                value: Some(Value::String("step2_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps4.insert("step1".to_string(), step1_4);
+        executed_steps4.insert("step2".to_string(), step2_4);
+        let result4 = engine.interpolate_string_from_parent_input_or_sibling_output(template4, &variables4, &executed_steps4).unwrap();
+        assert_eq!(result4, "Alice and Bob from step1_result and step2_result");
+        
+        // Test case 5: Parent inputs with JSONPath and sibling outputs
+        let template5 = "Name: {{inputs[0].name}} from {{steps.step1.outputs[0]}}";
+        let variables5 = vec![Value::Object({
+            let mut map = serde_json::Map::new();
+            map.insert("name".to_string(), Value::String("Charlie".to_string()));
+            map
+        })];
+        let mut executed_steps5: HashMap<String, ShAction> = HashMap::new();
+        let step1_5 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("step1_result".to_string()),
+                value: Some(Value::String("step1_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps5.insert("step1".to_string(), step1_5);
+        let result5 = engine.interpolate_string_from_parent_input_or_sibling_output(template5, &variables5, &executed_steps5).unwrap();
+        assert_eq!(result5, "Name: Charlie from step1_result");
+        
+        // Test case 6: Sibling outputs with JSONPath
+        let template6 = "{{inputs[0]}} from {{steps.step1.outputs[0].data}}";
+        let variables6 = vec![Value::String("Input".to_string())];
+        let mut executed_steps6: HashMap<String, ShAction> = HashMap::new();
+        let step1_6 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "object".to_string(),
+                template: Value::Object({
+                    let mut map = serde_json::Map::new();
+                    map.insert("data".to_string(), Value::String("step1_data".to_string()));
+                    map
+                }),
+                value: Some(Value::Object({
+                    let mut map = serde_json::Map::new();
+                    map.insert("data".to_string(), Value::String("step1_data".to_string()));
+                    map
+                })),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps6.insert("step1".to_string(), step1_6);
+        let result6 = engine.interpolate_string_from_parent_input_or_sibling_output(template6, &variables6, &executed_steps6).unwrap();
+        assert_eq!(result6, "Input from step1_data");
+        
+        // Test case 7: Non-string values from both sources
+        let template7 = "Number {{inputs[0]}} and result {{steps.step1.outputs[0]}}";
+        let variables7 = vec![Value::Number(serde_json::Number::from(42))];
+        let mut executed_steps7: HashMap<String, ShAction> = HashMap::new();
+        let step1_7 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "number".to_string(),
+                template: Value::Number(serde_json::Number::from(100)),
+                value: Some(Value::Number(serde_json::Number::from(100))),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps7.insert("step1".to_string(), step1_7);
+        let result7 = engine.interpolate_string_from_parent_input_or_sibling_output(template7, &variables7, &executed_steps7).unwrap();
+        assert_eq!(result7, "Number 42 and result 100");
+        
+        // Test case 8: Boolean values from both sources
+        let template8 = "Status {{inputs[0]}} and flag {{steps.step1.outputs[0]}}";
+        let variables8 = vec![Value::Bool(true)];
+        let mut executed_steps8: HashMap<String, ShAction> = HashMap::new();
+        let step1_8 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "boolean".to_string(),
+                template: Value::Bool(false),
+                value: Some(Value::Bool(false)),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps8.insert("step1".to_string(), step1_8);
+        let result8 = engine.interpolate_string_from_parent_input_or_sibling_output(template8, &variables8, &executed_steps8).unwrap();
+        assert_eq!(result8, "Status true and flag false");
+        
+        // Test case 9: Complex mixed template with multiple references
+        let template9 = "{{inputs[0]}} {{inputs[1]}} from {{steps.step1.outputs[0]}} and {{steps.step2.outputs[0]}} with {{inputs[0].name}}";
+        let variables9 = vec![
+            Value::Object({
+                let mut map = serde_json::Map::new();
+                map.insert("name".to_string(), Value::String("Alice".to_string()));
+                map
+            }),
+            Value::String("Bob".to_string())
+        ];
+        let mut executed_steps9: HashMap<String, ShAction> = HashMap::new();
+        let step1_9 = ShAction {
+            id: "step1".to_string(),
+            name: "step1".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("step1_result".to_string()),
+                value: Some(Value::String("step1_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        let step2_9 = ShAction {
+            id: "step2".to_string(),
+            name: "step2".to_string(),
+            kind: "wasm".to_string(),
+            uses: "test-action".to_string(),
+            inputs: vec![],
+            outputs: vec![ShIO {
+                name: "output0".to_string(),
+                r#type: "string".to_string(),
+                template: Value::String("step2_result".to_string()),
+                value: Some(Value::String("step2_result".to_string())),
+                required: false,
+            }],
+            parent_action: None,
+            steps: HashMap::new(),
+            types: None,
+            flow_control: false,
+            mirrors: vec![],
+            permissions: None,
+        };
+        executed_steps9.insert("step1".to_string(), step1_9);
+        executed_steps9.insert("step2".to_string(), step2_9);
+        let result9 = engine.interpolate_string_from_parent_input_or_sibling_output(template9, &variables9, &executed_steps9).unwrap();
+        assert_eq!(result9, "{\"name\":\"Alice\"} Bob from step1_result and step2_result with Alice");
+        
+        // Test case 10: Empty template
+        let template10 = "";
+        let variables10 = vec![Value::String("test".to_string())];
+        let executed_steps10: HashMap<String, ShAction> = HashMap::new();
+        let result10 = engine.interpolate_string_from_parent_input_or_sibling_output(template10, &variables10, &executed_steps10).unwrap();
+        assert_eq!(result10, "");
     }
 
     #[test]
@@ -2449,8 +3030,8 @@ mod tests {
         // Test case 1: String template with simple interpolation
         let template1 = Value::String("Hello {{inputs[0]}} world!".to_string());
         let variables1 = vec![Value::String("John".to_string())];
-        let executed_steps1 = HashMap::new();
-        let result1 = engine.interpolate(&template1, &variables1, &executed_steps1).unwrap();
+        let executed_steps1: HashMap<String, ShAction> = HashMap::new();
+        let result1 = engine.interpolate_from_parent_inputs(&template1, &variables1).unwrap();
         assert_eq!(result1, Value::String("Hello John world!".to_string()));
         
         // Test case 2: String template that resolves to JSON object
@@ -2459,8 +3040,8 @@ mod tests {
             Value::String("Alice".to_string()),
             Value::Number(serde_json::Number::from(25))
         ];
-        let executed_steps2 = HashMap::new();
-        let result2 = engine.interpolate(&template2, &variables2, &executed_steps2).unwrap();
+        let executed_steps2: HashMap<String, ShAction> = HashMap::new();
+        let result2 = engine.interpolate_from_parent_inputs(&template2, &variables2).unwrap();
         let expected2 = Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("name".to_string(), Value::String("Alice".to_string()));
@@ -2476,8 +3057,8 @@ mod tests {
             Value::String("banana".to_string()),
             Value::String("cherry".to_string())
         ];
-        let executed_steps3 = HashMap::new();
-        let result3 = engine.interpolate(&template3, &variables3, &executed_steps3).unwrap();
+        let executed_steps3: HashMap<String, ShAction> = HashMap::new();
+        let result3 = engine.interpolate_from_parent_inputs(&template3, &variables3).unwrap();
         let expected3 = Value::Array(vec![
             Value::String("apple".to_string()),
             Value::String("banana".to_string()),
@@ -2488,29 +3069,29 @@ mod tests {
         // Test case 4: String template that resolves to JSON primitive (number)
         let template4 = Value::String("{{inputs[0]}}".to_string());
         let variables4 = vec![Value::Number(serde_json::Number::from(42))];
-        let executed_steps4 = HashMap::new();
-        let result4 = engine.interpolate(&template4, &variables4, &executed_steps4).unwrap();
+        let executed_steps4: HashMap<String, ShAction> = HashMap::new();
+        let result4 = engine.interpolate_from_parent_inputs(&template4, &variables4).unwrap();
         assert_eq!(result4, Value::Number(serde_json::Number::from(42)));
         
         // Test case 5: String template that resolves to JSON primitive (boolean)
         let template5 = Value::String("{{inputs[0]}}".to_string());
         let variables5 = vec![Value::Bool(true)];
-        let executed_steps5 = HashMap::new();
-        let result5 = engine.interpolate(&template5, &variables5, &executed_steps5).unwrap();
+        let executed_steps5: HashMap<String, ShAction> = HashMap::new();
+        let result5 = engine.interpolate_from_parent_inputs(&template5, &variables5).unwrap();
         assert_eq!(result5, Value::Bool(true));
         
         // Test case 6: String template that resolves to JSON primitive (null)
         let template6 = Value::String("{{inputs[0]}}".to_string());
         let variables6 = vec![Value::Null];
-        let executed_steps6 = HashMap::new();
-        let result6 = engine.interpolate(&template6, &variables6, &executed_steps6).unwrap();
+        let executed_steps6: HashMap<String, ShAction> = HashMap::new();
+        let result6 = engine.interpolate_from_parent_inputs(&template6, &variables6).unwrap();
         assert_eq!(result6, Value::Null);
         
         // Test case 7: String template that doesn't resolve to valid JSON
         let template7 = Value::String("Hello {{inputs[0]}} world!".to_string());
         let variables7 = vec![Value::String("John".to_string())];
-        let executed_steps7 = HashMap::new();
-        let result7 = engine.interpolate(&template7, &variables7, &executed_steps7).unwrap();
+        let executed_steps7: HashMap<String, ShAction> = HashMap::new();
+        let result7 = engine.interpolate_from_parent_inputs(&template7, &variables7).unwrap();
         assert_eq!(result7, Value::String("Hello John world!".to_string()));
         
         // Test case 8: Object template with string interpolation
@@ -2525,8 +3106,8 @@ mod tests {
             Value::String("Bob".to_string()),
             Value::Number(serde_json::Number::from(30))
         ];
-        let executed_steps8 = HashMap::new();
-        let result8 = engine.interpolate(&template8, &variables8, &executed_steps8).unwrap();
+        let executed_steps8: HashMap<String, ShAction> = HashMap::new();
+        let result8 = engine.interpolate_from_parent_inputs(&template8, &variables8).unwrap();
         let expected8 = Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("name".to_string(), Value::String("Bob".to_string()));
@@ -2555,8 +3136,8 @@ mod tests {
             Value::String("Charlie".to_string()),
             Value::String("charlie@example.com".to_string())
         ];
-        let executed_steps9 = HashMap::new();
-        let result9 = engine.interpolate(&template9, &variables9, &executed_steps9).unwrap();
+        let executed_steps9: HashMap<String, ShAction> = HashMap::new();
+        let result9 = engine.interpolate_from_parent_inputs(&template9, &variables9).unwrap();
         let expected9 = Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("user".to_string(), Value::Object({
@@ -2584,8 +3165,8 @@ mod tests {
             Value::String("green".to_string()),
             Value::String("blue".to_string())
         ];
-        let executed_steps10 = HashMap::new();
-        let result10 = engine.interpolate(&template10, &variables10, &executed_steps10).unwrap();
+        let executed_steps10: HashMap<String, ShAction> = HashMap::new();
+        let result10 = engine.interpolate_from_parent_inputs(&template10, &variables10).unwrap();
         let expected10 = Value::Array(vec![
             Value::String("red".to_string()),
             Value::String("green".to_string()),
@@ -2601,8 +3182,8 @@ mod tests {
             Value::Null
         ]);
         let variables11 = vec![Value::String("test".to_string())];
-        let executed_steps11 = HashMap::new();
-        let result11 = engine.interpolate(&template11, &variables11, &executed_steps11).unwrap();
+        let executed_steps11: HashMap<String, ShAction> = HashMap::new();
+        let result11 = engine.interpolate_from_parent_inputs(&template11, &variables11).unwrap();
         let expected11 = Value::Array(vec![
             Value::String("test".to_string()),
             Value::Number(serde_json::Number::from(42)),
@@ -2628,8 +3209,8 @@ mod tests {
             Value::String("c".to_string()),
             Value::String("d".to_string())
         ];
-        let executed_steps12 = HashMap::new();
-        let result12 = engine.interpolate(&template12, &variables12, &executed_steps12).unwrap();
+        let executed_steps12: HashMap<String, ShAction> = HashMap::new();
+        let result12 = engine.interpolate_from_parent_inputs(&template12, &variables12).unwrap();
         let expected12 = Value::Array(vec![
             Value::Array(vec![
                 Value::String("a".to_string()),
@@ -2703,7 +3284,7 @@ mod tests {
             map.insert("step2".to_string(), step2);
             map
         };
-        let result13 = engine.interpolate(&template13, &variables13, &executed_steps13).unwrap();
+        let result13 = engine.interpolate_from_parent_inputs(&template13, &variables13).unwrap();
         let expected13 = Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("user".to_string(), Value::String("David".to_string()));
@@ -2718,22 +3299,21 @@ mod tests {
         // Test case 14: Primitive values (should return unchanged)
         let template14 = Value::Number(serde_json::Number::from(123));
         let variables14 = vec![];
-        let executed_steps14 = HashMap::new();
-        let result14 = engine.interpolate(&template14, &variables14, &executed_steps14).unwrap();
+        let result14 = engine.interpolate_from_parent_inputs(&template14, &variables14).unwrap();
         assert_eq!(result14, Value::Number(serde_json::Number::from(123)));
         
         // Test case 15: Boolean primitive (should return unchanged)
         let template15 = Value::Bool(false);
         let variables15 = vec![];
-        let executed_steps15 = HashMap::new();
-        let result15 = engine.interpolate(&template15, &variables15, &executed_steps15).unwrap();
+        let executed_steps15: HashMap<String, ShAction> = HashMap::new();
+        let result15 = engine.interpolate_from_parent_inputs(&template15, &variables15).unwrap();
         assert_eq!(result15, Value::Bool(false));
         
         // Test case 16: Null primitive (should return unchanged)
         let template16 = Value::Null;
         let variables16 = vec![];
-        let executed_steps16 = HashMap::new();
-        let result16 = engine.interpolate(&template16, &variables16, &executed_steps16).unwrap();
+        let executed_steps16: HashMap<String, ShAction> = HashMap::new();
+        let result16 = engine.interpolate_from_parent_inputs(&template16, &variables16).unwrap();
         assert_eq!(result16, Value::Null);
         
         // Test case 17: String template with JSONPath interpolation
@@ -2744,8 +3324,8 @@ mod tests {
             map.insert("age".to_string(), Value::Number(serde_json::Number::from(28)));
             map
         })];
-        let executed_steps17 = HashMap::new();
-        let result17 = engine.interpolate(&template17, &variables17, &executed_steps17).unwrap();
+        let executed_steps17: HashMap<String, ShAction> = HashMap::new();
+        let result17 = engine.interpolate_from_parent_inputs(&template17, &variables17).unwrap();
         let expected17 = Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("name".to_string(), Value::String("Eve".to_string()));
@@ -2757,22 +3337,22 @@ mod tests {
         // Test case 18: Empty object (should return unchanged)
         let template18 = Value::Object(serde_json::Map::new());
         let variables18 = vec![];
-        let executed_steps18 = HashMap::new();
-        let result18 = engine.interpolate(&template18, &variables18, &executed_steps18).unwrap();
+        let executed_steps18: HashMap<String, ShAction> = HashMap::new();
+        let result18 = engine.interpolate_from_parent_inputs(&template18, &variables18).unwrap();
         assert_eq!(result18, Value::Object(serde_json::Map::new()));
         
         // Test case 19: Empty array (should return unchanged)
         let template19 = Value::Array(vec![]);
         let variables19 = vec![];
-        let executed_steps19 = HashMap::new();
-        let result19 = engine.interpolate(&template19, &variables19, &executed_steps19).unwrap();
+        let executed_steps19: HashMap<String, ShAction> = HashMap::new();
+        let result19 = engine.interpolate_from_parent_inputs(&template19, &variables19).unwrap();
         assert_eq!(result19, Value::Array(vec![]));
         
         // Test case 20: String template with malformed JSON (should return as string)
         let template20 = Value::String("Hello {{inputs[0]}} world!".to_string());
         let variables20 = vec![Value::String("Frank".to_string())];
-        let executed_steps20 = HashMap::new();
-        let result20 = engine.interpolate(&template20, &variables20, &executed_steps20).unwrap();
+        let executed_steps20: HashMap<String, ShAction> = HashMap::new();
+        let result20 = engine.interpolate_from_parent_inputs(&template20, &variables20).unwrap();
         assert_eq!(result20, Value::String("Hello Frank world!".to_string()));
     }
 
@@ -2813,8 +3393,8 @@ mod tests {
                 required: true,
             }
         ];
-        let steps = HashMap::new();
-        let result = engine.resolve_io(&io_definitions, &io_values, &steps).unwrap();
+        let steps: HashMap<String, ShAction> = HashMap::new();
+        let result = engine.resolve_from_parent_inputs(&io_definitions, &io_values).unwrap();
         let expected = vec![
             Value::String("Hello".to_string()),
             Value::String("World".to_string())
@@ -2852,7 +3432,7 @@ mod tests {
                 required: true,
             }
         ];
-        let result2 = engine.resolve_io(&io_definitions2, &io_values2, &steps).unwrap();
+        let result2 = engine.resolve_from_parent_inputs(&io_definitions2, &io_values2).unwrap();
         let expected2 = vec![Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("name".to_string(), Value::String("Alice".to_string()));
@@ -2899,7 +3479,7 @@ mod tests {
             map.insert("step1".to_string(), step1);
             map
         };
-        let result3 = engine.resolve_io(&io_definitions3, &io_values3, &steps3).unwrap();
+        let result3 = engine.resolve_from_parent_inputs(&io_definitions3, &io_values3).unwrap();
         let expected3 = vec![Value::String("Hello from step1".to_string())];
         assert_eq!(result3, expected3);
         
@@ -2922,7 +3502,7 @@ mod tests {
                 required: true,
             }
         ];
-        let result4 = engine.resolve_io(&io_definitions4, &io_values4, &steps3).unwrap();
+        let result4 = engine.resolve_from_parent_inputs(&io_definitions4, &io_values4).unwrap();
         let expected4 = vec![Value::String("John used Hello from step1".to_string())];
         assert_eq!(result4, expected4);
         
@@ -2950,7 +3530,7 @@ mod tests {
                 required: true,
             }
         ];
-        let result5 = engine.resolve_io(&io_definitions5, &io_values5, &steps).unwrap();
+        let result5 = engine.resolve_from_parent_inputs(&io_definitions5, &io_values5).unwrap();
         let expected5 = vec![Value::String("Bob".to_string())];
         assert_eq!(result5, expected5);
         
@@ -2965,13 +3545,13 @@ mod tests {
             }
         ];
         let io_values6 = vec![];
-        let result6 = engine.resolve_io(&io_definitions6, &io_values6, &steps);
+        let result6 = engine.resolve_from_parent_inputs(&io_definitions6, &io_values6);
         assert_eq!(result6, None);
         
         // Test case 7: IO resolution with empty definitions (should return empty vector)
         let io_definitions7 = vec![];
         let io_values7 = vec![];
-        let result7 = engine.resolve_io(&io_definitions7, &io_values7, &steps).unwrap();
+        let result7 = engine.resolve_from_parent_inputs(&io_definitions7, &io_values7).unwrap();
         assert_eq!(result7, vec![] as Vec<Value>);
         
         // Test case 8: IO resolution with null values
@@ -2993,7 +3573,7 @@ mod tests {
                 required: true,
             }
         ];
-        let result8 = engine.resolve_io(&io_definitions8, &io_values8, &steps).unwrap();
+        let result8 = engine.resolve_from_parent_inputs(&io_definitions8, &io_values8).unwrap();
         let expected8 = vec![Value::Null];
         assert_eq!(result8, expected8);
         
@@ -3034,7 +3614,7 @@ mod tests {
                 required: true,
             }
         ];
-        let result9 = engine.resolve_io(&io_definitions9, &io_values9, &steps).unwrap();
+        let result9 = engine.resolve_from_parent_inputs(&io_definitions9, &io_values9).unwrap();
         let expected9 = vec![Value::Array(vec![
             Value::String("apple".to_string()),
             Value::String("banana".to_string()),
@@ -3119,7 +3699,7 @@ mod tests {
             map.insert("step2".to_string(), step2);
             map
         };
-        let result10 = engine.resolve_io(&io_definitions10, &io_values10, &steps10).unwrap();
+        let result10 = engine.resolve_from_parent_inputs(&io_definitions10, &io_values10).unwrap();
         let expected10 = vec![Value::Object({
             let mut map = serde_json::Map::new();
             map.insert("user".to_string(), Value::String("Charlie".to_string()));
@@ -3142,7 +3722,7 @@ mod tests {
             }
         ];
         let io_values11 = vec![]; // No values provided
-        let result11 = engine.resolve_io(&io_definitions11, &io_values11, &steps);
+        let result11 = engine.resolve_from_parent_inputs(&io_definitions11, &io_values11);
         assert_eq!(result11, None);
         
         // Test case 12: IO resolution with still unresolved templates (should return None)
@@ -3156,8 +3736,8 @@ mod tests {
             }
         ];
         let io_values12 = vec![];
-        let steps12 = HashMap::new(); // No executed steps
-        let result12 = engine.resolve_io(&io_definitions12, &io_values12, &steps12);
+        let steps12: HashMap<String, ShAction> = HashMap::new(); // No executed steps
+        let result12 = engine.resolve_from_parent_inputs(&io_definitions12, &io_values12);
         assert_eq!(result12, None);
     }
 
