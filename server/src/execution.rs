@@ -2276,7 +2276,7 @@ mod tests {
         // Test case 1: Simple input interpolation without jsonpath
         let template1 = "Hello {{inputs[0]}} world!";
         let variables1 = vec![Value::String("John".to_string())];
-        let executed_steps1: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps1: HashMap<String, ShAction> = HashMap::new();
         let result1 = engine.interpolate_string_from_parent_input(template1, &variables1).unwrap();
         assert_eq!(result1, "Hello John world!");
         
@@ -2286,28 +2286,28 @@ mod tests {
             Value::String("Alice".to_string()),
             Value::String("Bob".to_string())
         ];
-        let executed_steps2: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps2: HashMap<String, ShAction> = HashMap::new();
         let result2 = engine.interpolate_string_from_parent_input(template2, &variables2).unwrap();
         assert_eq!(result2, "Alice and Bob are friends");
         
         // Test case 3: Input interpolation with non-string values
         let template3 = "The number is {{inputs[0]}}";
         let variables3 = vec![Value::Number(serde_json::Number::from(42))];
-        let executed_steps3: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps3: HashMap<String, ShAction> = HashMap::new();
         let result3 = engine.interpolate_string_from_parent_input(template3, &variables3).unwrap();
         assert_eq!(result3, "The number is 42");
         
         // Test case 4: Input interpolation with boolean values
         let template4 = "Status: {{inputs[0]}}";
         let variables4 = vec![Value::Bool(true)];
-        let executed_steps4: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps4: HashMap<String, ShAction> = HashMap::new();
         let result4 = engine.interpolate_string_from_parent_input(template4, &variables4).unwrap();
         assert_eq!(result4, "Status: true");
         
         // Test case 5: Input interpolation with null values
         let template5 = "Value: {{inputs[0]}}";
         let variables5 = vec![Value::Null];
-        let executed_steps5: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps5: HashMap<String, ShAction> = HashMap::new();
         let result5 = engine.interpolate_string_from_parent_input(template5, &variables5).unwrap();
         assert_eq!(result5, "Value: null");
         
@@ -2319,7 +2319,7 @@ mod tests {
             map.insert("age".to_string(), Value::Number(serde_json::Number::from(30)));
             map
         })];
-        let executed_steps6: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps6: HashMap<String, ShAction> = HashMap::new();
         let result6 = engine.interpolate_string_from_parent_input(template6, &variables6).unwrap();
         assert_eq!(result6, "Name: Charlie");
         
@@ -2336,7 +2336,7 @@ mod tests {
             }));
             map
         })];
-        let executed_steps7: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps7: HashMap<String, ShAction> = HashMap::new();
         let result7 = engine.interpolate_string_from_parent_input(template7, &variables7).unwrap();
         assert_eq!(result7, "City: New York");
         
@@ -2350,7 +2350,7 @@ mod tests {
             ]));
             map
         })];
-        let executed_steps8: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps8: HashMap<String, ShAction> = HashMap::new();
         let result8 = engine.interpolate_string_from_parent_input(template8, &variables8).unwrap();
         assert_eq!(result8, "First item: apple");
         
@@ -2460,21 +2460,21 @@ mod tests {
         // Test case 12: Template with no interpolation (should return unchanged)
         let template12 = "Hello world!";
         let variables12 = vec![];
-        let executed_steps12: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps12: HashMap<String, ShAction> = HashMap::new();
         let result12 = engine.interpolate_string_from_parent_input(template12, &variables12).unwrap();
         assert_eq!(result12, "Hello world!");
         
         // Test case 13: Template with malformed interpolation (should leave unchanged)
         let template13 = "Hello {{inputs[0 world!";
         let variables13 = vec![Value::String("John".to_string())];
-        let executed_steps13: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps13: HashMap<String, ShAction> = HashMap::new();
         let result13 = engine.interpolate_string_from_parent_input(template13, &variables13).unwrap();
         assert_eq!(result13, "Hello {{inputs[0 world!");
         
         // Test case 14: Input index out of bounds (should leave unchanged)
         let template14 = "Hello {{inputs[5]}} world!";
         let variables14 = vec![Value::String("John".to_string())];
-        let executed_steps14: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps14: HashMap<String, ShAction> = HashMap::new();
         let result14 = engine.interpolate_string_from_parent_input(template14, &variables14).unwrap();
         assert_eq!(result14, "Hello {{inputs[5]}} world!");
         
@@ -2564,7 +2564,7 @@ mod tests {
             }));
             map
         })];
-        let executed_steps18: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps18: HashMap<String, ShAction> = HashMap::new();
         let result18 = engine.interpolate_string_from_parent_input(template18, &variables18).unwrap();
         assert_eq!(result18, "User: Grace");
         
@@ -2588,8 +2588,8 @@ mod tests {
         // Test case 1: Only parent inputs (no sibling outputs)
         let template1 = "Hello {{inputs[0]}} world!";
         let variables1 = vec![Value::String("John".to_string())];
-        let executed_steps1: HashMap<String, ShAction> = HashMap::new();
-        let result1 = engine.interpolate_string_from_parent_input_or_sibling_output(template1, &variables1, &executed_steps1).unwrap();
+        let _executed_steps1: HashMap<String, ShAction> = HashMap::new();
+        let result1 = engine.interpolate_string_from_parent_input_or_sibling_output(template1, &variables1, &_executed_steps1).unwrap();
         assert_eq!(result1, "Hello John world!");
         
         // Test case 2: Only sibling outputs (no parent inputs)
@@ -2883,8 +2883,8 @@ mod tests {
         // Test case 10: Empty template
         let template10 = "";
         let variables10 = vec![Value::String("test".to_string())];
-        let executed_steps10: HashMap<String, ShAction> = HashMap::new();
-        let result10 = engine.interpolate_string_from_parent_input_or_sibling_output(template10, &variables10, &executed_steps10).unwrap();
+        let _executed_steps10: HashMap<String, ShAction> = HashMap::new();
+        let result10 = engine.interpolate_string_from_parent_input_or_sibling_output(template10, &variables10, &_executed_steps10).unwrap();
         assert_eq!(result10, "");
     }
 
@@ -2895,7 +2895,7 @@ mod tests {
         // Test case 1: String template with simple interpolation
         let template1 = Value::String("Hello {{inputs[0]}} world!".to_string());
         let variables1 = vec![Value::String("John".to_string())];
-        let executed_steps1: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps1: HashMap<String, ShAction> = HashMap::new();
         let result1 = engine.interpolate_from_parent_inputs(&template1, &variables1).unwrap();
         assert_eq!(result1, Value::String("Hello John world!".to_string()));
         
@@ -2905,7 +2905,7 @@ mod tests {
             Value::String("Alice".to_string()),
             Value::Number(serde_json::Number::from(25))
         ];
-        let executed_steps2: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps2: HashMap<String, ShAction> = HashMap::new();
         let result2 = engine.interpolate_from_parent_inputs(&template2, &variables2).unwrap();
         let expected2 = Value::Object({
             let mut map = serde_json::Map::new();
@@ -2922,7 +2922,7 @@ mod tests {
             Value::String("banana".to_string()),
             Value::String("cherry".to_string())
         ];
-        let executed_steps3: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps3: HashMap<String, ShAction> = HashMap::new();
         let result3 = engine.interpolate_from_parent_inputs(&template3, &variables3).unwrap();
         let expected3 = Value::Array(vec![
             Value::String("apple".to_string()),
@@ -2934,28 +2934,28 @@ mod tests {
         // Test case 4: String template that resolves to JSON primitive (number)
         let template4 = Value::String("{{inputs[0]}}".to_string());
         let variables4 = vec![Value::Number(serde_json::Number::from(42))];
-        let executed_steps4: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps4: HashMap<String, ShAction> = HashMap::new();
         let result4 = engine.interpolate_from_parent_inputs(&template4, &variables4).unwrap();
         assert_eq!(result4, Value::Number(serde_json::Number::from(42)));
         
         // Test case 5: String template that resolves to JSON primitive (boolean)
         let template5 = Value::String("{{inputs[0]}}".to_string());
         let variables5 = vec![Value::Bool(true)];
-        let executed_steps5: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps5: HashMap<String, ShAction> = HashMap::new();
         let result5 = engine.interpolate_from_parent_inputs(&template5, &variables5).unwrap();
         assert_eq!(result5, Value::Bool(true));
         
         // Test case 6: String template that resolves to JSON primitive (null)
         let template6 = Value::String("{{inputs[0]}}".to_string());
         let variables6 = vec![Value::Null];
-        let executed_steps6: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps6: HashMap<String, ShAction> = HashMap::new();
         let result6 = engine.interpolate_from_parent_inputs(&template6, &variables6).unwrap();
         assert_eq!(result6, Value::Null);
         
         // Test case 7: String template that doesn't resolve to valid JSON
         let template7 = Value::String("Hello {{inputs[0]}} world!".to_string());
         let variables7 = vec![Value::String("John".to_string())];
-        let executed_steps7: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps7: HashMap<String, ShAction> = HashMap::new();
         let result7 = engine.interpolate_from_parent_inputs(&template7, &variables7).unwrap();
         assert_eq!(result7, Value::String("Hello John world!".to_string()));
         
@@ -2971,7 +2971,7 @@ mod tests {
             Value::String("Bob".to_string()),
             Value::Number(serde_json::Number::from(30))
         ];
-        let executed_steps8: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps8: HashMap<String, ShAction> = HashMap::new();
         let result8 = engine.interpolate_from_parent_inputs(&template8, &variables8).unwrap();
         let expected8 = Value::Object({
             let mut map = serde_json::Map::new();
@@ -3001,7 +3001,7 @@ mod tests {
             Value::String("Charlie".to_string()),
             Value::String("charlie@example.com".to_string())
         ];
-        let executed_steps9: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps9: HashMap<String, ShAction> = HashMap::new();
         let result9 = engine.interpolate_from_parent_inputs(&template9, &variables9).unwrap();
         let expected9 = Value::Object({
             let mut map = serde_json::Map::new();
@@ -3030,7 +3030,7 @@ mod tests {
             Value::String("green".to_string()),
             Value::String("blue".to_string())
         ];
-        let executed_steps10: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps10: HashMap<String, ShAction> = HashMap::new();
         let result10 = engine.interpolate_from_parent_inputs(&template10, &variables10).unwrap();
         let expected10 = Value::Array(vec![
             Value::String("red".to_string()),
@@ -3047,7 +3047,7 @@ mod tests {
             Value::Null
         ]);
         let variables11 = vec![Value::String("test".to_string())];
-        let executed_steps11: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps11: HashMap<String, ShAction> = HashMap::new();
         let result11 = engine.interpolate_from_parent_inputs(&template11, &variables11).unwrap();
         let expected11 = Value::Array(vec![
             Value::String("test".to_string()),
@@ -3074,7 +3074,7 @@ mod tests {
             Value::String("c".to_string()),
             Value::String("d".to_string())
         ];
-        let executed_steps12: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps12: HashMap<String, ShAction> = HashMap::new();
         let result12 = engine.interpolate_from_parent_inputs(&template12, &variables12).unwrap();
         let expected12 = Value::Array(vec![
             Value::Array(vec![
@@ -3099,7 +3099,7 @@ mod tests {
             map
         });
         let variables13 = vec![Value::String("David".to_string())];
-        let executed_steps13 = {
+        let _executed_steps13 = {
             let mut map = HashMap::new();
             let step1 = ShAction {
                 id: "step1".to_string(),
@@ -3170,14 +3170,14 @@ mod tests {
         // Test case 15: Boolean primitive (should return unchanged)
         let template15 = Value::Bool(false);
         let variables15 = vec![];
-        let executed_steps15: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps15: HashMap<String, ShAction> = HashMap::new();
         let result15 = engine.interpolate_from_parent_inputs(&template15, &variables15).unwrap();
         assert_eq!(result15, Value::Bool(false));
         
         // Test case 16: Null primitive (should return unchanged)
         let template16 = Value::Null;
         let variables16 = vec![];
-        let executed_steps16: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps16: HashMap<String, ShAction> = HashMap::new();
         let result16 = engine.interpolate_from_parent_inputs(&template16, &variables16).unwrap();
         assert_eq!(result16, Value::Null);
         
@@ -3189,7 +3189,7 @@ mod tests {
             map.insert("age".to_string(), Value::Number(serde_json::Number::from(28)));
             map
         })];
-        let executed_steps17: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps17: HashMap<String, ShAction> = HashMap::new();
         let result17 = engine.interpolate_from_parent_inputs(&template17, &variables17).unwrap();
         let expected17 = Value::Object({
             let mut map = serde_json::Map::new();
@@ -3202,21 +3202,21 @@ mod tests {
         // Test case 18: Empty object (should return unchanged)
         let template18 = Value::Object(serde_json::Map::new());
         let variables18 = vec![];
-        let executed_steps18: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps18: HashMap<String, ShAction> = HashMap::new();
         let result18 = engine.interpolate_from_parent_inputs(&template18, &variables18).unwrap();
         assert_eq!(result18, Value::Object(serde_json::Map::new()));
         
         // Test case 19: Empty array (should return unchanged)
         let template19 = Value::Array(vec![]);
         let variables19 = vec![];
-        let executed_steps19: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps19: HashMap<String, ShAction> = HashMap::new();
         let result19 = engine.interpolate_from_parent_inputs(&template19, &variables19).unwrap();
         assert_eq!(result19, Value::Array(vec![]));
         
         // Test case 20: String template with malformed JSON (should return as string)
         let template20 = Value::String("Hello {{inputs[0]}} world!".to_string());
         let variables20 = vec![Value::String("Frank".to_string())];
-        let executed_steps20: HashMap<String, ShAction> = HashMap::new();
+        let _executed_steps20: HashMap<String, ShAction> = HashMap::new();
         let result20 = engine.interpolate_from_parent_inputs(&template20, &variables20).unwrap();
         assert_eq!(result20, Value::String("Hello Frank world!".to_string()));
     }
@@ -3258,7 +3258,7 @@ mod tests {
                 required: true,
             }
         ];
-        let steps: HashMap<String, ShAction> = HashMap::new();
+        let _steps: HashMap<String, ShAction> = HashMap::new();
         let result = engine.resolve_from_parent_inputs(&io_definitions, &io_values).unwrap();
         let expected = vec![
             Value::String("Hello".to_string()),
@@ -3317,7 +3317,7 @@ mod tests {
             }
         ];
         let io_values3 = vec![];
-        let steps3 = {
+        let _steps3 = {
             let mut map = HashMap::new();
             let step1 = ShAction {
                 id: "step1".to_string(),
@@ -3514,7 +3514,7 @@ mod tests {
                 required: true,
             }
         ];
-        let steps10 = {
+        let _steps10 = {
             let mut map = HashMap::new();
             let step1 = ShAction {
                 id: "step1".to_string(),
@@ -3601,7 +3601,7 @@ mod tests {
             }
         ];
         let io_values12 = vec![];
-        let steps12: HashMap<String, ShAction> = HashMap::new(); // No executed steps
+        let _steps12: HashMap<String, ShAction> = HashMap::new(); // No executed steps
         let result12 = engine.resolve_from_parent_inputs(&io_definitions12, &io_values12);
         assert_eq!(result12, None);
     }
@@ -5165,34 +5165,34 @@ mod tests {
     //     assert_eq!(action_tree["uses"], action_ref);
     // }
 
-    // #[tokio::test]
-    // async fn test_execute_action_sleep() {
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+    #[tokio::test]
+    async fn test_execute_action_sleep() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing the sleep action directly
-    //     let action_ref = "std/sleep:0.0.1";
+        // Test executing the sleep action directly
+        let action_ref = "std/sleep:0.0.1";
         
-    //     // Test with two inputs: seconds and ignored value
-    //     let inputs = vec![
-    //         json!(2.5),  // seconds
-    //         json!("ignored_value")  // second input that will be ignored
-    //     ];
+        // Test with two inputs: seconds and ignored value
+        let inputs = vec![
+            json!(2.5),  // seconds
+            json!("ignored_value")  // second input that will be ignored
+        ];
         
-    //     println!("Testing sleep action with inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        println!("Testing sleep action with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("Sleep test result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid sleep action_ref and inputs");
+        println!("Sleep test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid sleep action_ref and inputs");
         
-    //     let action_tree = result.unwrap();
+        let action_tree = result.unwrap();
         
-    //     // Verify the action structure
-    //     assert_eq!(action_tree["name"], "sleep");
-    //     assert_eq!(action_tree["kind"], "wasm");
-    //     assert_eq!(action_tree["uses"], action_ref);
-    // }
+        // Verify the action structure
+        assert_eq!(action_tree["name"], "sleep");
+        assert_eq!(action_tree["kind"], "wasm");
+        assert_eq!(action_tree["uses"], action_ref);
+    }
 
     // #[tokio::test]
     // async fn test_execute_action_base64_to_text() {
@@ -5958,7 +5958,6 @@ mod tests {
         println!("Testing http-get-wasm action with inputs: {:#?}", inputs);
         let result = engine.execute_action(action_ref, inputs).await;
         
-        println!("http-get-wasm test result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid http-get-wasm action_ref and inputs");
         
