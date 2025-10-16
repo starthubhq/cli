@@ -43,6 +43,12 @@ impl ExecutionEngine {
         self.logger.get_ws_sender()
     }
 
+    fn push_to_execution_buffer(&self, buffer: &mut Vec<String>, step_id: String) {
+        if !buffer.contains(&step_id) {
+            buffer.push(step_id);
+        }
+    }
+
     pub async fn execute_action(&mut self, action_ref: &str, inputs: Vec<Value>) -> Result<Value> {
         self.logger.log_info(&format!("Starting execution of action: {}", action_ref), None);
         
@@ -99,11 +105,21 @@ impl ExecutionEngine {
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
 
             // Extract values from inputs before serializing
-            let input_values: Vec<Value> = action.inputs.iter()
+            let input_values: Vec<Value> = if action.name == "sleep" {
+                vec![
+                    Value::Number(5.into()),
+                    Value::String("get_simulator".to_string()),
+                    Value::String("1".to_string())
+                ]
+                // action.inputs.iter()
+                // .map(|io| io.value.clone().unwrap_or(Value::Null))
+                // .collect()
+            } else {
+                action.inputs.iter()
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
-                .collect();
+                .collect()
+            };
 
-            println!("input_values to wasm: {:#?}", input_values);
             let result = if action.kind == "wasm" {
                 wasm::run_wasm_step(
                     action, 
@@ -121,24 +137,31 @@ impl ExecutionEngine {
             };
             
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
-
-            println!("result: {:#?}", result);
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
                 Vec::new()
             } else {
                 if let Some(first_result) = result.first() {
                     if let Some(array) = first_result.as_array() {
-                        array.iter().map(|item| Self::parse(item.clone())).collect()
+                        // For cast actions, preserve the original values without parsing
+                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) {
+                            array.iter().map(|item| item.clone()).collect()
+                        } else {
+                            array.iter().map(|item| Self::parse(item.clone())).collect()
+                        }
                     } else {
-                        vec![Self::parse(first_result.clone())]
+                        // For cast actions, preserve the original value without parsing
+                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) {
+                            vec![first_result.clone()]
+                        } else {
+                            vec![Self::parse(first_result.clone())]
+                        }
                     }
                 } else {
                     Vec::new()
                 }
             };
 
-            println!("json_objects: {:#?}", json_objects);
             // inject the outputs into the action
             let updated_outputs = self.instantiate_io(
                 &action.outputs,
@@ -151,13 +174,11 @@ impl ExecutionEngine {
                 outputs: updated_outputs,
                 ..action.clone()
             };
-
-            println!("before returning from action: {:#?}", updated_action.name);
             
             return Ok(updated_action);
         }
 
-        
+
         let mut execution_buffer: Vec<String> = Vec::new();
 
         // Initially, we want to inject the input values into the inputs of the steps.
@@ -214,29 +235,27 @@ impl ExecutionEngine {
 
             println!("current_step_id from recursive call: {:?}", current_step_id);
             // We create a new buffer without the first step.
-            let remaining_buffer = execution_buffer.into_iter().skip(1).collect();
+            let mut remaining_buffer = execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
             println!("remaining_buffer: {:#?}", remaining_buffer);
             // Execute the step recursively
             if let Some(step) = action.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
 
-                println!("step to execute: {:#?}", step.name);
                 // We exeute the step recursively
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
 
-                println!("executed_step outputs: {:#?}", executed_step.outputs);
                 // Once we have executed the step, we want to update the corresponding step
                 // in the current action.
                 let updated_steps: HashMap<String, ShAction> = action.steps.iter()
-                .map(|(id, step)| {
-                    if id == &current_step_id {
-                        (id.clone(), executed_step.clone())
-                    } else {
-                        (id.clone(), step.clone())
-                    }
-                })
-                .collect();
+                    .map(|(id, step)| {
+                        if id == &current_step_id {
+                            (id.clone(), executed_step.clone())
+                        } else {
+                            (id.clone(), step.clone())
+                        }
+                    })
+                    .collect();
 
                 let action_with_udpated_steps = ShAction {
                     steps: updated_steps,
@@ -251,37 +270,38 @@ impl ExecutionEngine {
                     steps: updated_siblings,
                     ..action_with_udpated_steps.clone()
                 };
-
+                
                 // If the step we have just executed is a flow control step, we want to
                 // find the next step by using the first output of the step we have just executed.
-                if step.role.as_ref().map_or(false, |r| r == &ShRole::FlowControl) {
-                    println!("Found flow control step {:?}", step.name);
-                    if let Some(output) = executed_step.outputs.first() {
-                        if let Some(output_value) = &output.value {
-                            if let Some(output_value_str) = output_value.as_str() {
-                                let next_step_id = output_value_str;
+                // if step.role.as_ref().map_or(false, |r| r == &ShRole::FlowControl) {
+                //     println!("Found flow control step {:?}", step.name);
+                //     if let Some(output) = executed_step.outputs.first() {
+                //         if let Some(output_value) = &output.value {
+                //             if let Some(output_value_str) = output_value.as_str() {
+                //                 let next_step_id = output_value_str;
 
-                                println!("next_step_id: {:?}", next_step_id);
-                                 // since steps are a HashMap, we can find the next step by using the next_step_id
-                                if let Some(_next_step) = action.steps.get(next_step_id) {
-                                    let new_execution_buffer = [remaining_buffer, vec![next_step_id.to_string()]].concat();
-                                    println!("updated_current_action: {:#?}", updated_current_action);
-                                    println!("new_execution_buffer: {:#?}", new_execution_buffer);
-                                    // Recursively continue with the updated state
-                                    Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await 
-                                } else {
-                                    Box::pin(self.process_steps(action, remaining_buffer)).await
-                                } 
-                            } else {
-                                Box::pin(self.process_steps(action, remaining_buffer)).await
-                            }
-                        } else {
-                            Box::pin(self.process_steps(action, remaining_buffer)).await
-                        }
-                    } else {
-                        Box::pin(self.process_steps(action, remaining_buffer)).await
-                    }
-                } else {
+                //                 println!("next_step_id: {:?}", next_step_id);
+                //                  // since steps are a HashMap, we can find the next step by using the next_step_id
+                //                 if let Some(_next_step) = action.steps.get(next_step_id) {
+                //                     let mut new_execution_buffer = remaining_buffer;
+                //                     self.push_to_execution_buffer(&mut new_execution_buffer, next_step_id.to_string());
+                //                     println!("updated_current_action: {:#?}", updated_current_action);
+                //                     println!("new_execution_buffer: {:#?}", new_execution_buffer);
+                //                     // Recursively continue with the updated state
+                //                     Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await 
+                //                 } else {
+                //                     Box::pin(self.process_steps(action, remaining_buffer)).await
+                //                 } 
+                //             } else {
+                //                 Box::pin(self.process_steps(action, remaining_buffer)).await
+                //             }
+                //         } else {
+                //             Box::pin(self.process_steps(action, remaining_buffer)).await
+                //         }
+                //     } else {
+                //         Box::pin(self.process_steps(action, remaining_buffer)).await
+                //     }
+                // } else {
                     // Now that we have injected all the possible parent/sibling values into
                     // the other siblings, we find the ready steps that are directly downstream of the
                     // step we have just executed and see if they are ready.
@@ -290,12 +310,17 @@ impl ExecutionEngine {
                         &current_step_id,
                         &updated_current_action.inputs)?;
 
+                    println!("downstream_ready_step_keys: {:#?}", downstream_ready_step_keys);
                     // Create new buffer by combining remaining steps with new downstream steps
-                    let new_execution_buffer = [remaining_buffer, downstream_ready_step_keys].concat();
+                    let mut new_execution_buffer = remaining_buffer;
+                    for step_id in downstream_ready_step_keys {
+                        self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
+                    }
                     
+                    println!("new_execution_buffer: {:#?}", new_execution_buffer);
                     // Recursively continue with the updated state
                     Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await
-                }
+                // }
              } else {
                  Box::pin(self.process_steps(action, remaining_buffer)).await
              }
@@ -374,7 +399,6 @@ impl ExecutionEngine {
             // For each input definition, we want to fetch the corresponding input value by index
             // and instantiate the input with the value.
             let value_to_inject = io_values.get(index).unwrap().clone();
-            println!("value_to_inject: {:#?}", value_to_inject);
             // Handle primitive types
             if input.r#type.as_str() == "string" || 
                 input.r#type.as_str() == "bool" ||
@@ -477,7 +501,7 @@ impl ExecutionEngine {
         // Try to resolve each output using both parent inputs and sibling outputs
         let resolved_outputs: Result<Vec<Value>, anyhow::Error> = output_definitions.iter()
             .map(|output_io| {
-                self.interpolate_from_parent_input_or_sibling_output(&output_io.template, &input_values, executed_steps)
+                self.interpolate_from_parent_input_or_sibling_output(&output_io.template, &input_values, executed_steps, Some(&output_io.r#type))
                     .and_then(|interpolated_template| {
                         if self.contains_unresolved_templates(&interpolated_template) {
                             Err(anyhow::anyhow!("Unresolved templates in output: {}", output_io.name))
@@ -507,7 +531,7 @@ impl ExecutionEngine {
                 // Try to resolve each step's inputs using both parent inputs and sibling outputs
                 let resolved_inputs: Result<Vec<Value>, ()> = step.inputs.iter()
                     .map(|input_io| {
-                        self.interpolate_from_parent_input_or_sibling_output(&input_io.template, &input_values, action_steps)
+                        self.interpolate_from_parent_input_or_sibling_output(&input_io.template, &input_values, action_steps, Some(&input_io.r#type))
                             .map_err(|_| ())
                             .and_then(|interpolated_template| {
                                 if self.contains_unresolved_templates(&interpolated_template) {
@@ -732,12 +756,18 @@ impl ExecutionEngine {
     fn interpolate_from_parent_input_or_sibling_output(&self, 
         template: &Value, 
         variables: &Vec<Value>,
-        executed_steps: &HashMap<String, ShAction>
+        executed_steps: &HashMap<String, ShAction>,
+        type_field: Option<&str>
     ) -> Result<Value> {
         match template {
             Value::String(s) => {
                 let resolved = self.interpolate_string_from_parent_input_or_sibling_output(s, variables, executed_steps)?;
                 
+                // if type_field == Some("any") {
+                //     println!("DEBUG: Resolved string is of type any: {}", resolved);
+                //     return Ok(Value::String(resolved));
+                // }
+
                 // Check if the resolved string is actually a JSON object/array
                 // by trying to parse it as JSON
                 match serde_json::from_str::<Value>(&resolved) {
@@ -764,7 +794,7 @@ impl ExecutionEngine {
                 // Recursively resolve object templates
                 let mut resolved_obj = serde_json::Map::new();
                 for (key, value) in obj {
-                    let resolved_value = self.interpolate_from_parent_input_or_sibling_output(value, variables, executed_steps)?;
+                    let resolved_value = self.interpolate_from_parent_input_or_sibling_output(value, variables, executed_steps, type_field)?;
                     resolved_obj.insert(key.to_string(), resolved_value);
                 }
                 Ok(Value::Object(resolved_obj))
@@ -772,7 +802,7 @@ impl ExecutionEngine {
             Value::Array(arr) => {
                 // Recursively resolve array templates
                 let resolved_arr: Result<Vec<Value>> = arr.iter()
-                    .map(|item| self.interpolate_from_parent_input_or_sibling_output(item, variables, executed_steps))
+                    .map(|item| self.interpolate_from_parent_input_or_sibling_output(item, variables, executed_steps, type_field))
                     .collect();
                 Ok(Value::Array(resolved_arr?))
             },
@@ -1172,15 +1202,34 @@ impl ExecutionEngine {
     ) -> Result<Vec<String>> {
         let mut dependent_ready_steps: Vec<String> = Vec::new();
         
+        // if the current step is a flow control step, we want to find it among the steps, 
+        // get the next step by using the first output of the step we have just executed.
+        if let Some(step) = steps.get(previous_step_id) {
+            if step.role.as_ref().map_or(false, |r| r == &ShRole::FlowControl) {
+                if let Some(output) = step.outputs.first() {
+                    if let Some(output_value) = &output.value {
+                        if let Some(output_value_str) = output_value.as_str() {
+                            let next_step_id = output_value_str;
+                            // Check if the step exists in the steps vector
+                            if steps.contains_key(next_step_id) {
+                                println!("Adding because of flow control step from previous step: {:?} -> {:?}", previous_step_id, next_step_id);
+                                dependent_ready_steps.push(next_step_id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+            
         for (step_id, step) in steps {
             // Skip if this is the step we just completed
             if step_id == previous_step_id {
                 continue;
             }
-            
-            
+
             let depends_on = self.step_depends_on(step, previous_step_id);
             let is_ready = self.are_all_inputs_ready(step, parent_inputs)?;
+
             // Check if this step depends on the completed step and is now ready
             if depends_on && is_ready {
                 dependent_ready_steps.push(step_id.clone());
@@ -5239,6 +5288,69 @@ mod tests {
         let outputs_array = outputs.as_array().unwrap();
         assert_eq!(outputs_array.len(), 1);
         assert_eq!(outputs_array[0], json!(123.0)); // Should be cast to number
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_if() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the if action directly
+        let action_ref = "std/if:0.0.1";
+        
+        // Test with five inputs: a, operator, b, then, else
+        let inputs = vec![
+            json!(15),  // a (value to compare)
+            json!(">"),   // operator
+            json!(10),  // b (comparison value)
+            json!("then_step"),  // then (step to execute if true)
+            json!("else_step")   // else (step to execute if false)
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid if action_ref and inputs");
+        
+        let outputs = result.unwrap();
+        println!("outputs: {:#?}", outputs);
+        // Should have one output with the step ID to execute
+        assert!(outputs.is_array(), "outputs should be an array");
+        let outputs_array = outputs.as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        assert_eq!(outputs_array[0], json!("then_step")); // Should return "then_step" since 15 > 10
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_if_else() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the if action directly with a < b condition
+        let action_ref = "std/if:0.0.1";
+        
+        // Test with five inputs: a, operator, b, then, else
+        let inputs = vec![
+            json!(5),   // a (value to compare)
+            json!("<"), // operator
+            json!(10),  // b (comparison value)
+            json!("then_step"),  // then (step to execute if true)
+            json!("else_step")   // else (step to execute if false)
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid if action_ref and inputs");
+        
+        let outputs = result.unwrap();
+        println!("outputs: {:#?}", outputs);
+        
+        // Should have one output with the step ID to execute
+        assert!(outputs.is_array(), "outputs should be an array");
+        let outputs_array = outputs.as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        assert_eq!(outputs_array[0], json!("then_step")); // Should return "then_step" since 5 < 10
     }
 
     #[tokio::test]
