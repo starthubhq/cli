@@ -3,6 +3,15 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
+// ---- Action roles ----
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ShRole {
+    #[serde(rename = "flow_control")]
+    FlowControl,
+    #[serde(rename = "typing_control")]
+    TypingControl
+}
+
 // ---- Starthub manifest schema ----
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShManifest {
@@ -12,7 +21,7 @@ pub struct ShManifest {
     pub version: String,
     pub kind: Option<ShKind>,
     #[serde(default)]
-    pub flow_control: bool,
+    pub role: Option<ShRole>,
     pub manifest_version: u32,
     pub repository: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -75,7 +84,7 @@ pub struct ShAction {
     pub outputs: Vec<ShIO>,             // Array format: [{"name": "...", "type": "...", "value": ...}]
     pub parent_action: Option<String>,   // UUID of parent action (None for root)
     pub steps: HashMap<String, ShAction>, // Nested actions keyed by UUID
-    pub flow_control: bool,               // Flow control capability
+    pub role: Option<ShRole>,            // Role: FlowControl, TypingControl, etc.
     
     // Manifest structure fields
     pub types: Option<serde_json::Map<String, Value>>,   // From manifest.types
