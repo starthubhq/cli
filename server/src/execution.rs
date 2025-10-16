@@ -65,7 +65,8 @@ impl ExecutionEngine {
         let inputs_to_inject = self.instantiate_io(
             &root_action.inputs,
             &inputs, 
-            &root_action.types)?;
+            &root_action.types,
+            root_action.role.as_ref())?;
         
         
         // Create a new action with injected inputs (avoiding deep clone)
@@ -142,7 +143,8 @@ impl ExecutionEngine {
             let updated_outputs = self.instantiate_io(
                 &action.outputs,
                 &json_objects,
-                &action.types
+                &action.types,
+                action.role.as_ref()
             )?;
 
             let updated_action = ShAction {
@@ -191,7 +193,7 @@ impl ExecutionEngine {
         // Create a new action with resolved outputs
         let updated_action = ShAction {
             steps: processed_steps,
-            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types)?,
+            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types, action.role.as_ref())?,
             ..action.clone()
         };
 
@@ -329,12 +331,14 @@ impl ExecutionEngine {
         &self,
         io_fields: &Vec<ShIO>,
         io_values: &Vec<Value>,
-        types: &Option<serde_json::Map<String, Value>>
+        types: &Option<serde_json::Map<String, Value>>,
+        action_role: Option<&ShRole>
     ) -> Result<Vec<ShIO>> {
         let cast_values = self.cast(
             types,
             io_fields,
-            io_values
+            io_values,
+            action_role
         )?;
 
         let result = io_fields.iter()
@@ -358,7 +362,13 @@ impl ExecutionEngine {
     fn cast(&self,
         types: &Option<serde_json::Map<String, Value>>, 
         io_definitions: &Vec<ShIO>,
-        io_values: &Vec<Value>) -> Result<Vec<Value>> {
+        io_values: &Vec<Value>,
+        action_role: Option<&ShRole>) -> Result<Vec<Value>> {
+        // Skip schema validation for typing_control actions - return values as-is
+        if action_role.map_or(false, |role| role == &ShRole::TypingControl) {
+            return Ok(io_values.clone());
+        }
+
         let mut values_to_inject: Vec<Value> = Vec::new();
         for (index, input) in io_definitions.iter().enumerate() {
             // For each input definition, we want to fetch the corresponding input value by index
@@ -513,7 +523,8 @@ impl ExecutionEngine {
                     let inputs_to_inject = self.instantiate_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
-                        &step.types).ok();
+                        &step.types,
+                        step.role.as_ref()).ok();
                     
                     if let Some(inputs_to_inject) = inputs_to_inject {
                         // Create new step with injected inputs
@@ -1271,7 +1282,8 @@ impl ExecutionEngine {
                     let inputs_to_inject = self.instantiate_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
-                        &step.types).ok();
+                        &step.types,
+                        step.role.as_ref()).ok();
                     
                     if let Some(inputs_to_inject) = inputs_to_inject {
                         // Create new step with injected inputs
@@ -4227,7 +4239,7 @@ mod tests {
             }
         ];
         let io_values1 = vec![Value::String("John".to_string())];
-        let result1 = engine.cast(&types1, &io_definitions1, &io_values1).unwrap();
+        let result1 = engine.cast(&types1, &io_definitions1, &io_values1, None).unwrap();
         assert_eq!(result1.len(), 1);
         assert_eq!(result1[0], Value::String("John".to_string()));
         
@@ -4242,7 +4254,7 @@ mod tests {
             }
         ];
         let io_values2 = vec![Value::Bool(true)];
-        let result2 = engine.cast(&types1, &io_definitions2, &io_values2).unwrap();
+        let result2 = engine.cast(&types1, &io_definitions2, &io_values2, None).unwrap();
         assert_eq!(result2.len(), 1);
         assert_eq!(result2[0], Value::Bool(true));
         
@@ -4257,7 +4269,7 @@ mod tests {
             }
         ];
         let io_values3 = vec![Value::Number(30.into())];
-        let result3 = engine.cast(&types1, &io_definitions3, &io_values3).unwrap();
+        let result3 = engine.cast(&types1, &io_definitions3, &io_values3, None).unwrap();
         assert_eq!(result3.len(), 1);
         assert_eq!(result3[0], Value::Number(30.into()));
         
@@ -4276,7 +4288,7 @@ mod tests {
             map.insert("key".to_string(), Value::String("value".to_string()));
             map
         })];
-        let result4 = engine.cast(&types1, &io_definitions4, &io_values4).unwrap();
+        let result4 = engine.cast(&types1, &io_definitions4, &io_values4, None).unwrap();
         assert_eq!(result4.len(), 1);
         assert_eq!(result4[0], io_values4[0]);
         
@@ -4309,7 +4321,7 @@ mod tests {
             Value::Number(25.into()),
             Value::Bool(false)
         ];
-        let result5 = engine.cast(&types1, &io_definitions5, &io_values5).unwrap();
+        let result5 = engine.cast(&types1, &io_definitions5, &io_values5, None).unwrap();
         assert_eq!(result5.len(), 3);
         assert_eq!(result5[0], Value::String("Alice".to_string()));
         assert_eq!(result5[1], Value::Number(25.into()));
@@ -4351,7 +4363,7 @@ mod tests {
             user_obj.insert("age".to_string(), Value::Number(30.into()));
             user_obj
         })];
-        let result6 = engine.cast(&types6, &io_definitions6, &io_values6).unwrap();
+        let result6 = engine.cast(&types6, &io_definitions6, &io_values6, None).unwrap();
         assert_eq!(result6.len(), 1);
         assert_eq!(result6[0], io_values6[0]);
         
@@ -4362,7 +4374,7 @@ mod tests {
             // Missing required "age" field
             user_obj
         })];
-        let result7 = engine.cast(&types6, &io_definitions6, &io_values7);
+        let result7 = engine.cast(&types6, &io_definitions6, &io_values7, None);
         assert!(result7.is_err());
         assert!(result7.unwrap_err().to_string().contains("Value 0 is invalid"));
         
@@ -4373,7 +4385,7 @@ mod tests {
             user_obj.insert("age".to_string(), Value::Number(30.into()));
             user_obj
         })];
-        let result8 = engine.cast(&types6, &io_definitions6, &io_values8);
+        let result8 = engine.cast(&types6, &io_definitions6, &io_values8, None);
         assert!(result8.is_err());
         assert!(result8.unwrap_err().to_string().contains("Value 0 is invalid"));
         
@@ -4385,7 +4397,7 @@ mod tests {
             user_obj.insert("extra".to_string(), Value::String("not allowed".to_string())); // Additional property
             user_obj
         })];
-        let result9 = engine.cast(&types6, &io_definitions6, &io_values9);
+        let result9 = engine.cast(&types6, &io_definitions6, &io_values9, None);
         assert!(result9.is_err());
         assert!(result9.unwrap_err().to_string().contains("Value 0 is invalid"));
         
@@ -4415,7 +4427,7 @@ mod tests {
                 user_obj
             })
         ];
-        let result10 = engine.cast(&types6, &io_definitions10, &io_values10).unwrap();
+        let result10 = engine.cast(&types6, &io_definitions10, &io_values10, None).unwrap();
         assert_eq!(result10.len(), 2);
         assert_eq!(result10[0], Value::String("Test Title".to_string()));
         assert_eq!(result10[1], io_values10[1]);
@@ -4458,7 +4470,7 @@ mod tests {
                 user_obj
             })
         ])];
-        let result11 = engine.cast(&types11, &io_definitions11, &io_values11).unwrap();
+        let result11 = engine.cast(&types11, &io_definitions11, &io_values11, None).unwrap();
         assert_eq!(result11.len(), 1);
         assert_eq!(result11[0], io_values11[0]);
         
@@ -4473,7 +4485,7 @@ mod tests {
             }
         ];
         let io_values12 = vec![Value::String("test".to_string())];
-        let result12 = engine.cast(&types6, &io_definitions12, &io_values12).unwrap();
+        let result12 = engine.cast(&types6, &io_definitions12, &io_values12, None).unwrap();
         // Should pass through unchanged since UnknownType is not in types map
         assert_eq!(result12.len(), 1);
         assert_eq!(result12[0], Value::String("test".to_string()));
@@ -4494,14 +4506,14 @@ mod tests {
             }
         ];
         let io_values13 = vec![Value::String("test".to_string())];
-        let result13 = engine.cast(&types13, &io_definitions13, &io_values13);
+        let result13 = engine.cast(&types13, &io_definitions13, &io_values13, None);
         assert!(result13.is_err());
         assert!(result13.unwrap_err().to_string().contains("Failed to compile schema for type 'InvalidType'"));
         
         // Test case 14: Empty IO definitions and values
         let io_definitions14 = vec![];
         let io_values14 = vec![];
-        let result14 = engine.cast(&types1, &io_definitions14, &io_values14).unwrap();
+        let result14 = engine.cast(&types1, &io_definitions14, &io_values14, None).unwrap();
         assert_eq!(result14.len(), 0);
         
         // Test case 15: Mismatched IO definitions and values length (should panic)
@@ -4517,7 +4529,7 @@ mod tests {
         let io_values15 = vec![]; // Empty values
         // This should panic due to index out of bounds
         let result15 = std::panic::catch_unwind(|| {
-            engine.cast(&types1, &io_definitions15, &io_values15)
+            engine.cast(&types1, &io_definitions15, &io_values15, None)
         });
         assert!(result15.is_err()); // Should panic on unwrap() when getting value by index
     }
@@ -4549,7 +4561,7 @@ mod tests {
         ];
         let types1 = None;
         
-        let result1 = engine.instantiate_io(&io_fields1, &input_values1, &types1);
+        let result1 = engine.instantiate_io(&io_fields1, &input_values1, &types1, None);
         assert!(result1.is_ok());
         
         // Check that values were injected
@@ -4583,7 +4595,7 @@ mod tests {
             })
         ];
         
-        let result2 = engine.instantiate_io(&io_fields2, &input_values2, &types1);
+        let result2 = engine.instantiate_io(&io_fields2, &input_values2, &types1, None);
         assert!(result2.is_ok());
         
         // Check that values were injected
@@ -4629,7 +4641,7 @@ mod tests {
             user_obj
         })];
         
-        let result3 = engine.instantiate_io(&io_fields3, &input_values3, &types3);
+        let result3 = engine.instantiate_io(&io_fields3, &input_values3, &types3, None);
         assert!(result3.is_ok());
         
         // Check that value was injected
@@ -4663,7 +4675,7 @@ mod tests {
             })
         ];
         
-        let result4 = engine.instantiate_io(&io_fields4, &input_values4, &types3);
+        let result4 = engine.instantiate_io(&io_fields4, &input_values4, &types3, None);
         assert!(result4.is_ok());
         
         // Check that both values were injected
@@ -4688,7 +4700,7 @@ mod tests {
             user_obj
         })];
         
-        let result5 = engine.instantiate_io(&io_fields5, &input_values5, &types3);
+        let result5 = engine.instantiate_io(&io_fields5, &input_values5, &types3, None);
         assert!(result5.is_err());
         assert!(result5.unwrap_err().to_string().contains("Value 0 is invalid"));
         
@@ -4710,7 +4722,7 @@ mod tests {
         ];
         let input_values6 = vec![Value::String("test".to_string())];
         
-        let result6 = engine.instantiate_io(&io_fields6, &input_values6, &types6);
+        let result6 = engine.instantiate_io(&io_fields6, &input_values6, &types6, None);
         assert!(result6.is_err());
         assert!(result6.unwrap_err().to_string().contains("Failed to compile schema for type 'InvalidType'"));
         
@@ -4718,7 +4730,7 @@ mod tests {
         let io_fields7 = vec![];
         let input_values7 = vec![];
         
-        let result7 = engine.instantiate_io(&io_fields7, &input_values7, &types1);
+        let result7 = engine.instantiate_io(&io_fields7, &input_values7, &types1, None);
         assert!(result7.is_ok());
         
         // Test case 8: Unknown type (should pass through)
@@ -4733,7 +4745,7 @@ mod tests {
         ];
         let input_values8 = vec![Value::String("test_value".to_string())];
         
-        let result8 = engine.instantiate_io(&io_fields8, &input_values8, &types3);
+        let result8 = engine.instantiate_io(&io_fields8, &input_values8, &types3, None);
         assert!(result8.is_ok());
         
         // Check that value was injected (pass through behavior)
@@ -4780,7 +4792,7 @@ mod tests {
             })
         ])];
         
-        let result9 = engine.instantiate_io(&io_fields9, &input_values9, &types9);
+        let result9 = engine.instantiate_io(&io_fields9, &input_values9, &types9, None);
         assert!(result9.is_ok());
         
         // Check that value was injected
@@ -4799,7 +4811,7 @@ mod tests {
         ];
         let input_values10 = vec![Value::Null];
         
-        let result10 = engine.instantiate_io(&io_fields10, &input_values10, &types1);
+        let result10 = engine.instantiate_io(&io_fields10, &input_values10, &types1, None);
         assert!(result10.is_ok());
         
         // Check that null value was injected
@@ -5198,6 +5210,35 @@ mod tests {
         // Check that the first output contains the next step ID
         let first_output = &outputs_array[0];
         assert_eq!(first_output, "next_step_id");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_cast() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the cast action directly
+        let action_ref = "std/cast:0.0.1";
+        
+        // Test with three inputs: value, input_type, and output_type
+        let inputs = vec![
+            json!("123"),  // value (string)
+            json!("string"),  // input_type
+            json!("number")   // output_type
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid cast action_ref and inputs");
+        
+        let outputs = result.unwrap();
+        
+        // Should have one output with the casted value
+        assert!(outputs.is_array(), "outputs should be an array");
+        let outputs_array = outputs.as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
+        assert_eq!(outputs_array[0], json!(123.0)); // Should be cast to number
     }
 
     #[tokio::test]
