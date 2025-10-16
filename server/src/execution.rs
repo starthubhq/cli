@@ -102,6 +102,7 @@ impl ExecutionEngine {
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
                 .collect();
 
+            println!("input_values to wasm: {:#?}", input_values);
             let result = if action.kind == "wasm" {
                 wasm::run_wasm_step(
                     action, 
@@ -120,6 +121,7 @@ impl ExecutionEngine {
             
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
 
+            println!("result: {:#?}", result);
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
                 Vec::new()
@@ -134,6 +136,8 @@ impl ExecutionEngine {
                     Vec::new()
                 }
             };
+
+            println!("json_objects: {:#?}", json_objects);
             // inject the outputs into the action
             let updated_outputs = self.instantiate_io(
                 &action.outputs,
@@ -145,6 +149,8 @@ impl ExecutionEngine {
                 outputs: updated_outputs,
                 ..action.clone()
             };
+
+            println!("before returning from action: {:#?}", updated_action.name);
             
             return Ok(updated_action);
         }
@@ -217,6 +223,7 @@ impl ExecutionEngine {
                 // We exeute the step recursively
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
 
+                println!("executed_step outputs: {:#?}", executed_step.outputs);
                 // Once we have executed the step, we want to update the corresponding step
                 // in the current action.
                 let updated_steps: HashMap<String, ShAction> = action.steps.iter()
@@ -357,7 +364,7 @@ impl ExecutionEngine {
             // For each input definition, we want to fetch the corresponding input value by index
             // and instantiate the input with the value.
             let value_to_inject = io_values.get(index).unwrap().clone();
-            
+            println!("value_to_inject: {:#?}", value_to_inject);
             // Handle primitive types
             if input.r#type.as_str() == "string" || 
                 input.r#type.as_str() == "bool" ||
@@ -6077,6 +6084,70 @@ mod tests {
         assert_eq!(output_obj["id"], 1);
         // Value should be a string (could be empty if simulator doesn't exist)
         assert!(output_obj["value"].is_number());
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_poll_simulator_state_by_id() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the poll simulator state action
+        let action_ref = "starthubhq/poll-simulator-state-by-id:0.0.1";
+        
+        // Test with simulator_id and api_key inputs
+        let inputs = vec![
+            json!("1"),  // simulator_id as string
+            json!("sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe")  // api_key as string
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid poll simulator state action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["kind"], "composition");
+        assert_eq!(action_tree["uses"], action_ref);
+        
+        // Verify the composition has steps
+        let steps = &action_tree["steps"];
+        assert!(steps.is_object(), "steps should be an object");
+        
+        let steps_obj = steps.as_object().unwrap();
+        assert!(steps_obj.contains_key("get_simulator"), "should contain get_simulator step");
+        assert!(steps_obj.contains_key("sleep"), "should contain sleep step");
+        
+        // Verify get_simulator step uses the correct action
+        let get_simulator_step = &steps_obj["get_simulator"];
+        assert_eq!(get_simulator_step["uses"], "starthubhq/get-simulator-by-id:0.0.1");
+        
+        // Verify sleep step uses the correct action
+        let sleep_step = &steps_obj["sleep"];
+        assert_eq!(sleep_step["uses"], "std/sleep:0.0.1");
+        
+        // Verify sleep step has flow control inputs
+        let sleep_inputs = &sleep_step["inputs"];
+        assert!(sleep_inputs.is_array(), "sleep inputs should be an array");
+        
+        let sleep_inputs_array = sleep_inputs.as_array().unwrap();
+        assert_eq!(sleep_inputs_array.len(), 3, "sleep should have 3 inputs");
+        
+        // Check seconds input
+        let seconds_input = &sleep_inputs_array[0];
+        assert_eq!(seconds_input["name"], "seconds");
+        assert_eq!(seconds_input["value"], 5);
+        
+        // Check next_step input
+        let next_step_input = &sleep_inputs_array[1];
+        assert_eq!(next_step_input["name"], "next_step");
+        assert_eq!(next_step_input["value"], "get_simulator");
+        
+        // Check depends_on input
+        let depends_on_input = &sleep_inputs_array[2];
+        assert_eq!(depends_on_input["name"], "depends_on");
+        assert_eq!(depends_on_input["value"], "{{steps.get_simulator.outputs[0].id}}");
     }
     
 
