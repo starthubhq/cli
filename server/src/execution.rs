@@ -55,16 +55,18 @@ impl ExecutionEngine {
         
         // 1. Build the action tree
         self.logger.log_info("Building action tree...", None);
+        
         let root_action = self.build_action_tree(
             action_ref,         // Action reference to download
             None,               // No parent action ID (root)
         ).await?;     
-
+        
         // 1) Instantiate and assign the inputs according to the types specified
         let inputs_to_inject = self.instantiate_io(
             &root_action.inputs,
             &inputs, 
             &root_action.types)?;
+        
         
         // Create a new action with injected inputs (avoiding deep clone)
         let new_root_action = ShAction {
@@ -72,6 +74,7 @@ impl ExecutionEngine {
             ..root_action
         };        
 
+        
         self.logger.log_success("Action tree built successfully", Some(&new_root_action.id));
 
         self.logger.log_info("Executing action tree...", Some(&new_root_action.id));
@@ -91,6 +94,7 @@ impl ExecutionEngine {
     async fn run_action_tree(&mut self, action: &ShAction) -> Result<ShAction> {
         // Base condition.
         if action.kind == "wasm" || action.kind == "docker" {
+            println!("running wasm action: {:?}", action.name);
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
 
             // Extract values from inputs before serializing
@@ -130,7 +134,6 @@ impl ExecutionEngine {
                     Vec::new()
                 }
             };
-
             // inject the outputs into the action
             let updated_outputs = self.instantiate_io(
                 &action.outputs,
@@ -201,14 +204,16 @@ impl ExecutionEngine {
             // Get the first step and create a new buffer without it
             let current_step_id = execution_buffer.first().unwrap().clone();
 
+            println!("current_step_id from recursive call: {:?}", current_step_id);
             // We create a new buffer without the first step.
             let remaining_buffer = execution_buffer.into_iter().skip(1).collect();
-            
+            println!("remaining_buffer: {:#?}", remaining_buffer);
             // Execute the step recursively
             if let Some(step) = action.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
 
+                println!("step to execute: {:#?}", step.name);
                 // We exeute the step recursively
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
 
@@ -241,14 +246,18 @@ impl ExecutionEngine {
                 // If the step we have just executed is a flow control step, we want to
                 // find the next step by using the first output of the step we have just executed.
                 if step.flow_control {
+                    println!("Found flow control step {:?}", step.name);
                     if let Some(output) = executed_step.outputs.first() {
                         if let Some(output_value) = &output.value {
                             if let Some(output_value_str) = output_value.as_str() {
                                 let next_step_id = output_value_str;
 
+                                println!("next_step_id: {:?}", next_step_id);
                                  // since steps are a HashMap, we can find the next step by using the next_step_id
                                 if let Some(_next_step) = action.steps.get(next_step_id) {
                                     let new_execution_buffer = [remaining_buffer, vec![next_step_id.to_string()]].concat();
+                                    println!("updated_current_action: {:#?}", updated_current_action);
+                                    println!("new_execution_buffer: {:#?}", new_execution_buffer);
                                     // Recursively continue with the updated state
                                     Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await 
                                 } else {
@@ -347,9 +356,6 @@ impl ExecutionEngine {
         for (index, input) in io_definitions.iter().enumerate() {
             // For each input definition, we want to fetch the corresponding input value by index
             // and instantiate the input with the value.
-            println!("index: {}", index);
-            println!("input: {:#?}", input);
-            println!("io_values: {:#?}", io_values);
             let value_to_inject = io_values.get(index).unwrap().clone();
             
             // Handle primitive types
@@ -1008,7 +1014,7 @@ impl ExecutionEngine {
             permissions: manifest.permissions.clone(),
         };
         
-        // 4. For each step, call the build_action_tree function recursively
+                // 4. For each step, call the build_action_tree function recursively
         for (_step_name, step_value) in manifest.steps {
             if let Some(uses_value) = step_value.get("uses") {
                 if let Some(uses_str) = uses_value.as_str() {
@@ -1033,14 +1039,12 @@ impl ExecutionEngine {
                         }
                     }
 
+                    
                     // Add child to parent's children HashMap
                     action_state.steps.insert(_step_name.clone(), child_action);
                 }
             }
         }
-
-        // At this point we have resolved all the children
-        // Steps will be executed dynamically based on dependencies during runtime
 
         return Ok(action_state);
     }
@@ -5164,10 +5168,11 @@ mod tests {
         // Test executing the sleep action directly
         let action_ref = "std/sleep:0.0.1";
         
-        // Test with two inputs: seconds and ignored value
+        // Test with three inputs: seconds, next_step, and depends_on
         let inputs = vec![
             json!(5),  // seconds
-            json!("next_step_id") 
+            json!("next_step_id"),  // next_step
+            json!("dependency_step_id")  // depends_on
         ];
         
         let result = engine.execute_action(action_ref, inputs).await;
@@ -5186,6 +5191,67 @@ mod tests {
         // Check that the first output contains the next step ID
         let first_output = &outputs_array[0];
         assert_eq!(first_output, "next_step_id");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_poll_weather() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the poll weather action
+        let action_ref = "starthubhq/poll-weather-by-location-name:0.0.1";
+        
+        // Test with weather config input
+        let inputs = vec![
+            json!({
+                "location_name": "rome",
+                "open_weather_api_key": "f13e712db9557544db878888528a5e29"
+            })
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid poll weather action_ref and inputs");
+        
+        let action_tree = result.unwrap();
+        
+        // Verify the action structure
+        assert_eq!(action_tree["kind"], "composition");
+        assert_eq!(action_tree["uses"], action_ref);
+        
+        // Verify the composition has steps
+        let steps = &action_tree["steps"];
+        assert!(steps.is_object(), "steps should be an object");
+        
+        let steps_obj = steps.as_object().unwrap();
+        assert!(steps_obj.contains_key("get_weather"), "should contain get_weather step");
+        assert!(steps_obj.contains_key("sleep"), "should contain sleep step");
+        
+        // Verify get_weather step uses the correct action
+        let get_weather_step = &steps_obj["get_weather"];
+        assert_eq!(get_weather_step["uses"], "starthubhq/get-weather-by-location-name:0.0.1");
+        
+        // Verify sleep step uses the correct action
+        let sleep_step = &steps_obj["sleep"];
+        assert_eq!(sleep_step["uses"], "starthubhq/sleep:0.0.1");
+        
+        // Verify sleep step has flow control inputs
+        let sleep_inputs = &sleep_step["inputs"];
+        assert!(sleep_inputs.is_array(), "sleep inputs should be an array");
+        
+        let sleep_inputs_array = sleep_inputs.as_array().unwrap();
+        assert_eq!(sleep_inputs_array.len(), 2, "sleep should have 2 inputs");
+        
+        // Check seconds input
+        let seconds_input = &sleep_inputs_array[0];
+        assert_eq!(seconds_input["name"], "seconds");
+        assert_eq!(seconds_input["value"], 5);
+        
+        // Check next_step input
+        let next_step_input = &sleep_inputs_array[1];
+        assert_eq!(next_step_input["name"], "next_step");
+        assert_eq!(next_step_input["value"], "get_weather");
     }
 
     // #[tokio::test]
@@ -5976,6 +6042,43 @@ mod tests {
         //            "HTTP response should contain status, body, or headers");
         // }
     }
+
+    #[tokio::test]
+    async fn test_execute_action_get_simulator_by_id() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action with simulator_id input
+        let action_ref = "starthubhq/get-simulator-by-id:0.0.1";
+        let inputs = vec![
+            json!("1"),  // simulator_id as string
+            json!("sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe")  // api_key as string
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+        
+        let outputs = result.unwrap();
+        println!("outputs: {:#?}", outputs);
+        // The function returns an array of output values directly
+        assert!(outputs.is_array());
+        let outputs_array = outputs.as_array().unwrap();
+        assert_eq!(outputs_array.len(), 1);
     
+        let output = &outputs_array[0];
+        assert!(output.is_object());
+        let output_obj = output.as_object().unwrap();
+        
+        // Verify the output has the expected structure with id and value
+        assert!(output_obj.contains_key("id"));
+        assert!(output_obj.contains_key("value"));
+        assert_eq!(output_obj["id"], 1);
+        // Value should be a string (could be empty if simulator doesn't exist)
+        assert!(output_obj["value"].is_number());
+    }
+    
+
     
 }
