@@ -132,6 +132,7 @@ pub enum ShType {
     Boolean,
     Object,
     Array,
+    Id,
     // Custom types are allowed
     Custom(String),
 }
@@ -143,6 +144,7 @@ impl serde::Serialize for ShType {
     {
         let s = match self {
             ShType::String => "string",
+            ShType::Id => "id",
             ShType::Number => "number",
             ShType::Boolean => "boolean",
             ShType::Object => "object",
@@ -219,6 +221,12 @@ pub struct MountSpec {
     pub target: String,
     pub rw: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShExecutionFrame {
+    pub timestamp: String,
+}
+
 
 
 // API Client for StartHub
