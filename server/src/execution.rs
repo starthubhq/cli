@@ -172,12 +172,6 @@ impl ExecutionEngine {
             execution_buffer,
         ).await?;
 
-        // println!("DEBUG: iterate_through_siblings returned successfully for step: {}", action.name);
-        
-        // println!("Processed steps: {:#?}", processed_steps);
-        // At this point we have executed all the steps of the current action.
-        // Since now we returned to the parent, we need to aggregate the outputs back at the higher level.
-
         // The outputs could be coming from the parent inputs or the sibling steps.
         let resolved_outputs = self.resolve_outputs(
             &action.outputs,
@@ -185,7 +179,6 @@ impl ExecutionEngine {
             &processed_steps
         )?;
 
-        // println!("Resolved outputs: {:#?}", resolved_outputs);
         // Create a new action with resolved outputs
         let updated_action = ShAction {
             steps: processed_steps,
@@ -193,11 +186,6 @@ impl ExecutionEngine {
             ..action.clone()
         };
 
-        // println!("Processed action: {:#?}", updated_action);
-        // println!("*********************************");
-        // // println!("Processed action: {:#?}", updated_action);
-        // println!("11111111111");
-        // println!("DEBUG: About to return from run_action_tree for step: ");
         Ok(updated_action)
     }
 
@@ -359,6 +347,9 @@ impl ExecutionEngine {
         for (index, input) in io_definitions.iter().enumerate() {
             // For each input definition, we want to fetch the corresponding input value by index
             // and instantiate the input with the value.
+            println!("index: {}", index);
+            println!("input: {:#?}", input);
+            println!("io_values: {:#?}", io_values);
             let value_to_inject = io_values.get(index).unwrap().clone();
             
             // Handle primitive types
@@ -5175,23 +5166,26 @@ mod tests {
         
         // Test with two inputs: seconds and ignored value
         let inputs = vec![
-            json!(2.5),  // seconds
-            json!("ignored_value")  // second input that will be ignored
+            json!(5),  // seconds
+            json!("next_step_id") 
         ];
         
-        println!("Testing sleep action with inputs: {:#?}", inputs);
         let result = engine.execute_action(action_ref, inputs).await;
         
-        println!("Sleep test result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid sleep action_ref and inputs");
         
-        let action_tree = result.unwrap();
+        let outputs = result.unwrap();
         
-        // Verify the action structure
-        assert_eq!(action_tree["name"], "sleep");
-        assert_eq!(action_tree["kind"], "wasm");
-        assert_eq!(action_tree["uses"], action_ref);
+        // Verify the outputs contain the next step ID
+        assert!(outputs.is_array(), "outputs should be an array");
+        
+        let outputs_array = outputs.as_array().unwrap();
+        assert!(!outputs_array.is_empty(), "outputs array should not be empty");
+        
+        // Check that the first output contains the next step ID
+        let first_output = &outputs_array[0];
+        assert_eq!(first_output, "next_step_id");
     }
 
     // #[tokio::test]
