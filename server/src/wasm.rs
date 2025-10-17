@@ -23,7 +23,7 @@ pub async fn run_wasm_step(
         bail!("wasmtime not found in PATH");
     }
 
-    log_info(&format!("Downloading WASM module: {}", action.uses), Some(&action.id));
+    
     // For now, we'll create a simple implementation that downloads the WASM file
     // In a real implementation, this would download from the registry
     let module_path = download_wasm(&action.uses, &action.mirrors, cache_dir).await?;
@@ -197,7 +197,6 @@ pub async fn download_wasm(
     mirrors: &[String], 
     cache_dir: &PathBuf
 ) -> Result<PathBuf> {
-    println!("Downloading WASM file for action: {}", action_ref);
     // Construct the WASM file path in the cache directory with proper directory structure
     let url_path = action_ref.replace(":", "/");
     let wasm_dir = cache_dir.join(&url_path);
@@ -208,7 +207,6 @@ pub async fn download_wasm(
     
     // Check if the WASM file already exists
     if wasm_path.exists() {
-        println!("WASM file already exists: {:?}", wasm_path);
         return Ok(wasm_path);
     }
     
