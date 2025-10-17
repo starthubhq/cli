@@ -74,13 +74,11 @@ impl ExecutionEngine {
             &root_action.types,
             root_action.role.as_ref())?;
         
-        
         // Create a new action with injected inputs (avoiding deep clone)
         let new_root_action = ShAction {
             inputs: inputs_to_inject,
             ..root_action
         };        
-
         
         self.logger.log_success("Action tree built successfully", Some(&new_root_action.id));
 
@@ -1075,13 +1073,23 @@ impl ExecutionEngine {
                     if let Some(step_inputs) = step_value.get("inputs") {
                         if let Some(inputs_array) = step_inputs.as_array() {
                             for (index, input) in inputs_array.iter().enumerate() {
-                                if let Some(input_obj) = input.as_object() {
-                                    if let Some(child_input) = child_action.inputs.get_mut(index) {
-                                        // Inject the template value from the step input
-                                        if let Some(template_value) = input_obj.get("value") {
-                                            child_input.template = template_value.clone();
+                                if let Some(child_input) = child_action.inputs.get_mut(index) {
+                                    // Handle both formats:
+                                    // 1. New format: direct values (string, object, etc.)
+                                    // 2. Old format: objects with "value" property
+                                    let template_value = if let Some(input_obj) = input.as_object() {
+                                        // Old format: object with "value" property
+                                        if let Some(value) = input_obj.get("value") {
+                                            value.clone()
+                                        } else {
+                                            input.clone()
                                         }
-                                    }
+                                    } else {
+                                        // New format: direct value
+                                        input.clone()
+                                    };
+                                    
+                                    child_input.template = template_value;
                                 }
                             }
                         }
@@ -6301,6 +6309,87 @@ mod tests {
         let depends_on_input = &sleep_inputs_array[2];
         assert_eq!(depends_on_input["name"], "depends_on");
         assert_eq!(depends_on_input["value"], "{{steps.get_simulator.outputs[0].id}}");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_openweather_coordinates_by_location_name() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the openweather-coordinates-by-location-name action
+        let action_ref = "starthubhq/openweather-coordinates-by-location-name:0.0.1";
+        
+        // Test with location name and API key
+        let inputs = vec![
+            json!({
+                "location_name": "London",
+                "open_weather_api_key": "f13e712db9557544db878888528a5e29"
+            })
+        ];
+        
+        println!("Testing openweather-coordinates-by-location-name action with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed in terms of action parsing and execution setup
+        // Note: The actual API call might fail due to invalid API key, but the composition should be properly executed
+        assert!(result.is_ok(), "execute_action should succeed for valid openweather-coordinates-by-location-name action_ref and inputs");
+        
+        let outputs = result.unwrap();
+        
+                // Verify that we got outputs
+        assert!(outputs.is_array(), "execute_action should return an array of outputs");
+        let outputs_array = outputs.as_array().unwrap();
+        
+        // For a composition action, we expect at least one output
+        assert!(!outputs_array.is_empty(), "Composition action should produce outputs");
+        
+        // Verify the output structure - should contain geocoding response
+        let first_output = &outputs_array[0];
+        assert!(first_output.is_object(), "Output should be an object");
+        
+        let output_obj = first_output.as_object().unwrap();
+        
+        // Verify the output has the expected structure based on the starthub-lock.json
+        // The output should contain coordinates, name, country, state, and local_names
+        assert!(output_obj.contains_key("name"), "Output should contain 'name' field");
+        assert!(output_obj.contains_key("lat"), "Output should contain 'lat' field");
+        assert!(output_obj.contains_key("lon"), "Output should contain 'lon' field");
+        assert!(output_obj.contains_key("country"), "Output should contain 'country' field");
+        assert!(output_obj.contains_key("state"), "Output should contain 'state' field");
+        assert!(output_obj.contains_key("local_names"), "Output should contain 'local_names' field");
+        
+        // Verify local_names is an object with expected language keys
+        if let Some(local_names) = output_obj.get("local_names") {
+            assert!(local_names.is_object(), "local_names should be an object");
+            let local_names_obj = local_names.as_object().unwrap();
+            
+            // Check for some expected language keys (based on the starthub-lock.json)
+            let expected_languages = ["en", "it", "fr", "de", "es", "pt", "ru", "zh", "ja", "ko", "ar", "hi"];
+            for lang in expected_languages {
+                if local_names_obj.contains_key(lang) {
+                    assert!(local_names_obj[lang].is_string(), "local_names.{} should be a string", lang);
+                }
+            }
+        }
+        
+        // Verify coordinate types
+        if let Some(lat) = output_obj.get("lat") {
+            assert!(lat.is_number(), "lat should be a number");
+        }
+        if let Some(lon) = output_obj.get("lon") {
+            assert!(lon.is_number(), "lon should be a number");
+        }
+        
+        // Verify string fields
+        if let Some(name) = output_obj.get("name") {
+            assert!(name.is_string(), "name should be a string");
+        }
+        if let Some(country) = output_obj.get("country") {
+            assert!(country.is_string(), "country should be a string");
+        }
+        if let Some(state) = output_obj.get("state") {
+            assert!(state.is_string(), "state should be a string");
+        }
     }
     
 
