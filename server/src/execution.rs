@@ -68,7 +68,7 @@ impl ExecutionEngine {
         ).await?;     
         
         // 1) Instantiate and assign the inputs according to the types specified
-        let typed_inputs_to_inject = self.cast_to_typed_io(
+        let typed_inputs_to_inject = self.cast_values_to_typed_io(
             &root_action.inputs,
             &inputs, 
             &root_action.types)?;
@@ -105,6 +105,7 @@ impl ExecutionEngine {
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
                 .collect();
 
+            println!("input_values: {:#?}", input_values);
             let result = if action.kind == "wasm" {
                 wasm::run_wasm_step(
                     action, 
@@ -148,7 +149,7 @@ impl ExecutionEngine {
             };
 
             // inject the outputs into the action
-            let typed_updated_outputs = self.cast_to_typed_io(
+            let typed_updated_outputs = self.cast_values_to_typed_io(
                 &action.outputs,
                 &json_objects,
                 &action.types
@@ -189,6 +190,7 @@ impl ExecutionEngine {
         
         // Iterative execution loop
         while !current_execution_buffer.is_empty() {
+            println!("new iteration");
             // Get the first step from the buffer
             let current_step_id = current_execution_buffer.first().unwrap().clone();
             
@@ -201,10 +203,10 @@ impl ExecutionEngine {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
 
-                // println!("just before executing step: {:#?}", step);
+                println!("just before executing step: {:#?}", step);
                 // Execute the step
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
-
+                println!("executed_step");
                 // Update the step in the current action
                 let updated_steps: HashMap<String, ShAction> = current_action.steps.iter()
                     .map(|(id, step)| {
@@ -225,13 +227,16 @@ impl ExecutionEngine {
                 // However, the effects of the processing of the current step have not beem applied to the siblings yet.
                 // For each sibling, inject the outputs of the step we have just executed
                 // into the inputs of the dependent step
-                let updated_siblings: HashMap<String, ShAction> = self.recalculate_resolutions(
+                println!("recalculating resolutions");
+                println!("current action id: {:#?}", current_step_id);
+                let recalculated_steps: HashMap<String, ShAction> = self.recalculate_steps(
                     &current_action_with_updated_steps.inputs, 
                     &current_action_with_updated_steps.steps
                 );
+                println!("recalculated_steps: {:#?}", recalculated_steps);
 
                 let updated_current_action = ShAction {
-                    steps: updated_siblings,
+                    steps: recalculated_steps,
                     ..current_action_with_updated_steps.clone()
                 };
                 
@@ -242,11 +247,12 @@ impl ExecutionEngine {
                     &updated_current_action.inputs
                 )?;
 
-                    // Create new buffer by combining remaining steps with new downstream steps
-                    let mut new_execution_buffer = remaining_buffer;
-                    for step_id in downstream_ready_step_keys {
-                        self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
-                    }
+                println!("downstream_ready_step_keys: {:#?}", downstream_ready_step_keys);
+                // Create new buffer by combining remaining steps with new downstream steps
+                let mut new_execution_buffer = remaining_buffer;
+                for step_id in downstream_ready_step_keys {
+                    self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
+                }
                     
                 // Update the current state for the next iteration
                 current_action = updated_current_action;
@@ -259,7 +265,7 @@ impl ExecutionEngine {
         
         println!("Attemptint to resolve outputs");
         // The outputs could be coming from the parent inputs or the sibling steps.
-        let resolved_output_values = self.resolve_from_parent_inputs_and_sibling_outputs(
+        let resolved_output_values = self.resolve_output_values_from_parent_inputs_and_sibling_outputs(
             &action.outputs,
             &action.inputs,
             &current_action.steps
@@ -269,7 +275,7 @@ impl ExecutionEngine {
         // Create a new action with resolved outputs
         let updated_action = ShAction {
             steps: current_action.steps,
-            outputs: self.cast_to_typed_io(
+            outputs: self.cast_values_to_typed_io(
                 &action.outputs,
                 &resolved_output_values,
                 &action.types
@@ -281,7 +287,7 @@ impl ExecutionEngine {
     }
 
     /// Instantiates and assigns values to IO fields in one operation
-    fn cast_to_typed_io(
+    fn cast_values_to_typed_io(
         &self,
         io_fields: &Vec<ShIO>,
         io_values: &Vec<Value>,
@@ -298,12 +304,17 @@ impl ExecutionEngine {
                 io.r#type == "number" ||
                 io.r#type == "object" {
                 None // Primitive types don't need type definition lookup
+            } else if io.r#type == "id" {
+                Some(&Value::String("string".to_string()))
             } else {
                 // Look up custom type definition
                 types.as_ref()
                     .and_then(|types_map| types_map.get(&io.r#type))
             };
             
+            println!("io.r#type: {:#?}", io.r#type);
+            println!("type_definition: {:#?}", type_definition);
+            println!("value_to_inject: {:#?}", value_to_inject);
             let converted_value = self.cast(&value_to_inject, &io.r#type, type_definition)?;
             cast_values.push(converted_value);
         }
@@ -337,9 +348,11 @@ impl ExecutionEngine {
         if target_type == "string" || 
             target_type == "bool" ||
             target_type == "number" ||
-            target_type == "object" {
+            target_type == "object" ||
+            target_type == "id" {
             
             let converted_value = match target_type {
+                "id" => value.clone(),
                 "string" => value.clone(),
                 "number" => {
                     // Convert string to number if needed
@@ -461,7 +474,7 @@ impl ExecutionEngine {
         resolved_values.ok()
     }
 
-    fn resolve_from_parent_inputs_and_sibling_outputs(
+    fn resolve_output_values_from_parent_inputs_and_sibling_outputs(
         &self,
         output_definitions: &Vec<ShIO>,
         action_inputs: &Vec<ShIO>,
@@ -494,7 +507,7 @@ impl ExecutionEngine {
     }
 
 
-    fn recalculate_resolutions(
+    fn recalculate_steps(
         &self,
         action_inputs: &Vec<ShIO>,
         action_steps: &HashMap<String, ShAction>
@@ -509,12 +522,7 @@ impl ExecutionEngine {
                 // Try to resolve each step's inputs using both parent inputs and sibling outputs
                 let resolved_inputs: Result<Vec<Value>, ()> = step.inputs.iter()
                     .map(|input_io| {
-                        if(input_io.name == "depends_on") {
-                            println!("depends_on: {:#?}", input_io);
-                            println!("action_steps: {:#?}", action_steps);
-                            println!("input_io.r#type: {:#?}", input_io.r#type);
-                            println!("input_io.template: {:#?}", input_io.template);
-                        }
+                        
 
                         self.interpolate_recursively_from_parent_input_or_sibling_output(
                             &input_io.template, 
@@ -533,10 +541,17 @@ impl ExecutionEngine {
                     .collect();
 
                 if let Ok(resolved_inputs_to_inject_into_child_step) = resolved_inputs {
-                    let inputs_to_inject = self.cast_to_typed_io(
+                    
+                    let inputs_to_inject = self.cast_values_to_typed_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
                         &step.types).ok();
+
+                    // print where the step is sleep
+                    if step.uses == "std/sleep:0.0.1" {
+                        println!("step is sleep");
+                        println!("inputs_to_inject from recalculate_steps: {:#?}", inputs_to_inject);
+                    }
                     
                     if let Some(inputs_to_inject) = inputs_to_inject {
                         // Create new step with injected inputs
@@ -544,8 +559,10 @@ impl ExecutionEngine {
                             inputs: inputs_to_inject,
                             ..step.clone()
                         };
+                        println!("new_step from recalculate_steps: {:#?}", new_step);
                         (step_id.clone(), new_step)
                     } else {
+                        println!("keeping original step if injection failed");
                         // Keep original step if injection failed
                         (step_id.clone(), step.clone())
                     }
@@ -740,11 +757,8 @@ impl ExecutionEngine {
     ) -> Result<Value> {
         // First resolve parent inputs
         let parent_resolved = self.interpolate_string_from_parent_input(template, input_variables)?;
-        println!("parent_resolved: {:#?}", parent_resolved);
         // Then resolve sibling outputs
-        let fully_resolved_value = self.interpolate_string_from_sibling_output(&parent_resolved, executed_steps)?;
-        println!("fully_resolved: {:#?}", fully_resolved_value);
-        
+        let fully_resolved_value = self.interpolate_string_from_sibling_output(&parent_resolved, executed_steps)?;        
         Ok(fully_resolved_value)
     }
 
@@ -753,8 +767,6 @@ impl ExecutionEngine {
         input_variables: &Vec<Value>,
         executed_steps: &HashMap<String, ShAction>
     ) -> Result<Value> {
-        println!("interpolate_recursively_from_parent_input_or_sibling_output");
-        println!("template: {:#?}", template);
         match template {
             Value::String(s) => {
                 let resolved = self.interpolate_string_from_parent_input_or_sibling_output(s, input_variables, executed_steps)?;
@@ -1305,7 +1317,7 @@ impl ExecutionEngine {
                     action_inputs
                 ) {
 
-                    let inputs_to_inject = self.cast_to_typed_io(
+                    let inputs_to_inject = self.cast_values_to_typed_io(
                         &step.inputs, 
                         &resolved_inputs_to_inject_into_child_step,
                         &step.types).ok();
@@ -4276,7 +4288,7 @@ mod tests {
         ];
         let types1 = None;
         
-        let result1 = engine.cast_to_typed_io(&io_fields1, &input_values1, &types1);
+        let result1 = engine.cast_values_to_typed_io(&io_fields1, &input_values1, &types1);
         assert!(result1.is_ok());
         
         // Check that values were injected
@@ -4310,7 +4322,7 @@ mod tests {
             })
         ];
         
-        let result2 = engine.cast_to_typed_io(&io_fields2, &input_values2, &types1);
+        let result2 = engine.cast_values_to_typed_io(&io_fields2, &input_values2, &types1);
         assert!(result2.is_ok());
         
         // Check that values were injected
@@ -4356,7 +4368,7 @@ mod tests {
             user_obj
         })];
         
-        let result3 = engine.cast_to_typed_io(&io_fields3, &input_values3, &types3);
+        let result3 = engine.cast_values_to_typed_io(&io_fields3, &input_values3, &types3);
         assert!(result3.is_ok());
         
         // Check that value was injected
@@ -4390,7 +4402,7 @@ mod tests {
             })
         ];
         
-        let result4 = engine.cast_to_typed_io(&io_fields4, &input_values4, &types3);
+        let result4 = engine.cast_values_to_typed_io(&io_fields4, &input_values4, &types3);
         assert!(result4.is_ok());
         
         // Check that both values were injected
@@ -4415,7 +4427,7 @@ mod tests {
             user_obj
         })];
         
-        let result5 = engine.cast_to_typed_io(&io_fields5, &input_values5, &types3);
+        let result5 = engine.cast_values_to_typed_io(&io_fields5, &input_values5, &types3);
         assert!(result5.is_err());
         assert!(result5.unwrap_err().to_string().contains("Value 0 is invalid"));
         
@@ -4437,7 +4449,7 @@ mod tests {
         ];
         let input_values6 = vec![Value::String("test".to_string())];
         
-        let result6 = engine.cast_to_typed_io(&io_fields6, &input_values6, &types6);
+        let result6 = engine.cast_values_to_typed_io(&io_fields6, &input_values6, &types6);
         assert!(result6.is_err());
         assert!(result6.unwrap_err().to_string().contains("Failed to compile schema for type 'InvalidType'"));
         
@@ -4445,7 +4457,7 @@ mod tests {
         let io_fields7 = vec![];
         let input_values7 = vec![];
         
-        let result7 = engine.cast_to_typed_io(&io_fields7, &input_values7, &types1);
+        let result7 = engine.cast_values_to_typed_io(&io_fields7, &input_values7, &types1);
         assert!(result7.is_ok());
         
         // Test case 8: Unknown type (should pass through)
@@ -4460,7 +4472,7 @@ mod tests {
         ];
         let input_values8 = vec![Value::String("test_value".to_string())];
         
-        let result8 = engine.cast_to_typed_io(&io_fields8, &input_values8, &types3);
+        let result8 = engine.cast_values_to_typed_io(&io_fields8, &input_values8, &types3);
         assert!(result8.is_ok());
         
         // Check that value was injected (pass through behavior)
@@ -4507,7 +4519,7 @@ mod tests {
             })
         ])];
         
-        let result9 = engine.cast_to_typed_io(&io_fields9, &input_values9, &types9);
+        let result9 = engine.cast_values_to_typed_io(&io_fields9, &input_values9, &types9);
         assert!(result9.is_ok());
         
         // Check that value was injected
@@ -4526,7 +4538,7 @@ mod tests {
         ];
         let input_values10 = vec![Value::Null];
         
-        let result10 = engine.cast_to_typed_io(&io_fields10, &input_values10, &types1);
+        let result10 = engine.cast_values_to_typed_io(&io_fields10, &input_values10, &types1);
         assert!(result10.is_ok());
         
         // Check that null value was injected
@@ -4555,6 +4567,7 @@ mod tests {
         assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
         
         let outputs = result.unwrap();
+        println!("outputs: {:#?}", outputs);
         // The function returns an array of output values directly
         assert!(outputs.is_array());
         let outputs_array = outputs.as_array().unwrap();
@@ -5845,7 +5858,7 @@ mod tests {
         
         // // Verify that we got outputs
         // assert!(outputs.is_array(), "execute_action should return an array of outputs");
-        // let outputs_array = outputs.as_array().unwrap();
+        let outputs = result.unwrap();        
         
         // // For a WASM action, we expect at least one output
         // assert!(!outputs_array.is_empty(), "WASM action should produce outputs");
@@ -6179,7 +6192,6 @@ mod tests {
         assert!(result.is_ok(), "execute_action should succeed for valid number-to-string action_ref and inputs");
         
         let outputs = result.unwrap();
-        
         // Verify that we got outputs
         assert!(outputs.is_array(), "execute_action should return an array of outputs");
         let outputs_array = outputs.as_array().unwrap();
