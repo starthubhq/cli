@@ -168,6 +168,7 @@ impl ExecutionEngine {
                 action.role.as_ref()
             )?;
 
+            // Create a new action with the updated outputs.
             let updated_action = ShAction {
                 outputs: updated_outputs,
                 ..action.clone()
@@ -195,57 +196,31 @@ impl ExecutionEngine {
         // TODO: find a way to make this immutable.
         execution_buffer.extend(ready_step_ids);
         
-        // Now we can start the functional execution of steps
-        // Using a functional approach with a helper function
-        let processed_steps = self.process_steps(
-            action_with_inputs_resolved_into_steps.clone(),
-            execution_buffer,
-        ).await?;
-
-        // The outputs could be coming from the parent inputs or the sibling steps.
-        let resolved_outputs = self.resolve_outputs(
-            &action.outputs,
-            &action.inputs,
-            &processed_steps
-        )?;
-
-        // Create a new action with resolved outputs
-        let updated_action = ShAction {
-            steps: processed_steps,
-            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types, action.role.as_ref())?,
-            ..action.clone()
-        };
-
-        Ok(updated_action)
-    }
-
-    async fn process_steps(
-        &mut self,
-        action: ShAction,
-        execution_buffer: Vec<String>,
-    ) -> Result<HashMap<String, ShAction>> {
-        // Functional execution using a recursive approach
-        if execution_buffer.is_empty() {
-            Ok(action.steps)
-        } else {
-            // Get the first step and create a new buffer without it
-            let current_step_id = execution_buffer.first().unwrap().clone();
-
-            println!("current_step_id from recursive call: {:?}", current_step_id);
-            // We create a new buffer without the first step.
-            let mut remaining_buffer = execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
+        // Now we can start the iterative execution of steps
+        // Using a loop-based approach instead of recursion to avoid stack overflow
+        let mut current_action = action_with_inputs_resolved_into_steps;
+        let mut current_execution_buffer = execution_buffer;
+        
+        // Iterative execution loop
+        while !current_execution_buffer.is_empty() {
+            // Get the first step from the buffer
+            let current_step_id = current_execution_buffer.first().unwrap().clone();
+            println!("current_step_id from iterative call: {:?}", current_step_id);
+            
+            // Remove the first step from the buffer
+            let mut remaining_buffer = current_execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
             println!("remaining_buffer: {:#?}", remaining_buffer);
-            // Execute the step recursively
-            if let Some(step) = action.steps.get(&current_step_id) {
+            
+            // Execute the current step
+            if let Some(step) = current_action.steps.get(&current_step_id) {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
 
-                // We exeute the step recursively
+                // Execute the step
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
 
-                // Once we have executed the step, we want to update the corresponding step
-                // in the current action.
-                let updated_steps: HashMap<String, ShAction> = action.steps.iter()
+                // Update the step in the current action
+                let updated_steps: HashMap<String, ShAction> = current_action.steps.iter()
                     .map(|(id, step)| {
                         if id == &current_step_id {
                             (id.clone(), executed_step.clone())
@@ -255,60 +230,31 @@ impl ExecutionEngine {
                     })
                     .collect();
 
-                let action_with_udpated_steps = ShAction {
+                let action_with_updated_steps = ShAction {
                     steps: updated_steps,
-                    ..action.clone()
-                };
-
-                // For each sibling, we want to inject the outputs of the step
-                // we have just executed into the inputs of the dependent step. This way,
-                // we collect all the updated steps and create a new action instance.
-                let updated_siblings: HashMap<String, ShAction> = self.resolve_parent_input_or_sibling_output_into_steps(&action_with_udpated_steps.inputs, &action_with_udpated_steps.steps);
-                let updated_current_action = ShAction {
-                    steps: updated_siblings,
-                    ..action_with_udpated_steps.clone()
+                    ..current_action.clone()
                 };
                 
-                // If the step we have just executed is a flow control step, we want to
-                // find the next step by using the first output of the step we have just executed.
-                // if step.role.as_ref().map_or(false, |r| r == &ShRole::FlowControl) {
-                //     println!("Found flow control step {:?}", step.name);
-                //     if let Some(output) = executed_step.outputs.first() {
-                //         if let Some(output_value) = &output.value {
-                //             if let Some(output_value_str) = output_value.as_str() {
-                //                 let next_step_id = output_value_str;
-
-                //                 println!("next_step_id: {:?}", next_step_id);
-                //                  // since steps are a HashMap, we can find the next step by using the next_step_id
-                //                 if let Some(_next_step) = action.steps.get(next_step_id) {
-                //                     let mut new_execution_buffer = remaining_buffer;
-                //                     self.push_to_execution_buffer(&mut new_execution_buffer, next_step_id.to_string());
-                //                     println!("updated_current_action: {:#?}", updated_current_action);
-                //                     println!("new_execution_buffer: {:#?}", new_execution_buffer);
-                //                     // Recursively continue with the updated state
-                //                     Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await 
-                //                 } else {
-                //                     Box::pin(self.process_steps(action, remaining_buffer)).await
-                //                 } 
-                //             } else {
-                //                 Box::pin(self.process_steps(action, remaining_buffer)).await
-                //             }
-                //         } else {
-                //             Box::pin(self.process_steps(action, remaining_buffer)).await
-                //         }
-                //     } else {
-                //         Box::pin(self.process_steps(action, remaining_buffer)).await
-                //     }
-                // } else {
-                    // Now that we have injected all the possible parent/sibling values into
-                    // the other siblings, we find the ready steps that are directly downstream of the
-                    // step we have just executed and see if they are ready.
+                // For each sibling, inject the outputs of the step we have just executed
+                // into the inputs of the dependent step
+                let updated_siblings: HashMap<String, ShAction> = self.resolve_parent_input_or_sibling_output_into_steps(
+                    &action_with_updated_steps.inputs, 
+                    &action_with_updated_steps.steps
+                );
+                let updated_current_action = ShAction {
+                    steps: updated_siblings,
+                    ..action_with_updated_steps.clone()
+                };
+                
+                // Find the ready steps that are directly downstream of the step we just executed
                     let downstream_ready_step_keys = self.find_downstream_ready_steps_keys(
                         &updated_current_action.steps,
                         &current_step_id,
-                        &updated_current_action.inputs)?;
+                    &updated_current_action.inputs
+                )?;
 
                     println!("downstream_ready_step_keys: {:#?}", downstream_ready_step_keys);
+                
                     // Create new buffer by combining remaining steps with new downstream steps
                     let mut new_execution_buffer = remaining_buffer;
                     for step_id in downstream_ready_step_keys {
@@ -316,14 +262,33 @@ impl ExecutionEngine {
                     }
                     
                     println!("new_execution_buffer: {:#?}", new_execution_buffer);
-                    // Recursively continue with the updated state
-                    Box::pin(self.process_steps(updated_current_action, new_execution_buffer)).await
-                // }
+                
+                // Update the current state for the next iteration
+                current_action = updated_current_action;
+                current_execution_buffer = new_execution_buffer;
              } else {
-                 Box::pin(self.process_steps(action, remaining_buffer)).await
-             }
+                // If step not found, continue with remaining buffer
+                current_execution_buffer = remaining_buffer;
+            }
         }
+        
+        // The outputs could be coming from the parent inputs or the sibling steps.
+        let resolved_outputs = self.resolve_outputs(
+            &action.outputs,
+            &action.inputs,
+            &current_action.steps
+        )?;
+
+        // Create a new action with resolved outputs
+        let updated_action = ShAction {
+            steps: current_action.steps,
+            outputs: self.instantiate_io(&action.outputs, &resolved_outputs, &action.types, action.role.as_ref())?,
+            ..action.clone()
+        };
+
+        Ok(updated_action)
     }
+
 
     /// Parses a value to a JSON object or array
     fn parse(value: Value) -> Value {
@@ -1073,7 +1038,7 @@ impl ExecutionEngine {
                     if let Some(step_inputs) = step_value.get("inputs") {
                         if let Some(inputs_array) = step_inputs.as_array() {
                             for (index, input) in inputs_array.iter().enumerate() {
-                                if let Some(child_input) = child_action.inputs.get_mut(index) {
+                                    if let Some(child_input) = child_action.inputs.get_mut(index) {
                                     // Handle both formats:
                                     // 1. New format: direct values (string, object, etc.)
                                     // 2. Old format: objects with "value" property
@@ -6310,7 +6275,7 @@ mod tests {
         assert_eq!(depends_on_input["name"], "depends_on");
         assert_eq!(depends_on_input["value"], "{{steps.get_simulator.outputs[0].id}}");
     }
-
+    
     #[tokio::test]
     async fn test_execute_action_openweather_coordinates_by_location_name() {
         // Create a mock ExecutionEngine
@@ -6335,7 +6300,6 @@ mod tests {
         assert!(result.is_ok(), "execute_action should succeed for valid openweather-coordinates-by-location-name action_ref and inputs");
         
         let outputs = result.unwrap();
-        
                 // Verify that we got outputs
         assert!(outputs.is_array(), "execute_action should return an array of outputs");
         let outputs_array = outputs.as_array().unwrap();
