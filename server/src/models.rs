@@ -85,6 +85,8 @@ pub struct ShAction {
     pub parent_action: Option<String>,   // UUID of parent action (None for root)
     pub steps: HashMap<String, ShAction>, // Nested actions keyed by UUID
     pub role: Option<ShRole>,            // Role: FlowControl, TypingControl, etc.
+    #[serde(default = "default_priority")]
+    pub priority: i32,                   // Execution priority (lower = higher priority)
     
     // Manifest structure fields
     pub types: Option<serde_json::Map<String, Value>>,   // From manifest.types
@@ -95,6 +97,11 @@ pub struct ShAction {
 // Helper function to determine if export field should be skipped during serialization
 fn is_default_export(export: &serde_json::Value) -> bool {
     export == &serde_json::json!({})
+}
+
+// Default priority value
+fn default_priority() -> i32 {
+    0
 }
 
 #[derive(Debug, Clone, PartialEq)]
