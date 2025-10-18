@@ -1112,7 +1112,7 @@ impl ExecutionEngine {
                             let next_step_id = output_value_str;
                             // Check if the step exists in the steps vector
                             // if steps.contains_key(next_step_id) {
-                            println!("found next step id from current step id: {:#?} to flow control step: {:#?}", completed_step_id, next_step_id);
+                            // println!("found next step id from current step id: {:#?} to flow control step: {:#?}", completed_step_id, next_step_id);
                             downstream_steps.push(next_step_id.to_string());
                             // }
                         }
@@ -1132,27 +1132,27 @@ impl ExecutionEngine {
 
             // Check if this step depends on the completed step and is now ready
             if depends_on && is_ready {
-                println!("found next step id from regular step from current step id: {:#?} to {:#?}", completed_step_id, step_id);
+                // println!("found next step id from regular step from current step id: {:#?} to {:#?}", completed_step_id, step_id);
                 downstream_steps.push(step_id.clone());
             }
         }
         
-        println!("downstream_steps: {:#?}", downstream_steps);
+        // println!("downstream_steps: {:#?}", downstream_steps);
 
-        let resolved_outputs = self.resolve_untyped_output_values(outputs, parent_inputs, steps)?;
-        let all_outputs_have_values = steps.values().all(|step| 
-            step.outputs.iter().all(|output| output.value.is_some())
-        );
+        // let resolved_outputs = self.resolve_untyped_output_values(outputs, parent_inputs, steps)?;
+        // let all_outputs_have_values = steps.values().all(|step| 
+        //     step.outputs.iter().all(|output| output.value.is_some())
+        // );
 
         // println!("All outputs have values: {:#?}", all_outputs_have_values);
         // If the length of the resolved outputs is the same as the length of the outputs, then we have a complete match
-        if resolved_outputs.len() == outputs.len() && all_outputs_have_values {
-            println!("completed_step_id: {:#?}", completed_step_id);
-            println!("resolved_outputs: {:#?}", resolved_outputs);
-            println!("outputs: {:#?}", outputs);
+        // if resolved_outputs.len() == outputs.len() && all_outputs_have_values {
+        //     println!("completed_step_id: {:#?}", completed_step_id);
+        //     println!("resolved_outputs: {:#?}", resolved_outputs);
+        //     println!("outputs: {:#?}", outputs);
             
-            // downstream_steps.push("outputs".to_string());
-        }
+        //     // downstream_steps.push("outputs".to_string());
+        // }
 
         Ok(downstream_steps)
     }
