@@ -98,7 +98,6 @@ impl ExecutionEngine {
     async fn run_action_tree(&mut self, action: &ShAction) -> Result<ShAction> {
         // Base condition.
         if action.kind == "wasm" || action.kind == "docker" {
-            println!("Executing {} wasm step: {}", action.kind, action.name);
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
 
             // Extract values from inputs before serializing
@@ -148,6 +147,10 @@ impl ExecutionEngine {
                 }
             };
 
+            if(action.uses.contains("std/if:0.0.1")) {
+                println!("json_objects: {:#?}", json_objects);
+            }
+
             // inject the outputs into the action
             let typed_updated_outputs = self.cast_values_to_typed_array(
                 &action.outputs,
@@ -191,7 +194,6 @@ impl ExecutionEngine {
         let mut current_action = action_with_inputs_resolved_into_steps;
         let mut current_execution_buffer = execution_buffer;
         
-        println!("current_execution_buffer: {:?}", current_execution_buffer);
         // Iterative execution loop
         while !current_execution_buffer.is_empty() {
             // Get the first step from the buffer
@@ -205,7 +207,6 @@ impl ExecutionEngine {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
                 // Execute the step
-
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
 
                 // Substitute the step in the current action with the executed step
@@ -239,18 +240,23 @@ impl ExecutionEngine {
                     ..current_action_with_updated_steps.clone()
                 };
                 
-                // Find the ready steps that are directly downstream of the step we just executed
-                let downstream_ready_step_key = self.find_next_step_id(
-                        &updated_current_action.steps,
-                        &current_step_id,
-                    &updated_current_action.inputs
-                )?;
-
                 // Create new buffer by combining remaining steps with new downstream steps
                 let mut new_execution_buffer = remaining_buffer;
-                if let Some(step_id) = downstream_ready_step_key {
-                    new_execution_buffer.push(step_id);
-                }
+                if !new_execution_buffer.contains(&"outputs".to_string()) {
+                    // Find the ready steps that are directly downstream of the step we just executed
+                    let downstream_step_ids = self.find_next_step_id(
+                            &updated_current_action.steps,
+                            &current_step_id,
+                        &updated_current_action.inputs,
+                        &updated_current_action.outputs
+                    )?;
+
+                    
+                    for step_id in downstream_step_ids {
+                        self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
+                    }
+                } 
+                
                     
                 // Update the current state for the next iteration
                 current_action = updated_current_action;
@@ -259,6 +265,8 @@ impl ExecutionEngine {
                 // If step not found, continue with remaining buffer
                 current_execution_buffer = remaining_buffer;
             }
+
+            println!("current_execution_buffer: {:#?}", current_execution_buffer);
         }
         
         // The outputs could be coming from the parent inputs or the sibling steps.
@@ -289,8 +297,11 @@ impl ExecutionEngine {
         io_values: &Vec<Value>,
         types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Vec<ShIO>> {
+        // println!("casting values to typed array");
+        // println!("io_fields: {:#?}", io_fields);
+        // println!("io_values: {:#?}", io_values);
+        // println!("types: {:#?}", types);
         let mut cast_values: Vec<Value> = Vec::new();
-        
         // For each IO field, cast the value to the appropriate type
         for (index, io) in io_fields.iter().enumerate() {
             let value_to_inject = io_values.get(index).unwrap().clone();
@@ -914,7 +925,7 @@ impl ExecutionEngine {
             permissions: manifest.permissions.clone(),
         };
         
-                // 4. For each step, call the build_action_tree function recursively
+        // 4. For each step, call the build_action_tree function recursively
         for (_step_name, step_value) in manifest.steps {
             if let Some(uses_value) = step_value.get("uses") {
                 if let Some(uses_str) = uses_value.as_str() {
@@ -955,8 +966,34 @@ impl ExecutionEngine {
                 }
             }
         }
+        
+        // After creating the action tree, we want to calculate the priority of the action
+        let steps_with_priorities = self.produce_steps_with_priorities(&action_state.steps);
+
+        action_state = ShAction {
+            steps: steps_with_priorities,
+            ..action_state.clone()
+        };
 
         return Ok(action_state);
+    }
+
+    fn produce_steps_with_priorities(&self, steps: &HashMap<String, ShAction>) -> HashMap<String, ShAction>{
+        // Sort step keys alphabetically to ensure deterministic ordering
+        let mut sorted_keys: Vec<_> = steps.keys().collect();
+        sorted_keys.sort();
+        
+        // Create new steps with priorities assigned based on alphabetical order
+        let mut steps_with_priorities = HashMap::new();
+        for (index, step_key) in sorted_keys.iter().enumerate() {
+            if let Some(step) = steps.get(*step_key) {
+                let mut updated_step = step.clone();
+                updated_step.priority = index as i32;
+                steps_with_priorities.insert((*step_key).clone(), updated_step);
+            }
+        }
+        
+        steps_with_priorities
     }
     
     pub fn find_sibling_dependencies(&self, value: &Value, steps: &HashMap<String, ShAction>) -> Result<Vec<String>> {        
@@ -1053,13 +1090,16 @@ impl ExecutionEngine {
         steps: &HashMap<String, ShAction>,
         completed_step_id: &str,
         parent_inputs: &Vec<ShIO>,
-    ) -> Result<Option<String>> {
-        // Find the first step that depends on the completed step and is ready
+        outputs: &Vec<ShIO>,
+    ) -> Result<Vec<String>> {
+        // Find all steps that depend on the completed step and are ready
         // Sort steps by priority (lower priority number = higher priority)
         let mut sorted_steps: Vec<_> = steps.iter().collect();
         sorted_steps.sort_by(|(_, a), (_, b)| {
             a.priority.cmp(&b.priority)
         });
+
+        let mut downstream_steps = Vec::new();
 
         // if the current step is a flow control step, we want to find it among the steps, 
         // get the next step by using the first output of the step we have just executed.
@@ -1071,9 +1111,10 @@ impl ExecutionEngine {
                         if let Some(output_value_str) = output_value.as_str() {
                             let next_step_id = output_value_str;
                             // Check if the step exists in the steps vector
-                            if steps.contains_key(next_step_id) {
-                                return Ok(Some(next_step_id.to_string()));
-                            }
+                            // if steps.contains_key(next_step_id) {
+                            println!("found next step id from current step id: {:#?} to flow control step: {:#?}", completed_step_id, next_step_id);
+                            downstream_steps.push(next_step_id.to_string());
+                            // }
                         }
                     }
                 }
@@ -1091,11 +1132,29 @@ impl ExecutionEngine {
 
             // Check if this step depends on the completed step and is now ready
             if depends_on && is_ready {
-                return Ok(Some(step_id.clone()));
+                println!("found next step id from regular step from current step id: {:#?} to {:#?}", completed_step_id, step_id);
+                downstream_steps.push(step_id.clone());
             }
         }
         
-        Ok(None)
+        println!("downstream_steps: {:#?}", downstream_steps);
+
+        let resolved_outputs = self.resolve_untyped_output_values(outputs, parent_inputs, steps)?;
+        let all_outputs_have_values = steps.values().all(|step| 
+            step.outputs.iter().all(|output| output.value.is_some())
+        );
+
+        // println!("All outputs have values: {:#?}", all_outputs_have_values);
+        // If the length of the resolved outputs is the same as the length of the outputs, then we have a complete match
+        if resolved_outputs.len() == outputs.len() && all_outputs_have_values {
+            println!("completed_step_id: {:#?}", completed_step_id);
+            println!("resolved_outputs: {:#?}", resolved_outputs);
+            println!("outputs: {:#?}", outputs);
+            
+            // downstream_steps.push("outputs".to_string());
+        }
+
+        Ok(downstream_steps)
     }
 
     /// Checks if all step inputs are ready (have values)
