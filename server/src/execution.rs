@@ -4644,141 +4644,101 @@ mod tests {
     //     assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs with file path");
     // }
 
-    // #[tokio::test]
-    // async fn test_execute_action_create_do_droplet_sync() {
-    //     dotenv::dotenv().ok();
+    #[tokio::test]
+    async fn test_execute_action_create_do_droplet_sync() {
+        dotenv::dotenv().ok();
 
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing action for droplet creation with sync
-    //     let action_ref = "starthubhq/do-create-droplet-sync:0.0.1";
+        // Test executing action for droplet creation with sync
+        let action_ref = "starthubhq/do-create-droplet-sync:0.0.1";
         
-    //     // Read test parameters from environment variables with defaults
-    //     let api_token = std::env::var("DO_API_TOKEN")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let name = std::env::var("DO_DROPLET_NAME")
-    //         .unwrap_or_else(|_| "test-droplet-sync".to_string());
-    //     let region = std::env::var("DO_DROPLET_REGION")
-    //         .unwrap_or_else(|_| "nyc1".to_string());
-    //     let size = std::env::var("DO_DROPLET_SIZE")
-    //         .unwrap_or_else(|_| "s-1vcpu-1gb".to_string());
-    //     let image = std::env::var("DO_DROPLET_IMAGE")
-    //         .unwrap_or_else(|_| "ubuntu-20-04-x64".to_string());
-    //     let backups = std::env::var("DO_DROPLET_BACKUPS")
-    //         .unwrap_or_else(|_| "false".to_string());
-    //     let ipv6 = std::env::var("DO_DROPLET_IPV6")
-    //         .unwrap_or_else(|_| "false".to_string());
-    //     let monitoring = std::env::var("DO_DROPLET_MONITORING")
-    //         .unwrap_or_else(|_| "false".to_string());
-    //     let tags = std::env::var("DO_DROPLET_TAGS")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let user_data = std::env::var("DO_DROPLET_USER_DATA")
-    //         .unwrap_or_else(|_| "".to_string());
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_DROPLET_NAME")
+            .unwrap_or_else(|_| "test-droplet-sync".to_string());
+        let region = std::env::var("DO_DROPLET_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let size = std::env::var("DO_DROPLET_SIZE")
+            .unwrap_or_else(|_| "s-1vcpu-1gb".to_string());
+        let image = std::env::var("DO_DROPLET_IMAGE")
+            .unwrap_or_else(|_| "ubuntu-20-04-x64".to_string());
+        let backups = std::env::var("DO_DROPLET_BACKUPS")
+            .unwrap_or_else(|_| "false".to_string());
+        let ipv6 = std::env::var("DO_DROPLET_IPV6")
+            .unwrap_or_else(|_| "false".to_string());
+        let monitoring = std::env::var("DO_DROPLET_MONITORING")
+            .unwrap_or_else(|_| "false".to_string());
+        let tags = std::env::var("DO_DROPLET_TAGS")
+            .unwrap_or_else(|_| "".to_string());
+        let user_data = std::env::var("DO_DROPLET_USER_DATA")
+            .unwrap_or_else(|_| "".to_string());
         
-    //     // Parse boolean values
-    //     let backups_bool = backups.parse::<bool>().unwrap_or(false);
-    //     let ipv6_bool = ipv6.parse::<bool>().unwrap_or(false);
-    //     let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
+        // Parse boolean values
+        let backups_bool = backups.parse::<bool>().unwrap_or(false);
+        let ipv6_bool = ipv6.parse::<bool>().unwrap_or(false);
+        let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
         
-    //     // Parse array values
-    //     let tags_array: Vec<String> = if tags.is_empty() {
-    //         vec![]
-    //     } else {
-    //         tags.split(',').map(|s| s.trim().to_string()).collect()
-    //     };
+        // Parse array values
+        let tags_array: Vec<String> = if tags.is_empty() {
+            vec![]
+        } else {
+            tags.split(',').map(|s| s.trim().to_string()).collect()
+        };
         
-    //     let inputs = vec![
-    //         json!({
-    //             "api_token": api_token,
-    //             "name": name,
-    //             "region": region,
-    //             "size": size,
-    //             "image": image,
-    //             "backups": backups_bool,
-    //             "ipv6": ipv6_bool,
-    //             "monitoring": monitoring_bool,
-    //             "tags": tags_array,
-    //             "user_data": user_data
-    //         })
-    //     ];
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "size": size,
+                "image": image,
+                "backups": backups_bool,
+                "ipv6": ipv6_bool,
+                "monitoring": monitoring_bool,
+                "tags": tags_array,
+                "user_data": user_data
+            })
+        ];
         
-    //     // println!("inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
-    //     println!("result: {:#?}", result);
-    //     // The test should succeed
-    //     // assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
-    // }
+        // println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        println!("result: {:#?}", result);
+        // The test should succeed
+        // assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
 
-    // #[tokio::test]
-    // async fn test_execute_action_get_do_droplet() {
-    //     dotenv::dotenv().ok();
+    #[tokio::test]
+    async fn test_execute_action_get_do_droplet() {
+        dotenv::dotenv().ok();
 
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing action for droplet retrieval
-    //     let action_ref = "starthubhq/do-get-droplet:0.0.1";
+        // Test executing action for droplet retrieval
+        let action_ref = "starthubhq/do-get-droplet:0.0.1";
         
-    //     // Read test parameters from environment variables with defaults
-    //     let api_token = std::env::var("DO_API_TOKEN")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let droplet_id = std::env::var("DO_DROPLET_ID")
-    //         .unwrap_or_else(|_| "123456789".to_string());
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let droplet_id = std::env::var("DO_DROPLET_ID")
+            .unwrap_or_else(|_| "123456789".to_string());
         
-    //     let inputs = vec![
-    //         json!({
-    //             "api_token": api_token,
-    //             "droplet_id": droplet_id
-    //         })
-    //     ];
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "droplet_id": droplet_id.parse::<u64>().unwrap_or(0)
+            })
+        ];
         
-    //     println!("Testing do-get-droplet with inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("do-get-droplet test result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid do-get-droplet action_ref and inputs");
-        
-    //     let action_tree = result.unwrap();
-        
-    //     // Verify the action structure
-    //     assert_eq!(action_tree["name"], "do-get-droplet");
-    //     assert_eq!(action_tree["kind"], "composition");
-    //     assert_eq!(action_tree["uses"], action_ref);
-        
-    //     // Verify inputs
-    //     assert!(action_tree["inputs"].is_array());
-    //     let inputs_array = action_tree["inputs"].as_array().unwrap();
-    //     assert_eq!(inputs_array.len(), 1);
-    //     let input = &inputs_array[0];
-    //     assert_eq!(input["name"], "droplet_config");
-    //     assert_eq!(input["type"], "DigitalOceanDropletGetConfig");
-        
-    //     // Verify outputs
-    //     assert!(action_tree["outputs"].is_array());
-    //     let outputs_array = action_tree["outputs"].as_array().unwrap();
-    //     assert_eq!(outputs_array.len(), 1);
-    //     let output = &outputs_array[0];
-    //     assert_eq!(output["name"], "droplet");
-    //     assert_eq!(output["type"], "DigitalOceanDroplet");
-        
-    //     // Execution order is now determined dynamically at runtime
-        
-    //     // Verify types are present
-    //     assert!(action_tree["types"].is_object());
-    //     let types = action_tree["types"].as_object().unwrap();
-    //     assert!(types.contains_key("DigitalOceanDropletGetConfig"));
-    //     assert!(types.contains_key("DigitalOceanDroplet"));
-        
-    //     // Verify permissions
-    //     assert!(action_tree["permissions"].is_object());
-    //     let permissions = action_tree["permissions"].as_object().unwrap();
-    //     assert!(permissions.contains_key("net"));
-    //     let net_permissions = permissions["net"].as_array().unwrap();
-    //     assert!(net_permissions.contains(&json!("http")));
-    //     assert!(net_permissions.contains(&json!("https")));
-    // }
+        println!("do-get-droplet test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid do-get-droplet action_ref and inputs");        
+    }
 
     // #[tokio::test]
     // async fn test_execute_action_std_read_file() {
