@@ -3,6 +3,15 @@ use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use serde_json::Value;
 
+// ---- Action roles ----
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ShRole {
+    #[serde(rename = "flow_control")]
+    FlowControl,
+    #[serde(rename = "typing_control")]
+    TypingControl
+}
+
 // ---- Starthub manifest schema ----
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShManifest {
@@ -11,6 +20,8 @@ pub struct ShManifest {
     pub description: String,
     pub version: String,
     pub kind: Option<ShKind>,
+    #[serde(default)]
+    pub role: Option<ShRole>,
     pub manifest_version: u32,
     pub repository: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -73,7 +84,9 @@ pub struct ShAction {
     pub outputs: Vec<ShIO>,             // Array format: [{"name": "...", "type": "...", "value": ...}]
     pub parent_action: Option<String>,   // UUID of parent action (None for root)
     pub steps: HashMap<String, ShAction>, // Nested actions keyed by UUID
-    pub execution_order: Vec<String>,   // Order of execution within this action
+    pub role: Option<ShRole>,            // Role: FlowControl, TypingControl, etc.
+    #[serde(default = "default_priority")]
+    pub priority: i32,                   // Execution priority (lower = higher priority)
     
     // Manifest structure fields
     pub types: Option<serde_json::Map<String, Value>>,   // From manifest.types
@@ -84,6 +97,11 @@ pub struct ShAction {
 // Helper function to determine if export field should be skipped during serialization
 fn is_default_export(export: &serde_json::Value) -> bool {
     export == &serde_json::json!({})
+}
+
+// Default priority value
+fn default_priority() -> i32 {
+    0
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +148,7 @@ pub enum ShType {
     Boolean,
     Object,
     Array,
+    Id,
     // Custom types are allowed
     Custom(String),
 }
@@ -141,6 +160,7 @@ impl serde::Serialize for ShType {
     {
         let s = match self {
             ShType::String => "string",
+            ShType::Id => "id",
             ShType::Number => "number",
             ShType::Boolean => "boolean",
             ShType::Object => "object",
@@ -217,6 +237,12 @@ pub struct MountSpec {
     pub target: String,
     pub rw: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShExecutionFrame {
+    pub timestamp: String,
+}
+
 
 
 // API Client for StartHub
