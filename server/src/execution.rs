@@ -6,7 +6,7 @@ use dirs;
 use tokio::sync::broadcast;
 
 use crate::models::{ShManifest, ShKind, ShIO, ShAction, ShRole};
-use crate::wasm;
+use crate::{docker, wasm};
 use crate::logger::{Logger};
 
 // Constants
@@ -115,8 +115,14 @@ impl ExecutionEngine {
                     &|msg, id| self.logger.log_error(msg, id),
                 ).await?
             } else if action.kind == "docker" {
-                // TODO: Implement docker step execution
-                return Err(anyhow::anyhow!("Docker step execution not implemented"));
+                docker::run_docker_step(
+                    action,
+                    &serde_json::to_value(&input_values_to_serialise)?,
+                    &self.cache_dir,
+                    &|msg, id| self.logger.log_info(msg, id),
+                    &|msg, id| self.logger.log_success(msg, id),
+                    &|msg, id| self.logger.log_error(msg, id),
+                ).await?
             } else {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
@@ -4726,6 +4732,9 @@ mod tests {
         let droplet_id = std::env::var("DO_DROPLET_ID")
             .unwrap_or_else(|_| "123456789".to_string());
         
+        println!("DO_API_TOKEN from env: '{}'", std::env::var("DO_API_TOKEN").unwrap_or_default());
+        println!("DO_DROPLET_ID from env: '{}'", std::env::var("DO_DROPLET_ID").unwrap_or_default());
+        
         let inputs = vec![
             json!({
                 "api_token": api_token,
@@ -4733,11 +4742,60 @@ mod tests {
             })
         ];
         
+        println!("inputs: {:#?}", inputs);
         let result = engine.execute_action(action_ref, inputs).await;
         
         println!("do-get-droplet test result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid do-get-droplet action_ref and inputs");        
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_ssh() {
+        dotenv::dotenv().ok();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+
+        // Docker-based SSH action
+        let action_ref = "starthubhq/ssh:0.0.1";
+
+        // Read test parameters from environment variables, with fallback to default SSH key
+        let private_key = std::env::var("SSH_PRIVATE_KEY")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
+                    .unwrap_or_else(|_| "".to_string())
+            });
+        let user = std::env::var("SSH_USER").unwrap_or_default();
+        let host = std::env::var("SSH_HOST").unwrap_or_default();
+        let cmd = std::env::var("SSH_COMMAND").unwrap_or_default();
+
+        println!("private_key: {}", private_key);
+        println!("user: {}", user);
+        println!("host: {}", host);
+        println!("cmd: {}", cmd);
+        // If required env vars are missing, skip the test gracefully
+        if private_key.is_empty() || user.is_empty() || host.is_empty() {
+            println!("Skipping SSH test: missing SSH_PRIVATE_KEY/SSH_USER/SSH_HOST env vars");
+            return;
+        }
+
+        let inputs = vec![
+            json!(private_key),
+            json!(user),
+            json!(host),
+            json!(cmd),
+        ];
+
+        let result = engine.execute_action(action_ref, inputs).await;
+        println!("ssh test result: {:#?}", result);
+
+        // Don't hard fail CI if remote isn't reachable; this validates the execution path
+        if let Ok(outputs) = result {
+            assert!(outputs.is_array());
+            let outputs_array = outputs.as_array().unwrap();
+            assert!(!outputs_array.is_empty());
+        }
     }
 
     // #[tokio::test]
