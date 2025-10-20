@@ -4732,6 +4732,9 @@ mod tests {
         let droplet_id = std::env::var("DO_DROPLET_ID")
             .unwrap_or_else(|_| "123456789".to_string());
         
+        println!("DO_API_TOKEN from env: '{}'", std::env::var("DO_API_TOKEN").unwrap_or_default());
+        println!("DO_DROPLET_ID from env: '{}'", std::env::var("DO_DROPLET_ID").unwrap_or_default());
+        
         let inputs = vec![
             json!({
                 "api_token": api_token,
@@ -4739,6 +4742,7 @@ mod tests {
             })
         ];
         
+        println!("inputs: {:#?}", inputs);
         let result = engine.execute_action(action_ref, inputs).await;
         
         println!("do-get-droplet test result: {:#?}", result);
@@ -4755,11 +4759,16 @@ mod tests {
         // Docker-based SSH action
         let action_ref = "starthubhq/ssh:0.0.1";
 
-        // Read test parameters from environment variables to avoid hardcoding secrets
-        let private_key = std::env::var("SSH_PRIVATE_KEY").unwrap_or_else(|_| "".to_string());
-        let user = std::env::var("SSH_USER").unwrap_or_else(|_| "tommaso".to_string());
-        let host = std::env::var("SSH_HOST").unwrap_or_else(|_| "harpy.nxtgrid.co".to_string());
-        let cmd = std::env::var("SSH_COMMAND").unwrap_or_else(|_| "uname".to_string());
+        // Read test parameters from environment variables, with fallback to default SSH key
+        let private_key = std::env::var("SSH_PRIVATE_KEY")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
+                    .unwrap_or_else(|_| "".to_string())
+            });
+        let user = std::env::var("SSH_USER").unwrap_or_default();
+        let host = std::env::var("SSH_HOST").unwrap_or_default();
+        let cmd = std::env::var("SSH_COMMAND").unwrap_or_default();
 
         println!("private_key: {}", private_key);
         println!("user: {}", user);
