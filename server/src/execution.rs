@@ -1,6 +1,7 @@
 use anyhow::Result;
 use jsonschema::JSONSchema;
 use serde_json::Value;
+use tracing_subscriber::filter::combinator::Or;
 use std::collections::HashMap;
 use dirs;
 use tokio::sync::broadcast;
@@ -127,6 +128,7 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
+            println!("wasm result: {:#?}", result);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
@@ -142,7 +144,7 @@ impl ExecutionEngine {
                         }
                     } else {
                         // For cast actions, preserve the original value without parsing
-                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) {
+                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) { 
                             vec![first_result.clone()]
                         } else {
                             vec![Self::parse(first_result.clone())]
@@ -153,16 +155,13 @@ impl ExecutionEngine {
                 }
             };
 
-            if(action.uses.contains("std/if:0.0.1")) {
-                println!("json_objects: {:#?}", json_objects);
-            }
-
             // inject the outputs into the action
             let typed_updated_outputs = self.cast_values_to_typed_array(
                 &action.outputs,
                 &json_objects,
                 &action.types
             )?;
+
             // Create a new action with the updated outputs.
             let updated_action = ShAction {
                 outputs: typed_updated_outputs,
@@ -257,7 +256,6 @@ impl ExecutionEngine {
                         &updated_current_action.outputs
                     )?;
 
-                    
                     for step_id in downstream_step_ids {
                         self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
                     }
@@ -271,8 +269,6 @@ impl ExecutionEngine {
                 // If step not found, continue with remaining buffer
                 current_execution_buffer = remaining_buffer;
             }
-
-            println!("current_execution_buffer: {:#?}", current_execution_buffer);
         }
         
         // The outputs could be coming from the parent inputs or the sibling steps.
@@ -340,6 +336,9 @@ impl ExecutionEngine {
         target_type: &str,
         available_types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Value> {
+        // println!("casting value: {:#?}", value);
+        // println!("target_type: {:#?}", target_type);
+        // println!("available_types: {:#?}", available_types);
         // Handle primitive types with explicit conversion
         if target_type == "string" || 
             target_type == "bool" ||
@@ -415,11 +414,15 @@ impl ExecutionEngine {
                     }
                 };
 
+                
                 // Validate the value against the schema
                 if compiled_schema.validate(value).is_ok() {
                     Ok(value.clone())
                     } else {
                     let error_list: Vec<_> = compiled_schema.validate(value).unwrap_err().collect();
+                    println!("compiled_schema: {:#?}", compiled_schema);
+                    println!("value: {:#?}", value);
+                    println!("--------------------------------");
                     return Err(anyhow::anyhow!("Value is invalid: {:?}", error_list));
                     }
                 } else {
@@ -666,8 +669,18 @@ impl ExecutionEngine {
                 Value::Array(arr.into_iter().map(Self::parse).collect())
             },
             Value::String(s) => {
-                // Try to parse as JSON
+                // Try to parse as JSON, but preserve string values that look like numbers
                 if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
+                    // Check if the parsed value is a number that was originally a string
+                    if let Value::Number(n) = &parsed {
+                        // If it's a simple number that could be a semantic version, keep it as string
+                        if let Some(num) = n.as_f64() {
+                            if num.fract() == 0.0 && num >= 1.0 && num <= 99.0 {
+                                // This looks like a semantic version, keep as string
+                                return Value::String(s);
+                            }
+                        }
+                    }
                     Self::parse(parsed)
             } else {
                     Value::String(s)
@@ -1118,7 +1131,6 @@ impl ExecutionEngine {
                             let next_step_id = output_value_str;
                             // Check if the step exists in the steps vector
                             // if steps.contains_key(next_step_id) {
-                            // println!("found next step id from current step id: {:#?} to flow control step: {:#?}", completed_step_id, next_step_id);
                             downstream_steps.push(next_step_id.to_string());
                             // }
                         }
@@ -1134,8 +1146,13 @@ impl ExecutionEngine {
             }
 
             let depends_on = self.step_depends_on(step, completed_step_id);
-            let is_ready = self.are_all_inputs_ready(step, parent_inputs)?;
+            let is_ready = self.are_all_inputs_ready(step, &step.inputs)?;
 
+            // println!("step_id: {:#?}", step_id);
+            // println!("depends_on: {:#?}", depends_on);
+            // println!("is_ready: {:#?}", is_ready);
+            // println!("step: {:#?}", step.inputs);
+            // println!("--------------------------------");
             // Check if this step depends on the completed step and is now ready
             if depends_on && is_ready {
                 // println!("found next step id from regular step from current step id: {:#?} to {:#?}", completed_step_id, step_id);
@@ -1240,7 +1257,7 @@ impl ExecutionEngine {
                 .map_err(|e| anyhow::anyhow!("JSON parsing error: {} - Response: {}", e, response_text))?;
         Ok(manifest)
         } else {
-            Err(anyhow::anyhow!("Failed to download starthub-lock.json: {}", response.status()))
+            Err(anyhow::anyhow!("Failed to download starthub-lock.json: {} from url: {}", response.status(), storage_url))
         }
     }
 }
@@ -4494,45 +4511,191 @@ mod tests {
         assert!(!output_obj["weather"].as_str().unwrap().is_empty());
     }
 
-    // #[tokio::test]
-    // async fn test_execute_action_create_do_project() {
-    //     dotenv::dotenv().ok();
+    #[tokio::test]
+    async fn test_execute_action_create_do_project() {
+        dotenv::dotenv().ok();
 
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing action with the same inputs as test_build_action_tree
-    //     let action_ref = "starthubhq/do-create-project:0.0.1";
+        // Test executing action with the same inputs as test_build_action_tree
+        let action_ref = "starthubhq/do-create-project:0.0.1";
         
-    //     // Read test parameters from environment variables with defaults
-    //     let api_token = std::env::var("DO_API_TOKEN")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let name = std::env::var("DO_PROJECT_NAME")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let description = std::env::var("DO_PROJECT_DESCRIPTION")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let purpose = std::env::var("DO_PROJECT_PURPOSE")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
-    //         .unwrap_or_else(|_| "".to_string());
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_PROJECT_NAME")
+            .unwrap_or_else(|_| "".to_string());
+        let description = std::env::var("DO_PROJECT_DESCRIPTION")
+            .unwrap_or_else(|_| "".to_string());
+        let purpose = std::env::var("DO_PROJECT_PURPOSE")
+            .unwrap_or_else(|_| "".to_string());
+        let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
+            .unwrap_or_else(|_| "".to_string());
         
-    //     let inputs = vec![
-    //         json!({
-    //             "api_token": api_token,
-    //             "name": name,
-    //             "description": description,
-    //             "purpose": purpose,
-    //             "environment": environment
-    //         })
-    //     ];
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "description": description,
+                "purpose": purpose,
+                "environment": environment
+            })
+        ];
         
-    //     println!("inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
-    // }
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_tag() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for tag creation
+        let action_ref = "starthubhq/do-create-tag:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_TAG_NAME")
+            .unwrap_or_else(|_| "test-tag".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_vpc() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for VPC creation
+        let action_ref = "starthubhq/do-create-vpc:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_VPC_NAME")
+            .unwrap_or_else(|_| "test-vpc".to_string());
+        let region = std::env::var("DO_VPC_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let ip_range = std::env::var("DO_VPC_IP_RANGE")
+            .unwrap_or_else(|_| "10.10.10.0/24".to_string());
+        let description = std::env::var("DO_VPC_DESCRIPTION")
+            .unwrap_or_else(|_| "Test VPC for development".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "ip_range": ip_range,
+                "description": description,
+                "default": false
+            })
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_db_sync() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for database creation
+        let action_ref = "starthubhq/do-create-db-sync:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_DB_NAME")
+            .unwrap_or_else(|_| "test-database".to_string());
+        let engine_type = std::env::var("DO_DB_ENGINE")
+            .unwrap_or_else(|_| "pg".to_string());
+        let region = std::env::var("DO_DB_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let size = std::env::var("DO_DB_SIZE")
+            .unwrap_or_else(|_| "db-s-1vcpu-1gb".to_string());
+        let num_nodes = std::env::var("DO_DB_NUM_NODES")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse::<i32>()
+            .unwrap_or(1);
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "engine": engine_type,
+                "region": region,
+                "size": size,
+                "num_nodes": num_nodes
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_get_do_db() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for database status retrieval
+        let action_ref = "starthubhq/do-get-db:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let database_id = std::env::var("DO_DB_ID")
+            .unwrap_or_else(|_| "test-database-id".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "database_id": database_id
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
 
     // #[tokio::test]
     // async fn test_execute_action_create_do_droplet() {
@@ -4748,6 +4911,99 @@ mod tests {
         println!("do-get-droplet test result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid do-get-droplet action_ref and inputs");        
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_get_do_lb() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for load balancer retrieval
+        let action_ref = "starthubhq/do-get-lb:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let lb_id = std::env::var("DO_LB_ID")
+            .unwrap_or_else(|_| "4de7ac8b-495b-4884-9a69-1050c6793cd6".to_string());
+        
+        println!("DO_API_TOKEN from env: '{}'", std::env::var("DO_API_TOKEN").unwrap_or_default());
+        println!("DO_LB_ID from env: '{}'", std::env::var("DO_LB_ID").unwrap_or_default());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "lb_id": lb_id
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("do-get-lb test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid do-get-lb action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_lb_sync() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for load balancer creation
+        let action_ref = "starthubhq/do-create-lb-sync:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_LB_NAME")
+            .unwrap_or_else(|_| "test-lb-01".to_string());
+        let region = std::env::var("DO_LB_REGION")
+            .unwrap_or_else(|_| "nyc3".to_string());
+        let size = std::env::var("DO_LB_SIZE")
+            .unwrap_or_else(|_| "lb-small".to_string());
+        let project_id = std::env::var("DO_PROJECT_ID")
+            .unwrap_or_else(|_| "test-project-id".to_string());
+
+        println!("DO_PROJECT_ID from env: '{}'", std::env::var("DO_PROJECT_ID").unwrap_or_default());
+        println!("DO_API_TOKEN from env: '{}'", std::env::var("DO_API_TOKEN").unwrap_or_default());
+        println!("DO_LB_NAME from env: '{}'", std::env::var("DO_LB_NAME").unwrap_or_default());
+        println!("DO_LB_REGION from env: '{}'", std::env::var("DO_LB_REGION").unwrap_or_default());
+        println!("DO_LB_SIZE from env: '{}'", std::env::var("DO_LB_SIZE").unwrap_or_default());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "forwarding_rules": [
+                    {
+                        "entry_protocol": "http",
+                        "entry_port": 80,
+                        "target_protocol": "http",
+                        "target_port": 80
+                    }
+                ],
+                "droplet_ids": [],
+                "http_idle_timeout_seconds": 60,
+                "project_id": project_id,
+                "firewall": {
+                    "deny": [],
+                    "allow": []
+                }
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("do-create-lb-sync test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid do-create-lb-sync action_ref and inputs");
     }
 
     #[tokio::test]
