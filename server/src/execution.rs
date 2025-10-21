@@ -128,7 +128,6 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
-            println!("wasm result: {:#?}", result);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
