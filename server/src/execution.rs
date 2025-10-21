@@ -1,6 +1,7 @@
 use anyhow::Result;
 use jsonschema::JSONSchema;
 use serde_json::Value;
+use tracing_subscriber::filter::combinator::Or;
 use std::collections::HashMap;
 use dirs;
 use tokio::sync::broadcast;
@@ -142,7 +143,7 @@ impl ExecutionEngine {
                         }
                     } else {
                         // For cast actions, preserve the original value without parsing
-                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) {
+                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) { 
                             vec![first_result.clone()]
                         } else {
                             vec![Self::parse(first_result.clone())]
@@ -159,6 +160,7 @@ impl ExecutionEngine {
                 &json_objects,
                 &action.types
             )?;
+
             // Create a new action with the updated outputs.
             let updated_action = ShAction {
                 outputs: typed_updated_outputs,
@@ -200,6 +202,7 @@ impl ExecutionEngine {
         while !current_execution_buffer.is_empty() {
             // Get the first step from the buffer
             let current_step_id = current_execution_buffer.first().unwrap().clone();
+            println!("current_step_id: {}", current_step_id);
             
             // Remove the first step from the buffer
             let remaining_buffer = current_execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
@@ -253,7 +256,6 @@ impl ExecutionEngine {
                         &updated_current_action.outputs
                     )?;
 
-                    
                     for step_id in downstream_step_ids {
                         self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
                     }
@@ -334,9 +336,9 @@ impl ExecutionEngine {
         target_type: &str,
         available_types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Value> {
-        println!("casting value: {:#?}", value);
-        println!("target_type: {:#?}", target_type);
-        println!("available_types: {:#?}", available_types);
+        // println!("casting value: {:#?}", value);
+        // println!("target_type: {:#?}", target_type);
+        // println!("available_types: {:#?}", available_types);
         // Handle primitive types with explicit conversion
         if target_type == "string" || 
             target_type == "bool" ||
@@ -663,8 +665,18 @@ impl ExecutionEngine {
                 Value::Array(arr.into_iter().map(Self::parse).collect())
             },
             Value::String(s) => {
-                // Try to parse as JSON
+                // Try to parse as JSON, but preserve string values that look like numbers
                 if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
+                    // Check if the parsed value is a number that was originally a string
+                    if let Value::Number(n) = &parsed {
+                        // If it's a simple number that could be a semantic version, keep it as string
+                        if let Some(num) = n.as_f64() {
+                            if num.fract() == 0.0 && num >= 1.0 && num <= 99.0 {
+                                // This looks like a semantic version, keep as string
+                                return Value::String(s);
+                            }
+                        }
+                    }
                     Self::parse(parsed)
             } else {
                     Value::String(s)
@@ -1115,7 +1127,6 @@ impl ExecutionEngine {
                             let next_step_id = output_value_str;
                             // Check if the step exists in the steps vector
                             // if steps.contains_key(next_step_id) {
-                            // println!("found next step id from current step id: {:#?} to flow control step: {:#?}", completed_step_id, next_step_id);
                             downstream_steps.push(next_step_id.to_string());
                             // }
                         }
@@ -1131,8 +1142,13 @@ impl ExecutionEngine {
             }
 
             let depends_on = self.step_depends_on(step, completed_step_id);
-            let is_ready = self.are_all_inputs_ready(step, parent_inputs)?;
+            let is_ready = self.are_all_inputs_ready(step, &step.inputs)?;
 
+            // println!("step_id: {:#?}", step_id);
+            // println!("depends_on: {:#?}", depends_on);
+            // println!("is_ready: {:#?}", is_ready);
+            // println!("step: {:#?}", step.inputs);
+            // println!("--------------------------------");
             // Check if this step depends on the completed step and is now ready
             if depends_on && is_ready {
                 // println!("found next step id from regular step from current step id: {:#?} to {:#?}", completed_step_id, step_id);
@@ -1237,7 +1253,7 @@ impl ExecutionEngine {
                 .map_err(|e| anyhow::anyhow!("JSON parsing error: {} - Response: {}", e, response_text))?;
         Ok(manifest)
         } else {
-            Err(anyhow::anyhow!("Failed to download starthub-lock.json: {}", response.status()))
+            Err(anyhow::anyhow!("Failed to download starthub-lock.json: {} from url: {}", response.status(), storage_url))
         }
     }
 }
@@ -4597,6 +4613,82 @@ mod tests {
         
         let result = engine.execute_action(action_ref, inputs).await;
         
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_db_sync() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for database creation
+        let action_ref = "starthubhq/do-create-db-sync:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_DB_NAME")
+            .unwrap_or_else(|_| "test-database".to_string());
+        let engine_type = std::env::var("DO_DB_ENGINE")
+            .unwrap_or_else(|_| "pg".to_string());
+        let region = std::env::var("DO_DB_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let size = std::env::var("DO_DB_SIZE")
+            .unwrap_or_else(|_| "db-s-1vcpu-1gb".to_string());
+        let num_nodes = std::env::var("DO_DB_NUM_NODES")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse::<i32>()
+            .unwrap_or(1);
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "engine": engine_type,
+                "region": region,
+                "size": size,
+                "num_nodes": num_nodes
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_get_do_db() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for database status retrieval
+        let action_ref = "starthubhq/do-get-db:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let database_id = std::env::var("DO_DB_ID")
+            .unwrap_or_else(|_| "test-database-id".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "database_id": database_id
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
     }
