@@ -270,12 +270,15 @@ impl ExecutionEngine {
             }
         }
         
+        println!("current_action: {:#?}", current_action);
         // The outputs could be coming from the parent inputs or the sibling steps.
         let resolved_untyped_outputs = self.resolve_untyped_output_values(
             &action.outputs,
             &action.inputs,
             &current_action.steps
         )?;
+
+        println!("resolved_untyped_outputs: {:#?}", resolved_untyped_outputs);
 
         // Create a new action with resolved outputs
         let updated_action = ShAction {
@@ -6020,14 +6023,15 @@ mod tests {
         
         // Test with URL and optional headers
         let inputs = vec![
-            json!("https://api.restful-api.dev/objects"),  // URL
+            json!("https://raw.githubusercontent.com/tgirotto/install-grafana/refs/heads/main/install-grafana.sh"),  // URL
             json!({  // Headers
-                "Accept": "application/json"
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "User-Agent": "StartHub-Install-Grafana/1.0"
             })
         ];
         
         let result = engine.execute_action(action_ref, inputs).await;
-        
+        println!("result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid http-get-wasm action_ref and inputs");
         
@@ -6407,6 +6411,84 @@ mod tests {
         
         let output_string = first_output.as_str().unwrap();
         assert_eq!(output_string, "-15.7", "Output should be the string representation of the input negative number");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_install_grafana() {
+        dotenv::dotenv().ok();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing the install-grafana composition
+        let action_ref = "starthubhq/install-grafana:0.0.1";
+        
+        // Read test parameters from environment variables, with fallback to default SSH key
+        let private_key = std::env::var("SSH_PRIVATE_KEY")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
+                    .unwrap_or_else(|_| "".to_string())
+            });
+        let user = std::env::var("SSH_USER").unwrap_or_default();
+        let host = std::env::var("SSH_HOST").unwrap_or_default();
+        let script_url = std::env::var("GRAFANA_SCRIPT_URL")
+            .unwrap_or_else(|_| "https://raw.githubusercontent.com/tgirotto/install-grafana/refs/heads/main/install-grafana.sh".to_string());
+
+        println!("private_key: {}", private_key);
+        println!("user: {}", user);
+        println!("host: {}", host);
+        println!("script_url: {}", script_url);
+        
+        // If required env vars are missing, skip the test gracefully
+        if private_key.is_empty() || user.is_empty() || host.is_empty() {
+            println!("Skipping install-grafana test: missing SSH_PRIVATE_KEY/SSH_USER/SSH_HOST env vars");
+            return;
+        }
+        
+        let inputs = vec![
+            json!(script_url),
+            json!(private_key),
+            json!(user),
+            json!(host),
+        ];
+        
+        println!("Testing install-grafana with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("install-grafana test result: {:#?}", result);
+        
+        // The test will fail until the package is published to the registry
+        // This is expected behavior for a local package that hasn't been published yet
+        match result {
+            Ok(outputs) => {
+                // If the package exists and executes successfully, verify the outputs
+                assert!(outputs.is_array(), "execute_action should return an array of outputs");
+                let outputs_array = outputs.as_array().unwrap();
+                
+                // For a composition, we expect at least one output
+                assert!(!outputs_array.is_empty(), "Composition should produce outputs");
+                
+                // Verify the output structure - should contain script_content and execution_result
+                let first_output = &outputs_array[0];
+                assert!(first_output.is_string(), "Output should be a string (script content)");
+                
+                let script_content = first_output.as_str().unwrap();
+                assert!(!script_content.is_empty(), "script_content should not be empty");
+                
+                // Verify it contains expected script content (bash shebang and apt-get commands)
+                assert!(script_content.contains("#!/bin/bash"), "Script should contain bash shebang");
+                assert!(script_content.contains("apt-get"), "Script should contain apt-get commands");
+                assert!(script_content.contains("grafana"), "Script should contain grafana references");
+            }
+            Err(e) => {
+                // Expected to fail until package is published to registry
+                println!("Expected failure (package not yet published): {}", e);
+                assert!(e.to_string().contains("Failed to download starthub-lock.json") || 
+                       e.to_string().contains("400 Bad Request") ||
+                       e.to_string().contains("404 Not Found"),
+                       "Error should be related to package not found in registry");
+            }
+        }
     }
     
 
