@@ -153,10 +153,6 @@ impl ExecutionEngine {
                 }
             };
 
-            if(action.uses.contains("std/if:0.0.1")) {
-                println!("json_objects: {:#?}", json_objects);
-            }
-
             // inject the outputs into the action
             let typed_updated_outputs = self.cast_values_to_typed_array(
                 &action.outputs,
@@ -271,8 +267,6 @@ impl ExecutionEngine {
                 // If step not found, continue with remaining buffer
                 current_execution_buffer = remaining_buffer;
             }
-
-            println!("current_execution_buffer: {:#?}", current_execution_buffer);
         }
         
         // The outputs could be coming from the parent inputs or the sibling steps.
@@ -340,6 +334,9 @@ impl ExecutionEngine {
         target_type: &str,
         available_types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Value> {
+        println!("casting value: {:#?}", value);
+        println!("target_type: {:#?}", target_type);
+        println!("available_types: {:#?}", available_types);
         // Handle primitive types with explicit conversion
         if target_type == "string" || 
             target_type == "bool" ||
@@ -4494,45 +4491,115 @@ mod tests {
         assert!(!output_obj["weather"].as_str().unwrap().is_empty());
     }
 
-    // #[tokio::test]
-    // async fn test_execute_action_create_do_project() {
-    //     dotenv::dotenv().ok();
+    #[tokio::test]
+    async fn test_execute_action_create_do_project() {
+        dotenv::dotenv().ok();
 
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing action with the same inputs as test_build_action_tree
-    //     let action_ref = "starthubhq/do-create-project:0.0.1";
+        // Test executing action with the same inputs as test_build_action_tree
+        let action_ref = "starthubhq/do-create-project:0.0.1";
         
-    //     // Read test parameters from environment variables with defaults
-    //     let api_token = std::env::var("DO_API_TOKEN")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let name = std::env::var("DO_PROJECT_NAME")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let description = std::env::var("DO_PROJECT_DESCRIPTION")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let purpose = std::env::var("DO_PROJECT_PURPOSE")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
-    //         .unwrap_or_else(|_| "".to_string());
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_PROJECT_NAME")
+            .unwrap_or_else(|_| "".to_string());
+        let description = std::env::var("DO_PROJECT_DESCRIPTION")
+            .unwrap_or_else(|_| "".to_string());
+        let purpose = std::env::var("DO_PROJECT_PURPOSE")
+            .unwrap_or_else(|_| "".to_string());
+        let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
+            .unwrap_or_else(|_| "".to_string());
         
-    //     let inputs = vec![
-    //         json!({
-    //             "api_token": api_token,
-    //             "name": name,
-    //             "description": description,
-    //             "purpose": purpose,
-    //             "environment": environment
-    //         })
-    //     ];
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "description": description,
+                "purpose": purpose,
+                "environment": environment
+            })
+        ];
         
-    //     println!("inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
-    // }
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_tag() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for tag creation
+        let action_ref = "starthubhq/do-create-tag:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_TAG_NAME")
+            .unwrap_or_else(|_| "test-tag".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_vpc() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for VPC creation
+        let action_ref = "starthubhq/do-create-vpc:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_VPC_NAME")
+            .unwrap_or_else(|_| "test-vpc".to_string());
+        let region = std::env::var("DO_VPC_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let ip_range = std::env::var("DO_VPC_IP_RANGE")
+            .unwrap_or_else(|_| "10.10.10.0/24".to_string());
+        let description = std::env::var("DO_VPC_DESCRIPTION")
+            .unwrap_or_else(|_| "Test VPC for development".to_string());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "ip_range": ip_range,
+                "description": description,
+                "default": false
+            })
+        ];
+        
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
+    }
 
     // #[tokio::test]
     // async fn test_execute_action_create_do_droplet() {
