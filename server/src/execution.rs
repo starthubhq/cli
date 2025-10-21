@@ -128,6 +128,7 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
+            println!("wasm result: {:#?}", result);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
@@ -202,7 +203,6 @@ impl ExecutionEngine {
         while !current_execution_buffer.is_empty() {
             // Get the first step from the buffer
             let current_step_id = current_execution_buffer.first().unwrap().clone();
-            println!("current_step_id: {}", current_step_id);
             
             // Remove the first step from the buffer
             let remaining_buffer = current_execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
@@ -414,11 +414,15 @@ impl ExecutionEngine {
                     }
                 };
 
+                
                 // Validate the value against the schema
                 if compiled_schema.validate(value).is_ok() {
                     Ok(value.clone())
                     } else {
                     let error_list: Vec<_> = compiled_schema.validate(value).unwrap_err().collect();
+                    println!("compiled_schema: {:#?}", compiled_schema);
+                    println!("value: {:#?}", value);
+                    println!("--------------------------------");
                     return Err(anyhow::anyhow!("Value is invalid: {:?}", error_list));
                     }
                 } else {
@@ -4907,6 +4911,99 @@ mod tests {
         println!("do-get-droplet test result: {:#?}", result);
         // The test should succeed
         assert!(result.is_ok(), "execute_action should succeed for valid do-get-droplet action_ref and inputs");        
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_get_do_lb() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for load balancer retrieval
+        let action_ref = "starthubhq/do-get-lb:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let lb_id = std::env::var("DO_LB_ID")
+            .unwrap_or_else(|_| "4de7ac8b-495b-4884-9a69-1050c6793cd6".to_string());
+        
+        println!("DO_API_TOKEN from env: '{}'", std::env::var("DO_API_TOKEN").unwrap_or_default());
+        println!("DO_LB_ID from env: '{}'", std::env::var("DO_LB_ID").unwrap_or_default());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "lb_id": lb_id
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("do-get-lb test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid do-get-lb action_ref and inputs");
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_create_do_lb_sync() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for load balancer creation
+        let action_ref = "starthubhq/do-create-lb-sync:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_LB_NAME")
+            .unwrap_or_else(|_| "test-lb-01".to_string());
+        let region = std::env::var("DO_LB_REGION")
+            .unwrap_or_else(|_| "nyc3".to_string());
+        let size = std::env::var("DO_LB_SIZE")
+            .unwrap_or_else(|_| "lb-small".to_string());
+        let project_id = std::env::var("DO_PROJECT_ID")
+            .unwrap_or_else(|_| "test-project-id".to_string());
+
+        println!("DO_PROJECT_ID from env: '{}'", std::env::var("DO_PROJECT_ID").unwrap_or_default());
+        println!("DO_API_TOKEN from env: '{}'", std::env::var("DO_API_TOKEN").unwrap_or_default());
+        println!("DO_LB_NAME from env: '{}'", std::env::var("DO_LB_NAME").unwrap_or_default());
+        println!("DO_LB_REGION from env: '{}'", std::env::var("DO_LB_REGION").unwrap_or_default());
+        println!("DO_LB_SIZE from env: '{}'", std::env::var("DO_LB_SIZE").unwrap_or_default());
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "forwarding_rules": [
+                    {
+                        "entry_protocol": "http",
+                        "entry_port": 80,
+                        "target_protocol": "http",
+                        "target_port": 80
+                    }
+                ],
+                "droplet_ids": [],
+                "http_idle_timeout_seconds": 60,
+                "project_id": project_id,
+                "firewall": {
+                    "deny": [],
+                    "allow": []
+                }
+            })
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("do-create-lb-sync test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid do-create-lb-sync action_ref and inputs");
     }
 
     #[tokio::test]
