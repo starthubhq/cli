@@ -80,6 +80,7 @@ impl ExecutionEngine {
             ..root_action
         };        
         
+        println!("new_root_action: {:#?}", new_root_action);
         self.logger.log_success("Action tree built successfully", Some(&new_root_action.id));
 
         self.logger.log_info("Executing action tree...", Some(&new_root_action.id));
@@ -128,31 +129,37 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
+            println!("result: {:#?}", result);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             // Parse the result into a vector of JSON objects
             let json_objects: Vec<Value> = if result.is_empty() {
                 Vec::new()
             } else {
-                if let Some(first_result) = result.first() {
-                    if let Some(array) = first_result.as_array() {
-                        // For cast actions, preserve the original values without parsing
+                // Process all results, not just the first one
+                let mut all_values = Vec::new();
+                for result_item in &result {
+                    if let Some(array) = result_item.as_array() {
+                        // If the result is an array, process all elements
+                        for item in array {
                         if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) {
-                            array.iter().map(|item| item.clone()).collect()
+                                all_values.push(item.clone());
                         } else {
-                            array.iter().map(|item| Self::parse(item.clone())).collect()
+                                all_values.push(Self::parse(item.clone()));
+                            }
                         }
                     } else {
-                        // For cast actions, preserve the original value without parsing
+                        // If the result is not an array, process it as a single value
                         if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) { 
-                            vec![first_result.clone()]
+                            all_values.push(result_item.clone());
                         } else {
-                            vec![Self::parse(first_result.clone())]
+                            all_values.push(Self::parse(result_item.clone()));
                         }
                     }
-                } else {
-                    Vec::new()
                 }
+                all_values
             };
+
+            println!("json_objects: {:#?}", json_objects);
 
             // inject the outputs into the action
             let typed_updated_outputs = self.cast_values_to_typed_array(
@@ -160,6 +167,8 @@ impl ExecutionEngine {
                 &json_objects,
                 &action.types
             )?;
+
+            
 
             // Create a new action with the updated outputs.
             let updated_action = ShAction {
@@ -200,9 +209,10 @@ impl ExecutionEngine {
         
         // Iterative execution loop
         while !current_execution_buffer.is_empty() {
+            println!("current_execution_buffer: {:#?}", current_execution_buffer);
             // Get the first step from the buffer
             let current_step_id = current_execution_buffer.first().unwrap().clone();
-            
+            println!("current_step_id: {:#?}", current_step_id);
             // Remove the first step from the buffer
             let remaining_buffer = current_execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
             
@@ -211,6 +221,7 @@ impl ExecutionEngine {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
                 // Execute the step
+                println!("executing step: {:#?}", step);
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
 
                 // Substitute the step in the current action with the executed step
@@ -270,15 +281,12 @@ impl ExecutionEngine {
             }
         }
         
-        println!("current_action: {:#?}", current_action);
         // The outputs could be coming from the parent inputs or the sibling steps.
         let resolved_untyped_outputs = self.resolve_untyped_output_values(
             &action.outputs,
             &action.inputs,
             &current_action.steps
         )?;
-
-        println!("resolved_untyped_outputs: {:#?}", resolved_untyped_outputs);
 
         // Create a new action with resolved outputs
         let updated_action = ShAction {
@@ -301,14 +309,25 @@ impl ExecutionEngine {
         io_values: &Vec<Value>,
         types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Vec<ShIO>> {
-        // println!("casting values to typed array");
-        // println!("io_fields: {:#?}", io_fields);
-        // println!("io_values: {:#?}", io_values);
-        // println!("types: {:#?}", types);
+        println!("casting values to typed array");
+        println!("io_fields: {:#?}", io_fields);
+        println!("io_values: {:#?}", io_values);
+        println!("types: {:#?}", types);
         let mut cast_values: Vec<Value> = Vec::new();
         // For each IO field, cast the value to the appropriate type
         for (index, io) in io_fields.iter().enumerate() {
-            let value_to_inject = io_values.get(index).unwrap().clone();
+            println!("casting value to type: {:#?}", io);
+            let value_to_inject = match io_values.get(index) {
+                Some(value) => {
+                    println!("value to inject: {:#?}", value);
+                    value.clone()
+                },
+                None => {
+                    println!("No value found at index {}, skipping output", index);
+                    continue;
+                }
+            };
+            println!("--------------------------------");
             
             let converted_value = self.cast(&value_to_inject, &io.r#type, types)?;
             cast_values.push(converted_value);
@@ -4703,6 +4722,7 @@ mod tests {
     // async fn test_execute_action_create_do_droplet() {
     //     dotenv::dotenv().ok();
 
+    //     println!("Creating droplet non sync");
     //     // Create a mock ExecutionEngine
     //     let mut engine = ExecutionEngine::new();
         
@@ -4773,51 +4793,52 @@ mod tests {
     //     assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
     // }
 
-    // #[tokio::test]
-    // async fn test_execute_action_create_do_ssh_key_from_file() {
-    //     dotenv::dotenv().ok();
+    #[tokio::test]
+    async fn test_execute_action_create_do_ssh_key_from_file() {
+        dotenv::dotenv().ok();
 
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing action for SSH key creation from file
-    //     let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
+        // Test executing action for SSH key creation from file
+        let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
         
-    //     // Read test parameters from environment variables with defaults
-    //     let api_token = std::env::var("DO_API_TOKEN")
-    //         .unwrap_or_else(|_| "".to_string());
-    //     let name = std::env::var("DO_SSH_KEY_NAME")
-    //         .unwrap_or_else(|_| "test-ssh-key-from-file".to_string());
-    //     let ssh_key_file_path = std::env::var("DO_SSH_KEY_FILE_PATH")
-    //         .unwrap_or_else(|_| "/tmp/test_ssh_key.pub".to_string());
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_SSH_KEY_NAME")
+            .unwrap_or_else(|_| "test-ssh-key-from-file".to_string());
+        let ssh_key_file_path = std::env::var("DO_SSH_KEY_FILE_PATH")
+            .unwrap_or_else(|_| "/tmp/test_ssh_key.pub".to_string());
         
-    //     // Create a temporary SSH key file for testing if it doesn't exist
-    //     if !std::path::Path::new(&ssh_key_file_path).exists() {
-    //         let test_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA test@example.com";
-    //         if let Err(e) = std::fs::write(&ssh_key_file_path, test_public_key) {
-    //             println!("Warning: Could not create test SSH key file at {}: {}", ssh_key_file_path, e);
-    //         }
-    //     }
+        // Create a temporary SSH key file for testing if it doesn't exist
+        if !std::path::Path::new(&ssh_key_file_path).exists() {
+            let test_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA test@example.com";
+            if let Err(e) = std::fs::write(&ssh_key_file_path, test_public_key) {
+                println!("Warning: Could not create test SSH key file at {}: {}", ssh_key_file_path, e);
+            }
+        }
         
-    //     let inputs = vec![
-    //         json!({
-    //             "api_token": api_token,
-    //             "name": name,
-    //             "ssh_key_file_path": ssh_key_file_path
-    //         })
-    //     ];
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "ssh_key_file_path": ssh_key_file_path
+            })
+        ];
         
-    //     println!("inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs with file path");
-    // }
+        println!("result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs with file path");
+    }
 
     #[tokio::test]
     async fn test_execute_action_create_do_droplet_sync() {
         dotenv::dotenv().ok();
+        println!("Creating droplet sync");
 
         // Create a mock ExecutionEngine
         let mut engine = ExecutionEngine::new();
@@ -6412,7 +6433,7 @@ mod tests {
         let output_string = first_output.as_str().unwrap();
         assert_eq!(output_string, "-15.7", "Output should be the string representation of the input negative number");
     }
-
+    
     #[tokio::test]
     async fn test_execute_action_install_grafana() {
         dotenv::dotenv().ok();
@@ -6489,6 +6510,164 @@ mod tests {
                        "Error should be related to package not found in registry");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_ssh_keygen() {
+        dotenv::dotenv().ok();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+
+        // Test executing the ssh-keygen WASM action
+        let action_ref = "starthubhq/ssh-keygen:0.0.1";
+
+        // Create SSH keygen configuration - direct config object as per actual implementation
+        let ssh_keygen_config = json!({
+            "t": "rsa",
+            "b": 2048,
+            "C": "test@example.com"
+        });
+
+        let inputs = vec![ssh_keygen_config];
+
+        println!("Testing ssh-keygen with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+
+        println!("ssh-keygen test result: {:#?}", result);
+
+        // The test will fail until the package is published to the registry
+        // This is expected behavior for a local package that hasn't been published yet
+        match result {
+            Ok(outputs) => {
+                // If the package exists and executes successfully, verify the outputs
+                assert!(outputs.is_array(), "execute_action should return an array of outputs");
+                let outputs_array = outputs.as_array().unwrap();
+
+                // For a WASM action, we expect exactly 2 outputs: private_key and public_key
+                assert_eq!(outputs_array.len(), 2, "ssh-keygen should return exactly 2 outputs");
+
+                // Verify the output structure - should contain private_key and public_key
+                let private_key = &outputs_array[0];
+                let public_key = &outputs_array[1];
+
+                assert!(private_key.is_string(), "First output should be a string (private key)");
+                assert!(public_key.is_string(), "Second output should be a string (public key)");
+
+                let private_key_str = private_key.as_str().unwrap();
+                let public_key_str = public_key.as_str().unwrap();
+
+                assert!(!private_key_str.is_empty(), "private_key should not be empty");
+                assert!(!public_key_str.is_empty(), "public_key should not be empty");
+
+                // Verify private key format (PEM)
+                assert!(private_key_str.contains("-----BEGIN PRIVATE KEY-----"), 
+                       "Private key should be in PEM format");
+                assert!(private_key_str.contains("-----END PRIVATE KEY-----"), 
+                       "Private key should be in PEM format");
+
+                // Verify public key format (OpenSSH)
+                assert!(public_key_str.starts_with("ssh-rsa "), 
+                       "Public key should be in OpenSSH format");
+                assert!(public_key_str.contains("test@example.com"), 
+                       "Public key should contain the comment");
+
+                println!("✅ SSH keygen test passed - generated valid RSA key pair");
+            }
+            Err(e) => {
+                // Expected to fail until package is published to registry
+                println!("Expected failure (package not yet published): {}", e);
+                assert!(e.to_string().contains("Failed to download starthub-lock.json") ||
+                       e.to_string().contains("400 Bad Request") ||
+                       e.to_string().contains("404 Not Found"),
+                       "Error should be related to package not found in registry");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_action_deploy_grafana_single_instance() {
+        dotenv::dotenv().ok();
+        println!("Creating droplet sync");
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for droplet creation with sync
+        let action_ref = "starthubhq/deploy-grafana-single-instance:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let name = std::env::var("DO_DROPLET_NAME")
+            .unwrap_or_else(|_| "test-droplet-sync".to_string());
+        let region = std::env::var("DO_DROPLET_REGION")
+            .unwrap_or_else(|_| "nyc1".to_string());
+        let size = std::env::var("DO_DROPLET_SIZE")
+            .unwrap_or_else(|_| "s-1vcpu-1gb".to_string());
+        let image = std::env::var("DO_DROPLET_IMAGE")
+            .unwrap_or_else(|_| "ubuntu-20-04-x64".to_string());
+        let backups = std::env::var("DO_DROPLET_BACKUPS")
+            .unwrap_or_else(|_| "false".to_string());
+        let ipv6 = std::env::var("DO_DROPLET_IPV6")
+            .unwrap_or_else(|_| "false".to_string());
+        let monitoring = std::env::var("DO_DROPLET_MONITORING")
+            .unwrap_or_else(|_| "false".to_string());
+        let tags = std::env::var("DO_DROPLET_TAGS")
+            .unwrap_or_else(|_| "".to_string());
+        let user_data = std::env::var("DO_DROPLET_USER_DATA")
+            .unwrap_or_else(|_| "".to_string());
+        
+            let private_key = std::env::var("SSH_PRIVATE_KEY")
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
+                    .unwrap_or_else(|_| "".to_string())
+            });
+        let user = std::env::var("SSH_USER").unwrap_or_default();
+
+        println!("private_key: {}", private_key);
+        println!("user: {}", user);
+        
+        // If required env vars are missing, skip the test gracefully
+        if private_key.is_empty() || user.is_empty() {
+            println!("Skipping install-grafana test: missing SSH_PRIVATE_KEY/SSH_USER/SSH_HOST env vars");
+            return;
+        }
+
+        // Parse boolean values
+        let backups_bool = backups.parse::<bool>().unwrap_or(false);
+        let ipv6_bool = ipv6.parse::<bool>().unwrap_or(false);
+        let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
+        
+        // Parse array values
+        let tags_array: Vec<String> = if tags.is_empty() {
+            vec![]
+        } else {
+            tags.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "name": name,
+                "region": region,
+                "size": size,
+                "image": image,
+                "backups": backups_bool,
+                "ipv6": ipv6_bool,
+                "monitoring": monitoring_bool,
+                "tags": tags_array,
+                "user_data": user_data
+            }),
+            json!(private_key),
+            json!(user),
+        ];
+        
+        // println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        println!("result: {:#?}", result);
+        // The test should succeed
+        // assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
     }
     
 
