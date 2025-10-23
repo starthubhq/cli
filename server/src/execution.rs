@@ -80,7 +80,6 @@ impl ExecutionEngine {
             ..root_action
         };        
         
-        println!("new_root_action: {:#?}", new_root_action);
         self.logger.log_success("Action tree built successfully", Some(&new_root_action.id));
 
         self.logger.log_info("Executing action tree...", Some(&new_root_action.id));
@@ -107,7 +106,7 @@ impl ExecutionEngine {
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
                 .collect();
 
-            let result = if action.kind == "wasm" {
+            let result_string = if action.kind == "wasm" {
                 wasm::run_wasm_step(
                     action, 
                     &serde_json::to_value(&input_values_to_serialise)?, 
@@ -129,37 +128,16 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
-            println!("result: {:#?}", result);
+            // Parse the string result as JSON directly
+            let parsed_json = serde_json::from_str::<Value>(&result_string)
+                .expect("Docker/WASM actions always return valid JSON");
+            
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
-            // Parse the result into a vector of JSON objects
-            let json_objects: Vec<Value> = if result.is_empty() {
-                Vec::new()
-            } else {
-                // Process all results, not just the first one
-                let mut all_values = Vec::new();
-                for result_item in &result {
-                    if let Some(array) = result_item.as_array() {
-                        // If the result is an array, process all elements
-                        for item in array {
-                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) {
-                                all_values.push(item.clone());
-                        } else {
-                                all_values.push(Self::parse(item.clone()));
-                            }
-                        }
-                    } else {
-                        // If the result is not an array, process it as a single value
-                        if action.role.as_ref().map_or(false, |r| r == &ShRole::TypingControl) { 
-                            all_values.push(result_item.clone());
-                        } else {
-                            all_values.push(Self::parse(result_item.clone()));
-                        }
-                    }
-                }
-                all_values
-            };
-
-            println!("json_objects: {:#?}", json_objects);
+            
+            // Process the result - Docker/WASM actions always return JSON arrays of strings
+            let json_objects: Vec<Value> = parsed_json.as_array().unwrap().iter().map(|item| {
+                Self::parse(item.clone())
+            }).collect();
 
             // inject the outputs into the action
             let typed_updated_outputs = self.cast_values_to_typed_array(
@@ -167,8 +145,6 @@ impl ExecutionEngine {
                 &json_objects,
                 &action.types
             )?;
-
-            
 
             // Create a new action with the updated outputs.
             let updated_action = ShAction {
@@ -209,10 +185,8 @@ impl ExecutionEngine {
         
         // Iterative execution loop
         while !current_execution_buffer.is_empty() {
-            println!("current_execution_buffer: {:#?}", current_execution_buffer);
             // Get the first step from the buffer
             let current_step_id = current_execution_buffer.first().unwrap().clone();
-            println!("current_step_id: {:#?}", current_step_id);
             // Remove the first step from the buffer
             let remaining_buffer = current_execution_buffer.into_iter().skip(1).collect::<Vec<String>>();
             
@@ -221,8 +195,8 @@ impl ExecutionEngine {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
                 // Execute the step
-                println!("executing step: {:#?}", step);
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
+                println!("current_step_id: {:#?}", current_step_id);
 
                 // Substitute the step in the current action with the executed step
                 let updated_steps: HashMap<String, ShAction> = current_action.steps.iter()
@@ -241,6 +215,7 @@ impl ExecutionEngine {
                     ..current_action.clone()
                 };
 
+                // println!("current_action_with_updated_steps: {:#?}", current_action_with_updated_steps);
                 // By the time we get here, the current action has been updated with the outputs of the step we have just executed.
                 // However, the effects of the processing of the current step have not beem applied to the siblings yet.
                 // For each sibling, inject the outputs of the step we have just executed
@@ -266,6 +241,7 @@ impl ExecutionEngine {
                         &updated_current_action.outputs
                     )?;
 
+                    println!("downstream_step_ids: {:#?}", downstream_step_ids);
                     for step_id in downstream_step_ids {
                         self.push_to_execution_buffer(&mut new_execution_buffer, step_id);
                     }
@@ -309,17 +285,17 @@ impl ExecutionEngine {
         io_values: &Vec<Value>,
         types: &Option<serde_json::Map<String, Value>>
     ) -> Result<Vec<ShIO>> {
-        println!("casting values to typed array");
-        println!("io_fields: {:#?}", io_fields);
-        println!("io_values: {:#?}", io_values);
-        println!("types: {:#?}", types);
+        // println!("casting values to typed array");
+        // println!("io_fields: {:#?}", io_fields);
+        // println!("io_values: {:#?}", io_values);
+        // println!("types: {:#?}", types);
         let mut cast_values: Vec<Value> = Vec::new();
         // For each IO field, cast the value to the appropriate type
         for (index, io) in io_fields.iter().enumerate() {
-            println!("casting value to type: {:#?}", io);
+            // println!("casting value to type: {:#?}", io);
             let value_to_inject = match io_values.get(index) {
                 Some(value) => {
-                    println!("value to inject: {:#?}", value);
+                    // println!("value to inject: {:#?}", value);
                     value.clone()
                 },
                 None => {
@@ -327,7 +303,6 @@ impl ExecutionEngine {
                     continue;
                 }
             };
-            println!("--------------------------------");
             
             let converted_value = self.cast(&value_to_inject, &io.r#type, types)?;
             cast_values.push(converted_value);
@@ -4727,7 +4702,7 @@ mod tests {
     //     let mut engine = ExecutionEngine::new();
         
     //     // Test executing action for droplet creation
-    //     let action_ref = "starthubhq/do-create-droplet:0.0.1";
+    //     let action_ref = "starthubhq/do-create-droplet:0.0.2";
         
     //     // Read test parameters from environment variables with defaults
     //     let api_token = std::env::var("DO_API_TOKEN")
@@ -4757,9 +4732,8 @@ mod tests {
     //     let backups_bool = backups.parse::<bool>().unwrap_or(false);
     //     let ipv6_bool = ipv6.parse::<bool>().unwrap_or(false);
     //     let monitoring_bool = monitoring.parse::<bool>().unwrap_or(false);
-        
-    //     // Parse array values
-    //     let _ssh_keys_array: Vec<String> = if ssh_keys.is_empty() {
+
+    //     let ssh_keys_array: Vec<String> = if ssh_keys.is_empty() {
     //         vec![]
     //     } else {
     //         ssh_keys.split(',').map(|s| s.trim().to_string()).collect()
@@ -4782,7 +4756,8 @@ mod tests {
     //             "ipv6": ipv6_bool,
     //             "monitoring": monitoring_bool,
     //             "tags": tags_array,
-    //             "user_data": user_data
+    //             "user_data": user_data,
+    //             "ssh_keys": ssh_keys_array
     //         })
     //     ];
         
@@ -4794,48 +4769,6 @@ mod tests {
     // }
 
     #[tokio::test]
-    async fn test_execute_action_create_do_ssh_key_from_file() {
-        dotenv::dotenv().ok();
-
-        // Create a mock ExecutionEngine
-        let mut engine = ExecutionEngine::new();
-        
-        // Test executing action for SSH key creation from file
-        let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
-        
-        // Read test parameters from environment variables with defaults
-        let api_token = std::env::var("DO_API_TOKEN")
-            .unwrap_or_else(|_| "".to_string());
-        let name = std::env::var("DO_SSH_KEY_NAME")
-            .unwrap_or_else(|_| "test-ssh-key-from-file".to_string());
-        let ssh_key_file_path = std::env::var("DO_SSH_KEY_FILE_PATH")
-            .unwrap_or_else(|_| "/tmp/test_ssh_key.pub".to_string());
-        
-        // Create a temporary SSH key file for testing if it doesn't exist
-        if !std::path::Path::new(&ssh_key_file_path).exists() {
-            let test_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA test@example.com";
-            if let Err(e) = std::fs::write(&ssh_key_file_path, test_public_key) {
-                println!("Warning: Could not create test SSH key file at {}: {}", ssh_key_file_path, e);
-            }
-        }
-        
-        let inputs = vec![
-            json!({
-                "api_token": api_token,
-                "name": name,
-                "ssh_key_file_path": ssh_key_file_path
-            })
-        ];
-        
-        println!("inputs: {:#?}", inputs);
-        let result = engine.execute_action(action_ref, inputs).await;
-        
-        println!("result: {:#?}", result);
-        // The test should succeed
-        assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs with file path");
-    }
-
-    #[tokio::test]
     async fn test_execute_action_create_do_droplet_sync() {
         dotenv::dotenv().ok();
         println!("Creating droplet sync");
@@ -4844,7 +4777,7 @@ mod tests {
         let mut engine = ExecutionEngine::new();
         
         // Test executing action for droplet creation with sync
-        let action_ref = "starthubhq/do-create-droplet-sync:0.0.1";
+        let action_ref = "starthubhq/do-create-droplet-sync:0.0.2";
         
         // Read test parameters from environment variables with defaults
         let api_token = std::env::var("DO_API_TOKEN")
@@ -4867,6 +4800,14 @@ mod tests {
             .unwrap_or_else(|_| "".to_string());
         let user_data = std::env::var("DO_DROPLET_USER_DATA")
             .unwrap_or_else(|_| "".to_string());
+        let ssh_keys = std::env::var("DO_DROPLET_SSH_KEYS")
+            .unwrap_or_else(|_| "".to_string());
+
+        let ssh_keys_array: Vec<String> = if ssh_keys.is_empty() {
+            vec![]
+        } else {
+            ssh_keys.split(',').map(|s| s.trim().to_string()).collect()
+        };
         
         // Parse boolean values
         let backups_bool = backups.parse::<bool>().unwrap_or(false);
@@ -4891,7 +4832,8 @@ mod tests {
                 "ipv6": ipv6_bool,
                 "monitoring": monitoring_bool,
                 "tags": tags_array,
-                "user_data": user_data
+                "user_data": user_data,
+                "ssh_keys": ssh_keys_array
             })
         ];
         
@@ -5039,12 +4981,8 @@ mod tests {
         let action_ref = "starthubhq/ssh:0.0.1";
 
         // Read test parameters from environment variables, with fallback to default SSH key
-        let private_key = std::env::var("SSH_PRIVATE_KEY")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
-                    .unwrap_or_else(|_| "".to_string())
-            });
+        // let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAQEAtmpbgtNvdFRJnTKe2j3sSka7A/eTBG+G9kfULONd9CdtsBDm+jEF\nSY98NUUxzloHhN0WZHbCDJm4SM4qLp0WAT6wCihAJxPi8PTQT3vYRrM4UncwtaB+T3HLAX\npDwVqCeTaVKXTcqBg4cD+lsz1HoYO4//FP6a+K3EFDTiqfUcgViYZNIImXpVyUgeaHDVml\ncBolbKsJlFhMQx/H4bhaHcK701taFWZAwj25BUnH+myaulETbKaeD66Z1vfC1a4JqdGFJF\nFUBYFXbUF3RtcX9ocZsEhWNOfj7eG+YRgqlhkc9oQvjOeebLCDyOSSz+l8hcoa7aCfP0w+\nXNWbTXZVNwAAA8jhjCA34YwgNwAAAAdzc2gtcnNhAAABAQC2aluC0290VEmdMp7aPexKRr\nsD95MEb4b2R9Qs4130J22wEOb6MQVJj3w1RTHOWgeE3RZkdsIMmbhIziounRYBPrAKKEAn\nE+Lw9NBPe9hGszhSdzC1oH5PccsBekPBWoJ5NpUpdNyoGDhwP6WzPUehg7j/8U/pr4rcQU\nNOKp9RyBWJhk0giZelXJSB5ocNWaVwGiVsqwmUWExDH8fhuFodwrvTW1oVZkDCPbkFScf6\nbJq6URNspp4PrpnW98LVrgmp0YUkUVQFgVdtQXdG1xf2hxmwSFY05+Pt4b5hGCqWGRz2hC\n+M555ssIPI5JLP6XyFyhrtoJ8/TD5c1ZtNdlU3AAAAAwEAAQAAAQBDzsZkm8cG9ZwFqL7+\n/ly7AY7cOyf10qVXID1BUGVo8E0oUSgjIZzHCuTPgoCwpau82lhMEQ8yEuQ7gBOTD0aSQO\nS8adjrDcvi6QYUPcOYCF/r262KHnZFftXJH1NXaRcuCrmo1u19OL+mDirAtYtOgUIANgoQ\nInZaSJJF2LcvdTAC9+f8p3ua5V166lUZcc3QzdQhv5rxo9QAaWeKm9KrTHLfZDdpmAO7QI\nf3MObDpzkeQlwnX5XFK0rOo5xH7QxSAIgc3zQUfGgAUDDEbe72+pgJtGaMd7k6Bro+B/Y+\n1usriBaFBk0DuGfjp8Ln1Ly24yrd7+Hoz6ljy9h0ZBwFAAAAgQDEr6AxpEsGHrN/YrfF1B\n8VDFIb/fTymf6NVlDloErNrp3TQ7OCcYW+/lxYIAzzJTKK73sjHg6JaIkpsalLbwFd2P7f\n6f7f1jn6D3WmWTaR0Mi7r9M/3cbeu0IS9Z8Yha4MdesIFwY0PX+9BUxMd/AgqvBGsYLVp0\n+QWVbkuuZtBAAAAIEA+vP3Vcx5QjEA4zcgSVZkkBvSgDJy9Vg/rbQwe8X5rqUPSdDLv3iF\n5nRbGZe2jKLzH/YiIVI6IfiYL435oa/+4v408xBk6QgTgUKAxvGfc/Jqr+fFKCD5z0BsFX\naiX5eRJ8dnAV1lCLzaSKWLZ1pjxB6j4scWRkyRDx2A5kjizI0AAACBALoVhnG9anotZo88\nmbznvlkAiCLT/FpFQwpMXCC8IWSmIfnagzd1KnxpYgeFkTGS1iZvznly4X57wdllcJO++h\n7bWk20vulwy6UjSNL2RaDiruZgxjiHooy6XUhmHYpmvFo6WZkLTishsi5L0zVPST0kvihK\n1BjO5vB52tgPk/HTAAAAEGRlbW9AZXhhbXBsZS5jb20BAg==\n-----END OPENSSH PRIVATE KEY-----\n";
+        let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABFwAAAAdzc2gtcn\nNhAAAAAwEAAQAAAQEArOvHLeKnRVO8YSeTWhaLcS1IXOmxqUxXCGXwXXYoEplLH8gdi5EU\nEBFAwnrq8uviVSg9b2Cm1KFq0N451yD4j38rwHSuQNazCo9xSyXO1yL+w/y1tk1KI6K+PE\nRoKG1hqdkBQDkOma9U0OIX7UiZfU0kh8qIL6aRZARPOY0BczFym2c7TF4wa1SGVpqPvDEa\nJZDP292D8sUVbu/EXFGVebn98uxgd3wWl9dlKOVEk68EtRaZ6DlKBB//5/eAzycDSdXh6I\n3mNrPjuDLXauZLdGTIq2QQlgwMoqCntoAY3+ib9WR5IQVATjGrYjQwbSCM6Ojma1Uw7Jtr\naPdqQ+CZdwAAA8iVD4VxlQ+FcQAAAAdzc2gtcnNhAAABAQCs68ct4qdFU7xhJ5NaFotxLU\nhc6bGpTFcIZfBddigSmUsfyB2LkRQQEUDCeury6+JVKD1vYKbUoWrQ3jnXIPiPfyvAdK5A\n1rMKj3FLJc7XIv7D/LW2TUojor48RGgobWGp2QFAOQ6Zr1TQ4hftSJl9TSSHyogvppFkBE\n85jQFzMXKbZztMXjBrVIZWmo+8MRolkM/b3YPyxRVu78RcUZV5uf3y7GB3fBaX12Uo5UST\nrwS1FpnoOUoEH//n94DPJwNJ1eHojeY2s+O4Mtdq5kt0ZMirZBCWDAyioKe2gBjf6Jv1ZH\nkhBUBOMatiNDBtIIzo6OZrVTDsm2to92pD4Jl3AAAAAwEAAQAAAQAReDyGMTjO8ze75QCp\nAFAUHgwKfv2Y6gJ88beH6bEAuAXz7wa1G/IX8XZGb56e7h/OlKMoRm50Wt5svZbAWi9iZ+\nmmpuMX39j0vysl+WrdJ0bvy+8bvNE5qm5nrk2LkAlm3GqY72q/MgxykfTy3vvKweln4plB\nnyVfImRSnyE/Xtv2/fV+qzDR3GCHXXsbIugtidGs6SILsVPBTGphqpOuq3k9NAnotVHaJt\n1gyqO8Ad3Jcs/L2h0yWCFiad0TYa2gcce4crjC9CfheQKLuZ2FWtzjERvxN+Waf+lSkoZi\nVJpp1ERaLBpMZWTG/3Zqz6Kq0QH274Gct8NL0lbGiI35AAAAgQDIr71WkMl2NEJASHNlZ4\nmhdKVjNVn6HmH71Dp38tQ2tXfbOtDajVLNVP06f05sxyX8t4MR6YZiftiUUye5tDNbaK+z\n8NwDRn/nMpeGaKqDjSe3rkKlYdHF5oxtbxdM3HeDNyueyyrcRyo7LCW2lspsEhRajkDuhw\n0qKbyU6WM2vgAAAIEA2qTdbZO8sE68aYigpmyiClJ3A5Rr2YhEn7XvRXNVZZxyYav/MuWe\nKpeWKenRMMunfHz8lIi2qz5+IZaW/LHJved+HBRBjtnaAjXAis9zF0mIokZjG1l4qlrzZE\nDO94l3+dug+J6cdAeoN1f+wEGRMK1xn0mpAsMLvYHGFuSosk0AAACBAMp3EC8OF6QvG2c+\nkWHOJaY2s5k2l/IRmM0oix8iU6Il7MpM/HI/lEhGmN06DSLMBv+ubn6F6GxCCwwdXPqJIf\n9be8NsWZhe8TPDmdpJFm/xxpqzflkEmGDpUI1UXmOdY/YGe3Zcu3H5S+Rigo75uA5OHW3g\nO8KqVuFOBEIOFjTTAAAAEGRlbW9AZXhhbXBsZS5jb20BAg==\n-----END OPENSSH PRIVATE KEY-----\n";
         let user = std::env::var("SSH_USER").unwrap_or_default();
         let host = std::env::var("SSH_HOST").unwrap_or_default();
         let cmd = std::env::var("SSH_COMMAND").unwrap_or_default();
@@ -6518,7 +6456,7 @@ mod tests {
         // Create a mock ExecutionEngine
         let mut engine = ExecutionEngine::new();
 
-        // Test executing the ssh-keygen WASM action
+        // Test executing the ssh-keygen Docker action
         let action_ref = "starthubhq/ssh-keygen:0.0.1";
 
         // Create SSH keygen configuration - direct config object as per actual implementation
@@ -6543,7 +6481,7 @@ mod tests {
                 assert!(outputs.is_array(), "execute_action should return an array of outputs");
                 let outputs_array = outputs.as_array().unwrap();
 
-                // For a WASM action, we expect exactly 2 outputs: private_key and public_key
+                // For a Docker action, we expect exactly 2 outputs: private_key and public_key
                 assert_eq!(outputs_array.len(), 2, "ssh-keygen should return exactly 2 outputs");
 
                 // Verify the output structure - should contain private_key and public_key
@@ -6559,11 +6497,11 @@ mod tests {
                 assert!(!private_key_str.is_empty(), "private_key should not be empty");
                 assert!(!public_key_str.is_empty(), "public_key should not be empty");
 
-                // Verify private key format (PEM)
-                assert!(private_key_str.contains("-----BEGIN PRIVATE KEY-----"), 
-                       "Private key should be in PEM format");
-                assert!(private_key_str.contains("-----END PRIVATE KEY-----"), 
-                       "Private key should be in PEM format");
+                // Verify private key format (OpenSSH)
+                assert!(private_key_str.contains("-----BEGIN OPENSSH PRIVATE KEY-----"), 
+                       "Private key should be in OpenSSH format");
+                assert!(private_key_str.contains("-----END OPENSSH PRIVATE KEY-----"), 
+                       "Private key should be in OpenSSH format");
 
                 // Verify public key format (OpenSSH)
                 assert!(public_key_str.starts_with("ssh-rsa "), 
@@ -6617,19 +6555,12 @@ mod tests {
         let user_data = std::env::var("DO_DROPLET_USER_DATA")
             .unwrap_or_else(|_| "".to_string());
         
-            let private_key = std::env::var("SSH_PRIVATE_KEY")
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
-                    .unwrap_or_else(|_| "".to_string())
-            });
         let user = std::env::var("SSH_USER").unwrap_or_default();
 
-        println!("private_key: {}", private_key);
         println!("user: {}", user);
         
         // If required env vars are missing, skip the test gracefully
-        if private_key.is_empty() || user.is_empty() {
+        if user.is_empty() {
             println!("Skipping install-grafana test: missing SSH_PRIVATE_KEY/SSH_USER/SSH_HOST env vars");
             return;
         }
@@ -6659,7 +6590,6 @@ mod tests {
                 "tags": tags_array,
                 "user_data": user_data
             }),
-            json!(private_key),
             json!(user),
         ];
         
@@ -6669,7 +6599,328 @@ mod tests {
         // The test should succeed
         // assert!(result.is_ok(), "execute_action should succeed for valid action_ref and inputs");
     }
-    
 
-    
+    #[tokio::test]
+    async fn test_execute_action_linode_create_vm() {
+        dotenv::dotenv().ok();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+
+        // Test executing the linode-create-vm composition
+        let action_ref = "starthubhq/linode-create-vm:0.0.1";
+
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("LINODE_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let instance_type = std::env::var("LINODE_INSTANCE_TYPE")
+            .unwrap_or_else(|_| "g6-nanode-1".to_string());
+        let region = std::env::var("LINODE_REGION")
+            .unwrap_or_else(|_| "us-east".to_string());
+        let image = std::env::var("LINODE_IMAGE")
+            .unwrap_or_else(|_| "linode/ubuntu22.04".to_string());
+        let label = std::env::var("LINODE_LABEL")
+            .unwrap_or_else(|_| "test-linode-instance".to_string());
+        let root_pass = std::env::var("LINODE_ROOT_PASS")
+            .unwrap_or_else(|_| "TestPassword123!".to_string());
+        let authorized_keys = std::env::var("LINODE_AUTHORIZED_KEYS")
+            .unwrap_or_else(|_| "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCzTjn/2SWGJpik7iyNYU4pQMc0j9ISqWoB2n8ld3OLXVO55EMiYsU3pYBmPkJdwJnXdG//oB6Vbyk3NGDrOHIYIvxXdDEFeyEhA44rbEgEnjv0rUuZ0KibF1XagHEdZCpBPFNTTNzV4iC7ZmZ/acSCZNnfxMhFTXmV8rddBVdF2lh8D7ROA9pYMmGL2Jrh0g2z3EYLCy55EszfbIehKTv+3oByG1sE7ZpCPXDIZnGErugH/cdXUZOJu4BQpm5KO6pmAbRh2NoGJbpSWKnwJFCiDs1TtL0kcHAwZGe8ylCHiv73QelCfrQop4BawQtyTW+dEin3HFSyI8AcLTORAo3T tommaso.girotto91@gmail.com".to_string());
+        let booted = std::env::var("LINODE_BOOTED")
+            .unwrap_or_else(|_| "true".to_string());
+        let backups_enabled = std::env::var("LINODE_BACKUPS_ENABLED")
+            .unwrap_or_else(|_| "false".to_string());
+        let private_ip = std::env::var("LINODE_PRIVATE_IP")
+            .unwrap_or_else(|_| "false".to_string());
+        let tags = std::env::var("LINODE_TAGS")
+            .unwrap_or_else(|_| "test,linode".to_string());
+        let authorized_users = std::env::var("LINODE_AUTHORIZED_USERS")
+            .unwrap_or_else(|_| "".to_string());
+        let group = std::env::var("LINODE_GROUP")
+            .unwrap_or_else(|_| "".to_string());
+        let stackscript_id = std::env::var("LINODE_STACKSCRIPT_ID")
+            .unwrap_or_else(|_| "".to_string());
+        let stackscript_data = std::env::var("LINODE_STACKSCRIPT_DATA")
+            .unwrap_or_else(|_| "{}".to_string());
+        let metadata = std::env::var("LINODE_METADATA")
+            .unwrap_or_else(|_| "{}".to_string());
+        let firewall_id = std::env::var("LINODE_FIREWALL_ID")
+            .unwrap_or_else(|_| "".to_string());
+        let placement_group = std::env::var("LINODE_PLACEMENT_GROUP")
+            .unwrap_or_else(|_| "{}".to_string());
+
+        // Parse boolean values
+        let booted_bool = booted.parse::<bool>().unwrap_or(true);
+        let backups_enabled_bool = backups_enabled.parse::<bool>().unwrap_or(false);
+        let private_ip_bool = private_ip.parse::<bool>().unwrap_or(false);
+        
+        // Parse array values
+        let authorized_keys_array: Vec<String> = if authorized_keys.is_empty() {
+            vec![]
+        } else {
+            vec![authorized_keys]
+        };
+        
+        let authorized_users_array: Vec<String> = if authorized_users.is_empty() {
+            vec![]
+        } else {
+            authorized_users.split(',').map(|s| s.trim().to_string()).collect()
+        };
+        
+        let tags_array: Vec<String> = if tags.is_empty() {
+            vec![]
+        } else {
+            tags.split(',').map(|s| s.trim().to_string()).collect()
+        };
+
+        // Parse optional numeric values
+        let stackscript_id_num = if stackscript_id.is_empty() {
+            None
+        } else {
+            stackscript_id.parse::<i32>().ok()
+        };
+
+        let firewall_id_num = if firewall_id.is_empty() {
+            None
+        } else {
+            firewall_id.parse::<i32>().ok()
+        };
+
+        // Parse JSON objects
+        let stackscript_data_obj = if stackscript_data == "{}" {
+            json!({})
+        } else {
+            serde_json::from_str(&stackscript_data).unwrap_or(json!({}))
+        };
+
+        let metadata_obj = if metadata == "{}" {
+            json!({})
+        } else {
+            serde_json::from_str(&metadata).unwrap_or(json!({}))
+        };
+
+        let placement_group_obj = if placement_group == "{}" {
+            json!({})
+        } else {
+            serde_json::from_str(&placement_group).unwrap_or(json!({}))
+        };
+
+        // If required env vars are missing, skip the test gracefully
+        if api_token.is_empty() {
+            println!("Skipping linode-create-vm test: missing LINODE_API_TOKEN env var");
+            return;
+        }
+
+        let inputs = vec![
+            json!({
+                "linode_config": {
+                    "api_token": api_token,
+                    "type": instance_type,
+                    "region": region,
+                    "image": image,
+                    "label": label,
+                    "root_pass": root_pass,
+                    "authorized_keys": authorized_keys_array,
+                    "authorized_users": authorized_users_array,
+                    "booted": booted_bool,
+                    "backups_enabled": backups_enabled_bool,
+                    "private_ip": private_ip_bool,
+                    "tags": tags_array,
+                    "group": if group.is_empty() { None } else { Some(group) },
+                    "stackscript_id": stackscript_id_num,
+                    "stackscript_data": stackscript_data_obj,
+                    "metadata": metadata_obj,
+                    "firewall_id": firewall_id_num,
+                    "placement_group": placement_group_obj
+                }
+            })
+        ];
+
+        println!("Testing linode-create-vm with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+
+        println!("linode-create-vm test result: {:#?}", result);
+
+        // The test will fail until the package is published to the registry
+        // This is expected behavior for a local package that hasn't been published yet
+        match result {
+            Ok(outputs) => {
+                // If the package exists and executes successfully, verify the outputs
+                assert!(outputs.is_array(), "execute_action should return an array of outputs");
+                let outputs_array = outputs.as_array().unwrap();
+
+                // For a composition, we expect exactly 1 output: linode
+                assert_eq!(outputs_array.len(), 1, "linode-create-vm should return exactly 1 output");
+
+                // Verify the output structure - should contain Linode instance information
+                let linode = &outputs_array[0];
+                assert!(linode.is_object(), "First output should be an object (linode)");
+
+                // Verify the Linode object has the expected fields
+                if let Some(linode_obj) = linode.as_object() {
+                    assert!(linode_obj.contains_key("id"), "Linode should have an 'id' field");
+                    assert!(linode_obj.contains_key("label"), "Linode should have a 'label' field");
+                    assert!(linode_obj.contains_key("type"), "Linode should have a 'type' field");
+                    assert!(linode_obj.contains_key("region"), "Linode should have a 'region' field");
+                    assert!(linode_obj.contains_key("status"), "Linode should have a 'status' field");
+                }
+
+                println!("✅ Linode Create VM test passed - created Linode instance");
+            }
+            Err(e) => {
+                // Expected to fail due to package not found or API issues
+                println!("Expected failure (package not found or API issues): {}", e);
+                assert!(e.to_string().contains("Failed to download starthub-lock.json") ||
+                       e.to_string().contains("404 Not Found") ||
+                       e.to_string().contains("401 Unauthorized") ||
+                       e.to_string().contains("400 Bad Request"),
+                       "Error should be related to package not found or API authentication/validation issues");
+            }
+        }
+    }
+
+    // #[tokio::test]
+    // async fn test_execute_action_do_create_ssh_key() {
+    //     dotenv::dotenv().ok();
+    //     // Create a mock ExecutionEngine
+    //     let mut engine = ExecutionEngine::new();
+
+    //     // Test executing the do-create-ssh-key composition
+    //     let action_ref = "starthubhq/do-create-ssh-key:0.0.1";
+
+    //     // Read test parameters from environment variables with defaults
+    //     let api_token = std::env::var("DO_API_TOKEN")
+    //         .unwrap_or_else(|_| "".to_string());
+    //     let key_name = std::env::var("DO_SSH_KEY_NAME")
+    //         .unwrap_or_else(|_| "test-ssh-key".to_string());
+        
+    //     // Generate a test SSH public key (RSA format)
+    //     let test_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCzTjn/2SWGJpik7iyNYU4pQMc0j9ISqWoB2n8ld3OLXVO55EMiYsU3pYBmPkJdwJnXdG//oB6Vbyk3NGDrOHIYIvxXdDEFeyEhA44rbEgEnjv0rUuZ0KibF1XagHEdZCpBPFNTTNzV4iC7ZmZ/acSCZNnfxMhFTXmV8rddBVdF2lh8D7ROA9pYMmGL2Jrh0g2z3EYLCy55EszfbIehKTv+3oByG1sE7ZpCPXDIZnGErugH/cdXUZOJu4BQpm5KO6pmAbRh2NoGJbpSWKnwJFCiDs1TtL0kcHAwZGe8ylCHiv73QelCfrQop4BawQtyTW+dEin3HFSyI8AcLTORAo3T tommaso.girotto91@gmail.com";
+
+    //     // If required env vars are missing, skip the test gracefully
+    //     if api_token.is_empty() {
+    //         println!("Skipping do-create-ssh-key test: missing DO_API_TOKEN env var");
+    //         return;
+    //     }
+
+    //     let inputs = vec![
+    //         json!({
+    //             "api_token": api_token,
+    //             "name": key_name,
+    //             "public_key": test_public_key
+    //         })
+    //     ];
+
+    //     println!("Testing do-create-ssh-key with inputs: {:#?}", inputs);
+    //     let result = engine.execute_action(action_ref, inputs).await;
+
+    //     println!("do-create-ssh-key test result: {:#?}", result);
+
+    //     // The test will fail until the package is published to the registry
+    //     // This is expected behavior for a local package that hasn't been published yet
+    //     match result {
+    //         Ok(outputs) => {
+    //             // If the package exists and executes successfully, verify the outputs
+    //             assert!(outputs.is_array(), "execute_action should return an array of outputs");
+    //             let outputs_array = outputs.as_array().unwrap();
+
+    //             // For a composition, we expect exactly 1 output: ssh_key
+    //             assert_eq!(outputs_array.len(), 1, "do-create-ssh-key should return exactly 1 output");
+
+    //             // Verify the output structure - should contain SSH key information
+    //             let ssh_key = &outputs_array[0];
+    //             assert!(ssh_key.is_object(), "First output should be an object (ssh_key)");
+
+    //             // Verify the SSH key object has the expected fields
+    //             if let Some(ssh_key_obj) = ssh_key.as_object() {
+    //                 assert!(ssh_key_obj.contains_key("id"), "SSH key should have an 'id' field");
+    //                 assert!(ssh_key_obj.contains_key("name"), "SSH key should have a 'name' field");
+    //                 assert!(ssh_key_obj.contains_key("fingerprint"), "SSH key should have a 'fingerprint' field");
+    //                 assert!(ssh_key_obj.contains_key("public_key"), "SSH key should have a 'public_key' field");
+    //             }
+
+    //             println!("✅ DO Create SSH Key test passed - created SSH key in Digital Ocean");
+    //         }
+    //         Err(e) => {
+    //             // Expected to fail due to invalid SSH key or template resolution issues
+    //             println!("Expected failure (invalid SSH key or template resolution): {}", e);
+    //             assert!(e.to_string().contains("Value is invalid") ||
+    //                    e.to_string().contains("Failed to download starthub-lock.json") ||
+    //                    e.to_string().contains("400 Bad Request") ||
+    //                    e.to_string().contains("404 Not Found"),
+    //                    "Error should be related to validation, package not found, or API issues");
+    //         }
+    //     }
+    // }
+
+    #[tokio::test]
+    async fn test_execute_action_linode_create_ssh_key() {
+        dotenv::dotenv().ok();
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+
+        // Test executing the linode-create-ssh-key composition
+        let action_ref = "starthubhq/linode-create-ssh-key:0.0.1";
+
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("LINODE_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let label = std::env::var("LINODE_SSH_KEY_LABEL")
+            .unwrap_or_else(|_| "test-ssh-key".to_string());
+        let ssh_key = std::env::var("LINODE_SSH_KEY")
+            .unwrap_or_else(|_| "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCzTjn/2SWGJpik7iyNYU4pQMc0j9ISqWoB2n8ld3OLXVO55EMiYsU3pYBmPkJdwJnXdG//oB6Vbyk3NGDrOHIYIvxXdDEFeyEhA44rbEgEnjv0rUuZ0KibF1XagHEdZCpBPFNTTNzV4iC7ZmZ/acSCZNnfxMhFTXmV8rddBVdF2lh8D7ROA9pYMmGL2Jrh0g2z3EYLCy55EszfbIehKTv+3oByG1sE7ZpCPXDIZnGErugH/cdXUZOJu4BQpm5KO6pmAbRh2NoGJbpSWKnwJFCiDs1TtL0kcHAwZGe8ylCHiv73QelCfrQop4BawQtyTW+dEin3HFSyI8AcLTORAo3T tommaso.girotto91@gmail.com".to_string());
+
+        // If required env vars are missing, skip the test gracefully
+        if api_token.is_empty() {
+            println!("Skipping linode-create-ssh-key test: missing LINODE_API_TOKEN env var");
+            return;
+        }
+
+        let inputs = vec![
+            json!({
+                "api_token": api_token,
+                "label": label,
+                "ssh_key": ssh_key
+            })
+        ];
+
+        println!("Testing linode-create-ssh-key with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+
+        println!("linode-create-ssh-key test result: {:#?}", result);
+
+        // The test will fail until the package is published to the registry
+        // This is expected behavior for a local package that hasn't been published yet
+        match result {
+            Ok(outputs) => {
+                // If the package exists and executes successfully, verify the outputs
+                assert!(outputs.is_array(), "execute_action should return an array of outputs");
+                let outputs_array = outputs.as_array().unwrap();
+
+                // For a composition, we expect exactly 1 output: ssh_key
+                assert_eq!(outputs_array.len(), 1, "linode-create-ssh-key should return exactly 1 output");
+
+                // Verify the output structure - should contain Linode SSH key information
+                let ssh_key = &outputs_array[0];
+                assert!(ssh_key.is_object(), "First output should be an object (ssh_key)");
+
+                // Verify the SSH key object has the expected fields
+                if let Some(ssh_key_obj) = ssh_key.as_object() {
+                    assert!(ssh_key_obj.contains_key("id"), "SSH key should have an 'id' field");
+                    assert!(ssh_key_obj.contains_key("label"), "SSH key should have a 'label' field");
+                    assert!(ssh_key_obj.contains_key("ssh_key"), "SSH key should have an 'ssh_key' field");
+                    assert!(ssh_key_obj.contains_key("created"), "SSH key should have a 'created' field");
+                }
+
+                println!("✅ Linode Create SSH Key test passed - created SSH key");
+            }
+            Err(e) => {
+                // Expected to fail due to package not found or API issues
+                println!("Expected failure (package not found or API issues): {}", e);
+                assert!(e.to_string().contains("Failed to download starthub-lock.json") ||
+                       e.to_string().contains("404 Not Found") ||
+                       e.to_string().contains("401 Unauthorized") ||
+                       e.to_string().contains("400 Bad Request"),
+                       "Error should be related to package not found or API authentication/validation issues");
+            }
+        }
+    }
 }

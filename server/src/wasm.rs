@@ -17,7 +17,7 @@ pub async fn run_wasm_step(
     log_info: &(dyn Fn(&str, Option<&str>) + Send + Sync),
     log_success: &(dyn Fn(&str, Option<&str>) + Send + Sync),
     log_error: &(dyn Fn(&str, Option<&str>) + Send + Sync),
-) -> Result<Vec<Value>> {
+) -> Result<String> {
     if which::which("wasmtime").is_err() {
         log_error("wasmtime not found in PATH", Some(&action.id));
         bail!("wasmtime not found in PATH");
@@ -140,14 +140,15 @@ pub async fn run_wasm_step(
     let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
 
     let pump_out = tokio::spawn(async move {
+        let mut output = String::new();
         let mut line = String::new();
         while out_reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-            // Try to parse the line directly as JSON
-            if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
-                let _ = tx.send(v);
-            }
+            output.push_str(&line);
             line.clear();
         }
+        
+        // Send the raw output as a string
+        let _ = tx.send(Value::String(output.trim().to_string()));
     });
 
     let pump_err = tokio::spawn(async move {
@@ -169,24 +170,21 @@ pub async fn run_wasm_step(
     
     log_success("WASM execution completed successfully", Some(&action.id));
 
-    // Collect the first result from the WASM module
+    // Collect the result from the WASM module
     let mut results = Vec::new();
     while let Ok(v) = rx.try_recv() { 
         results.push(v);
     }
     
-    // The WASM module outputs a single JSON array, so we take the first result
+    // Return the first result as a string
     if results.is_empty() {
-        // If no results, return an empty vector
-        Ok(Vec::new())
+        Ok(String::new())
     } else {
-        // Take the first result and parse it as an array
         let first_result = &results[0];
-        if let Some(array) = first_result.as_array() {
-            Ok(array.clone())
+        if let Some(string_val) = first_result.as_str() {
+            Ok(string_val.to_string())
         } else {
-            // If it's not an array, wrap it in a single-element array
-            Ok(vec![first_result.clone()])
+            Ok(first_result.to_string())
         }
     }
 }
