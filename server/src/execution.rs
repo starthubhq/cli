@@ -128,6 +128,7 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
+            println!("result_string: {:#?}", result_string);
             // Parse the string result as JSON directly
             let parsed_json = serde_json::from_str::<Value>(&result_string)
                 .expect("Docker/WASM actions always return valid JSON");
@@ -195,6 +196,7 @@ impl ExecutionEngine {
                 // Since the step is coming from the execution buffer, it means that
                 // it is ready to be executed.
                 // Execute the step
+                println!("executing step: {:#?}", step);
                 let executed_step = Box::pin(self.run_action_tree(step)).await?;
                 println!("current_step_id: {:#?}", current_step_id);
 
@@ -767,7 +769,9 @@ impl ExecutionEngine {
         match type_definition {
             Value::Object(obj) => {
                 // Check if this is a field definition (has type, description, required)
-                if obj.contains_key("type") {
+                // A field definition should have a "type" key and be a simple object with type/description/required
+                // A type definition with multiple fields should not be treated as a field definition
+                if obj.contains_key("type") && obj.len() <= 3 && (obj.contains_key("description") || obj.contains_key("required") || obj.len() == 1) {
                     // This is a field definition, convert it
                     let mut property = serde_json::Map::new();
                     
@@ -809,7 +813,12 @@ impl ExecutionEngine {
                     let mut required = Vec::new();
                     
                     for (field_name, field_def) in obj {
-                        if let Ok(converted_field) = self.convert_to_json_schema(field_def) {
+                        // Handle field definitions that are just string types (like "api_token": "string")
+                        if let Some(field_type) = field_def.as_str() {
+                            let mut field_schema = serde_json::Map::new();
+                            field_schema.insert("type".to_string(), Value::String(field_type.to_string()));
+                            properties_vec.push((field_name.clone(), Value::Object(field_schema)));
+                        } else if let Ok(converted_field) = self.convert_to_json_schema(field_def) {
                             properties_vec.push((field_name.clone(), converted_field));
                             
                             // Check if this field is required
@@ -6626,30 +6635,10 @@ mod tests {
             .unwrap_or_else(|_| "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCzTjn/2SWGJpik7iyNYU4pQMc0j9ISqWoB2n8ld3OLXVO55EMiYsU3pYBmPkJdwJnXdG//oB6Vbyk3NGDrOHIYIvxXdDEFeyEhA44rbEgEnjv0rUuZ0KibF1XagHEdZCpBPFNTTNzV4iC7ZmZ/acSCZNnfxMhFTXmV8rddBVdF2lh8D7ROA9pYMmGL2Jrh0g2z3EYLCy55EszfbIehKTv+3oByG1sE7ZpCPXDIZnGErugH/cdXUZOJu4BQpm5KO6pmAbRh2NoGJbpSWKnwJFCiDs1TtL0kcHAwZGe8ylCHiv73QelCfrQop4BawQtyTW+dEin3HFSyI8AcLTORAo3T tommaso.girotto91@gmail.com".to_string());
         let booted = std::env::var("LINODE_BOOTED")
             .unwrap_or_else(|_| "true".to_string());
-        let backups_enabled = std::env::var("LINODE_BACKUPS_ENABLED")
-            .unwrap_or_else(|_| "false".to_string());
         let private_ip = std::env::var("LINODE_PRIVATE_IP")
             .unwrap_or_else(|_| "false".to_string());
-        let tags = std::env::var("LINODE_TAGS")
-            .unwrap_or_else(|_| "test,linode".to_string());
-        let authorized_users = std::env::var("LINODE_AUTHORIZED_USERS")
-            .unwrap_or_else(|_| "".to_string());
-        let group = std::env::var("LINODE_GROUP")
-            .unwrap_or_else(|_| "".to_string());
-        let stackscript_id = std::env::var("LINODE_STACKSCRIPT_ID")
-            .unwrap_or_else(|_| "".to_string());
-        let stackscript_data = std::env::var("LINODE_STACKSCRIPT_DATA")
-            .unwrap_or_else(|_| "{}".to_string());
-        let metadata = std::env::var("LINODE_METADATA")
-            .unwrap_or_else(|_| "{}".to_string());
-        let firewall_id = std::env::var("LINODE_FIREWALL_ID")
-            .unwrap_or_else(|_| "".to_string());
-        let placement_group = std::env::var("LINODE_PLACEMENT_GROUP")
-            .unwrap_or_else(|_| "{}".to_string());
-
         // Parse boolean values
         let booted_bool = booted.parse::<bool>().unwrap_or(true);
-        let backups_enabled_bool = backups_enabled.parse::<bool>().unwrap_or(false);
         let private_ip_bool = private_ip.parse::<bool>().unwrap_or(false);
         
         // Parse array values
@@ -6657,50 +6646,6 @@ mod tests {
             vec![]
         } else {
             vec![authorized_keys]
-        };
-        
-        let authorized_users_array: Vec<String> = if authorized_users.is_empty() {
-            vec![]
-        } else {
-            authorized_users.split(',').map(|s| s.trim().to_string()).collect()
-        };
-        
-        let tags_array: Vec<String> = if tags.is_empty() {
-            vec![]
-        } else {
-            tags.split(',').map(|s| s.trim().to_string()).collect()
-        };
-
-        // Parse optional numeric values
-        let stackscript_id_num = if stackscript_id.is_empty() {
-            None
-        } else {
-            stackscript_id.parse::<i32>().ok()
-        };
-
-        let firewall_id_num = if firewall_id.is_empty() {
-            None
-        } else {
-            firewall_id.parse::<i32>().ok()
-        };
-
-        // Parse JSON objects
-        let stackscript_data_obj = if stackscript_data == "{}" {
-            json!({})
-        } else {
-            serde_json::from_str(&stackscript_data).unwrap_or(json!({}))
-        };
-
-        let metadata_obj = if metadata == "{}" {
-            json!({})
-        } else {
-            serde_json::from_str(&metadata).unwrap_or(json!({}))
-        };
-
-        let placement_group_obj = if placement_group == "{}" {
-            json!({})
-        } else {
-            serde_json::from_str(&placement_group).unwrap_or(json!({}))
         };
 
         // If required env vars are missing, skip the test gracefully
@@ -6711,26 +6656,17 @@ mod tests {
 
         let inputs = vec![
             json!({
-                "linode_config": {
-                    "api_token": api_token,
-                    "type": instance_type,
-                    "region": region,
-                    "image": image,
-                    "label": label,
-                    "root_pass": root_pass,
-                    "authorized_keys": authorized_keys_array,
-                    "authorized_users": authorized_users_array,
-                    "booted": booted_bool,
-                    "backups_enabled": backups_enabled_bool,
-                    "private_ip": private_ip_bool,
-                    "tags": tags_array,
-                    "group": if group.is_empty() { None } else { Some(group) },
-                    "stackscript_id": stackscript_id_num,
-                    "stackscript_data": stackscript_data_obj,
-                    "metadata": metadata_obj,
-                    "firewall_id": firewall_id_num,
-                    "placement_group": placement_group_obj
-                }
+                "api_token": api_token,
+                "authorized_keys": authorized_keys_array,
+                "image": image,
+                "disk_encryption": "enabled",
+                "booted": booted_bool,
+                "region": region,
+                "root_pass": root_pass,
+                "private_ip": private_ip_bool,
+                "type": instance_type,
+                "maintenance_policy": "linode/migrate",
+                "label": label
             })
         ];
 
