@@ -43,19 +43,40 @@ jobs:
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --workspace --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           NAME="starthub"
+          SERVER_NAME="starthub-server"
           VER="${GITHUB_REF_NAME#v}"
           TARGET="${{ matrix.target }}"
           BIN="target/${TARGET}/release/${NAME}"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          SERVER_BIN="target/${TARGET}/release/${SERVER_NAME}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then 
+            BIN="${BIN}.exe"
+            SERVER_BIN="${SERVER_BIN}.exe"
+          fi
           mkdir -p dist
-          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}-v${VER}-${TARGET}.tar.gz" "$(basename "$BIN")"
+          # Verify UI directory exists
+          if [[ ! -d "server/ui/dist" ]]; then
+            echo "❌ Error: UI directory not found at server/ui/dist"
+            exit 1
+          fi
+          # Create a temporary directory structure for packaging
+          PACKAGE_DIR=$(mktemp -d)
+          # Copy binaries to package directory
+          cp "$BIN" "$PACKAGE_DIR/"
+          cp "$SERVER_BIN" "$PACKAGE_DIR/"
+          # Copy UI directory to package directory as ui/dist
+          mkdir -p "$PACKAGE_DIR/ui"
+          cp -r server/ui/dist "$PACKAGE_DIR/ui/"
+          # Create tarball from package directory
+          tar -C "$PACKAGE_DIR" -czf "dist/${NAME}-v${VER}-${TARGET}.tar.gz" .
+          # Cleanup
+          rm -rf "$PACKAGE_DIR"
 
       - name: Upload assets
         uses: softprops/action-gh-release@v2
