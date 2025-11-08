@@ -43,19 +43,27 @@ jobs:
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --workspace --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
           NAME="starthub"
+          SERVER_NAME="starthub-server"
           VER="${GITHUB_REF_NAME#v}"
           TARGET="${{ matrix.target }}"
           BIN="target/${TARGET}/release/${NAME}"
-          if [[ "${{ runner.os }}" == "Windows" ]]; then BIN="${BIN}.exe"; fi
+          SERVER_BIN="target/${TARGET}/release/${SERVER_NAME}"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then 
+            BIN="${BIN}.exe"
+            SERVER_BIN="${SERVER_BIN}.exe"
+          fi
           mkdir -p dist
-          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}-v${VER}-${TARGET}.tar.gz" "$(basename "$BIN")"
+          # Package both binaries in the same tarball
+          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}-v${VER}-${TARGET}.tar.gz" \
+            "$(basename "$BIN")" \
+            "$(basename "$SERVER_BIN")"
 
       - name: Upload assets
         uses: softprops/action-gh-release@v2
