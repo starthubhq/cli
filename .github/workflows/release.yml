@@ -60,10 +60,23 @@ jobs:
             SERVER_BIN="${SERVER_BIN}.exe"
           fi
           mkdir -p dist
-          # Package both binaries in the same tarball
-          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}-v${VER}-${TARGET}.tar.gz" \
-            "$(basename "$BIN")" \
-            "$(basename "$SERVER_BIN")"
+          # Verify UI directory exists
+          if [[ ! -d "server/ui/dist" ]]; then
+            echo "❌ Error: UI directory not found at server/ui/dist"
+            exit 1
+          fi
+          # Create a temporary directory structure for packaging
+          PACKAGE_DIR=$(mktemp -d)
+          # Copy binaries to package directory
+          cp "$BIN" "$PACKAGE_DIR/"
+          cp "$SERVER_BIN" "$PACKAGE_DIR/"
+          # Copy UI directory to package directory as ui/dist
+          mkdir -p "$PACKAGE_DIR/ui"
+          cp -r server/ui/dist "$PACKAGE_DIR/ui/"
+          # Create tarball from package directory
+          tar -C "$PACKAGE_DIR" -czf "dist/${NAME}-v${VER}-${TARGET}.tar.gz" .
+          # Cleanup
+          rm -rf "$PACKAGE_DIR"
 
       - name: Upload assets
         uses: softprops/action-gh-release@v2

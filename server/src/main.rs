@@ -103,13 +103,14 @@ fn get_ui_directory() -> Result<std::path::PathBuf> {
     let binary_dir = current_exe.parent().unwrap();
     
     // Try different possible locations for the UI directory
+    // Priority: check binary directory first (for npm package installations)
     let possible_paths = vec![
+        // When running from npm package (binary and UI in same directory)
+        binary_dir.join("ui").join("dist"),
         // When running from CLI directory (cargo run)
         std::env::current_dir()?.join("ui").join("dist"),
         // When running from server directory (cargo run from server/)
         std::env::current_dir()?.join("server").join("ui").join("dist"),
-        // When running the binary directly from CLI directory
-        binary_dir.join("ui").join("dist"),
         // When running from CLI directory with ./target/release/starthub-server
         std::env::current_dir()?.join("server").join("ui").join("dist"),
         // When running from target/release (go up to CLI, then to server/ui)
