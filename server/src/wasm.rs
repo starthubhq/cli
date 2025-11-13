@@ -42,6 +42,10 @@ pub async fn run_wasm_step(
     // build stdin payload - use the pre-built parameters
     let input_json = serde_json::to_string(inputs)?;
 
+    println!("Input: {}", input_json);
+    println!("Module path: {:?}", module_path);
+    println!("Action ID: {}", action.id);
+    println!("--------------------------------");
     log_info(&format!("Running WASM file: {:?}", module_path), Some(&action.id));
     log_info(&format!("Input: {}", input_json), Some(&action.id));
     
