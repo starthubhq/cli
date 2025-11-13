@@ -25,9 +25,6 @@ pub async fn run_docker_step(
         bail!("docker not found in PATH");
     }
 
-    // Build stdin payload from provided inputs
-    let input_json = serde_json::to_string(inputs)?;
-
     // Download the Docker image artifact from registry/mirrors
     let image_path = download_docker(&action.uses, &action.mirrors, _cache_dir).await?;
     log_success(&format!("Docker image downloaded: {:?}", image_path), Some(&action.id));
@@ -42,13 +39,10 @@ pub async fn run_docker_step(
         return Err(anyhow::anyhow!("Docker image not accessible at {:?}: {}", image_path, e));
     }
 
-    // The `uses` field should contain the docker image reference (e.g., "starthub-ssh" or "org/image:tag")
-    let image_ref = &action.uses;
-    if image_ref.trim().is_empty() {
-        bail!("docker image reference (uses) is empty for step {}", action.id);
-    }
+    // Build stdin payload - use the pre-built parameters (same as WASM)
+    let input_json = serde_json::to_string(inputs)?;
 
-    log_info(&format!("Running Docker image: {}", image_ref), Some(&action.id));
+    log_info(&format!("Running Docker image: {}", &action.uses), Some(&action.id));
     log_info(&format!("Input: {}", input_json), Some(&action.id));
 
     // Load the Docker image from the downloaded tar file
@@ -67,9 +61,9 @@ pub async fn run_docker_step(
     // Extract the image name from the load output
     let load_output = String::from_utf8_lossy(&load_result.stdout);
     let image_name = if let Some(line) = load_output.lines().find(|line| line.contains("Loaded image:")) {
-        line.split("Loaded image: ").nth(1).unwrap_or(image_ref).trim()
+        line.split("Loaded image: ").nth(1).unwrap_or(&action.uses).trim()
     } else {
-        image_ref
+        &action.uses
     };
     
     log_info(&format!("Loaded Docker image: {}", image_name), Some(&action.id));

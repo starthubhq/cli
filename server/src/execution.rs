@@ -130,11 +130,11 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
-            println!("result_string: {:#?}", result_string);
             // Parse the string result as JSON directly
             let parsed_json = serde_json::from_str::<Value>(&result_string)
                 .expect("Docker/WASM actions always return valid JSON");
             
+            println!("result_string: {:#?}", parsed_json);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             
             // Log the execution result to the frontend
@@ -4561,7 +4561,7 @@ mod tests {
         let mut engine = ExecutionEngine::new();
         
         // Test executing action with the same inputs as test_build_action_tree
-        let action_ref = "starthubhq/do-create-project:0.0.1";
+        let action_ref = "tgirotto/do-create-project-tf:0.0.1";
         
         // Read test parameters from environment variables with defaults
         let api_token = std::env::var("DO_API_TOKEN")
@@ -4575,14 +4575,13 @@ mod tests {
         let environment = std::env::var("DO_PROJECT_ENVIRONMENT")
             .unwrap_or_else(|_| "".to_string());
         
+        // Inputs as array of values in order: api_token, name, description, purpose, environment
         let inputs = vec![
-            json!({
-                "api_token": api_token,
-                "name": name,
-                "description": description,
-                "purpose": purpose,
-                "environment": environment
-            })
+            json!(api_token),
+            json!(name),
+            json!(description),
+            json!(purpose),
+            json!(environment)
         ];
         
         println!("inputs: {:#?}", inputs);
