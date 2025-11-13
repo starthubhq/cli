@@ -749,7 +749,8 @@ async fn find_starthub_server_processes() -> Result<Vec<(u32, String)>> {
                 if parts.len() >= 2 {
                     let pid_str = parts[1].trim_matches('"');
                     if let Ok(pid) = pid_str.parse::<u32>() {
-                        let cmd = parts.iter().skip(1).collect::<Vec<_>>().join(" ");
+                        let cmd_parts: Vec<&str> = parts.iter().skip(1).cloned().collect();
+                        let cmd = cmd_parts.join(" ");
                         processes.push((pid, cmd));
                     }
                 }
