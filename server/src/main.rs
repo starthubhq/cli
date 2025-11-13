@@ -180,20 +180,12 @@ async fn handle_run(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
     
-    // Parse inputs as JSON objects instead of strings
+    // Extract inputs array - values are already properly typed JSON values from the frontend
     let inputs = payload.get("inputs")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|item| {
-                    // If the item is a string, try to parse it as JSON
-                    if let Some(json_str) = item.as_str() {
-                        serde_json::from_str::<Value>(json_str).ok()
-                    } else {
-                        // If it's already a JSON object, use it directly
-                        Some(item.clone())
-                    }
-                })
+                .map(|item| item.clone())  // Use values directly, they're already properly typed
                 .collect::<Vec<Value>>()
         })
         .unwrap_or_default();

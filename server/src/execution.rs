@@ -98,6 +98,8 @@ impl ExecutionEngine {
 
     async fn run_action_tree(&mut self, action: &ShAction) -> Result<ShAction> {
         // Base condition.
+        
+        self.logger.log_info(&format!("Running action: {:#?}", action), None);
         if action.kind == "wasm" || action.kind == "docker" {
             self.logger.log_info(&format!("Executing {} wasm step: {}", action.kind, action.name), Some(&action.id));
 
@@ -375,7 +377,16 @@ impl ExecutionEngine {
                         _ => return Err(anyhow::anyhow!("Cannot convert {:?} to boolean", value)),
                     }
                 },
-                "object" => value.clone(),
+                "object" => {
+                    // If value is a string, try to parse it as JSON (for cases where frontend sends JSON strings)
+                    match value {
+                        Value::String(s) => {
+                            // Try to parse the string as JSON
+                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| value.clone())
+                        },
+                        _ => value.clone(),
+                    }
+                },
                 _ => value.clone(),
             };
             
