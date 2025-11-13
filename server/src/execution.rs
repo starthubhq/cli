@@ -137,6 +137,14 @@ impl ExecutionEngine {
             
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             
+            // Log the execution result to the frontend
+            let result_json = serde_json::to_string_pretty(&parsed_json)
+                .unwrap_or_else(|_| result_string.clone());
+            self.logger.log_info(
+                &format!("Execution result:\n{}", result_json),
+                Some(&action.id)
+            );
+            
             // Process the result - Docker/WASM actions always return JSON arrays of strings
             let json_objects: Vec<Value> = parsed_json.as_array().unwrap().iter().map(|item| {
                 Self::parse(item.clone())
@@ -148,6 +156,24 @@ impl ExecutionEngine {
                 &json_objects,
                 &action.types
             )?;
+
+            // Log the processed outputs to the frontend
+            let outputs_json: Vec<Value> = typed_updated_outputs.iter()
+                .map(|io| {
+                    let mut output_obj = serde_json::Map::new();
+                    output_obj.insert("name".to_string(), Value::String(io.name.clone()));
+                    output_obj.insert("type".to_string(), Value::String(io.r#type.clone()));
+                    output_obj.insert("value".to_string(), io.value.clone().unwrap_or(Value::Null));
+                    Value::Object(output_obj)
+                })
+                .collect();
+            
+            if let Ok(outputs_str) = serde_json::to_string_pretty(&outputs_json) {
+                self.logger.log_info(
+                    &format!("Processed outputs:\n{}", outputs_str),
+                    Some(&action.id)
+                );
+            }
 
             // Create a new action with the updated outputs.
             let updated_action = ShAction {
