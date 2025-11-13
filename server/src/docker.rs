@@ -98,6 +98,11 @@ pub async fn run_docker_step(
         let mut output = String::new();
         let mut line = String::new();
         while out_reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                // Print Docker stdout to server stderr (which goes to log file)
+                eprintln!("[Docker stdout] {}", trimmed);
+            }
             output.push_str(&line);
             line.clear();
         }
@@ -108,7 +113,11 @@ pub async fn run_docker_step(
     let pump_err = tokio::spawn(async move {
         let mut line = String::new();
         while err_reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-            // Consume stderr for now; logs may be verbose
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                // Print Docker stderr to server stderr (which goes to log file)
+                eprintln!("[Docker stderr] {}", trimmed);
+            }
             line.clear();
         }
     });

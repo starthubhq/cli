@@ -118,6 +118,7 @@ impl ExecutionEngine {
                     &|msg, id| self.logger.log_error(msg, id),
                 ).await?
             } else if action.kind == "docker" {
+                println!("input_values_to_serialise: {:#?}", input_values_to_serialise);
                 docker::run_docker_step(
                     action,
                     &serde_json::to_value(&input_values_to_serialise)?,

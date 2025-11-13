@@ -174,6 +174,7 @@ async fn handle_run(
     axum::extract::State(state): axum::extract::State<AppState>,
     Json(payload): Json<Value>
 ) -> Json<Value> {
+    println!("payload: {:#?}", payload);
     // Handle the /api/run endpoint that InputsComponent expects
     // Extract action and inputs from payload
     let action = payload.get("action")
