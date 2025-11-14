@@ -65,7 +65,9 @@ enum Commands {
     },
     /// Logout from Starthub backend
     Logout,
-    Auth
+    Auth,
+    /// Clear the cache
+    Reset,
 }
 
 #[tokio::main]
@@ -91,6 +93,7 @@ async fn main() -> Result<()> {
         Commands::Login { api_base } => commands::cmd_login_starthub(api_base).await?,
         Commands::Logout => commands::cmd_logout_starthub().await?,
         Commands::Auth => commands::cmd_auth_status().await?,
+        Commands::Reset => commands::cmd_reset().await?,
     }
     Ok(())
 }

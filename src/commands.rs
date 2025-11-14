@@ -7,6 +7,7 @@ use tokio::time::{sleep, Duration};
 use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use webbrowser;
 use reqwest;
+use dirs;
 
 use crate::models::{ShManifest, ShKind, ShPort, ShType};
 use crate::templates;
@@ -269,6 +270,25 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
             } else {
         println!("❌ Not authenticated (no token found)");
         println!("💡 Run 'starthub login' to authenticate");
+    }
+    
+    Ok(())
+}
+
+pub async fn cmd_reset() -> anyhow::Result<()> {
+    println!("🧹 Clearing cache...");
+    
+    // Get cache directory (same as used in execution.rs)
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("starthub/oci");
+    
+    if cache_dir.exists() {
+        // Remove the entire cache directory
+        fs::remove_dir_all(&cache_dir)?;
+        println!("✅ Cache cleared: {:?}", cache_dir);
+    } else {
+        println!("ℹ️  Cache directory does not exist: {:?}", cache_dir);
     }
     
     Ok(())
