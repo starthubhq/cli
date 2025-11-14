@@ -4525,7 +4525,7 @@ mod tests {
         let mut engine = ExecutionEngine::new();
         
         // Test executing action with the same inputs as test_build_action_tree
-        let action_ref = "starthubhq/get-weather-by-location-name:0.0.1";
+        let action_ref = "tgirotto/get-weather-by-location-name:0.0.1";
         let inputs = vec![
             json!({
                 "location_name": "Rome",
