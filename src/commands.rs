@@ -16,6 +16,50 @@ use crate::templates;
 const LOCAL_SERVER_URL: &str = "http://127.0.0.1:3000";
 const LOCAL_SERVER_HOST: &str = "127.0.0.1:3000";
 
+/// Check if required dependencies (wasmtime and docker) are installed
+fn check_dependencies() -> Result<()> {
+    let mut missing = Vec::new();
+    
+    // Check for wasmtime
+    let wasmtime_available = PCommand::new("wasmtime")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    
+    if !wasmtime_available {
+        missing.push("wasmtime");
+    }
+    
+    // Check for docker
+    let docker_available = PCommand::new("docker")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    
+    if !docker_available {
+        missing.push("docker");
+    }
+    
+    if !missing.is_empty() {
+        let missing_list = missing.join(" and ");
+        return Err(anyhow::anyhow!(
+            "Missing required dependencies: {}\n\n\
+            Please install the missing dependencies:\n\
+            - wasmtime: https://wasmtime.dev/\n\
+            - docker: https://www.docker.com/get-started",
+            missing_list
+        ));
+    }
+    
+    Ok(())
+}
+
 
 pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
     // Implementation for Docker publishing
@@ -295,6 +339,9 @@ pub async fn cmd_reset() -> anyhow::Result<()> {
 }
 
 pub async fn cmd_start(bind: String) -> Result<()> {
+    // Check for required dependencies
+    check_dependencies()?;
+    
     println!("🚀 Starting StartHub server in detached mode...");
     
     // Start the server as a detached process
@@ -408,6 +455,9 @@ fn get_server_log_file() -> Result<std::path::PathBuf> {
 }
 
 pub async fn cmd_run(action: String) -> Result<()> {
+    // Check for required dependencies
+    check_dependencies()?;
+    
     // Parse the action argument to extract namespace, slug, and version
     let (namespace, slug, version) = parse_action_arg(&action);
     
