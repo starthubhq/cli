@@ -89,28 +89,31 @@ pub async fn run_wasm_step(
     }
     
     // Mount the working directory for filesystem access
-    // Special handling for std/read-file and std/write-file actions
-    if action.uses.starts_with("std/read-file:") || action.uses.starts_with("std/write-file:") {
-        // For read-file and write-file, use the first input as the file path and mount its parent directory
-        if let Some(inputs_array) = inputs.as_array() {
-            if let Some(first_input) = inputs_array.first() {
-                if let Some(file_path) = first_input.as_str() {
-                    if file_path.starts_with('/') {
-                        let path = std::path::Path::new(file_path);
-                        let dir_to_mount = if path.is_file() {
-                            // If it's a file, use its parent directory
-                            path.parent()
-                                .and_then(|p| p.to_str())
-                                .unwrap_or(file_path)
-                        } else {
-                            // If it's a directory or doesn't exist, use as-is
-                            file_path
-                        };
-                        
-                        cmd.arg("--dir").arg(dir_to_mount);
-                        cmd.current_dir(dir_to_mount);
-                        
-                        log_info(&format!("Mounting directory for read-file: {}", dir_to_mount), Some(&action.id));
+    // Check if the action has filesystem permissions (read or write)
+    println!("Permissions: {:#?}", action.permissions);
+    if let Some(permissions) = &action.permissions {
+        if !permissions.fs.is_empty() {
+            // If filesystem permissions are required, mount the directory based on the first input (file path)
+            if let Some(inputs_array) = inputs.as_array() {
+                if let Some(first_input) = inputs_array.first() {
+                    if let Some(file_path) = first_input.as_str() {
+                        if file_path.starts_with('/') {
+                            let path = std::path::Path::new(file_path);
+                            let dir_to_mount = if path.is_file() {
+                                // If it's a file, use its parent directory
+                                path.parent()
+                                    .and_then(|p| p.to_str())
+                                    .unwrap_or(file_path)
+                            } else {
+                                // If it's a directory or doesn't exist, use as-is
+                                file_path
+                            };
+                            
+                            cmd.arg("--dir").arg(dir_to_mount);
+                            cmd.current_dir(dir_to_mount);
+                            
+                            log_info(&format!("Mounting directory for filesystem access (permissions: {:?}): {}", permissions.fs, dir_to_mount), Some(&action.id));
+                        }
                     }
                 }
             }

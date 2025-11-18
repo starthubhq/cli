@@ -131,6 +131,8 @@ impl ExecutionEngine {
                 return Err(anyhow::anyhow!("Unsupported action kind: {}", action.kind));
             };
             
+            println!("--------------------------------");
+            println!("result_string: {:#?}", result_string);
             // Parse the string result as JSON directly
             let parsed_json = serde_json::from_str::<Value>(&result_string)
                 .expect("Docker/WASM actions always return valid JSON");
@@ -5066,33 +5068,33 @@ mod tests {
         }
     }
 
-    // #[tokio::test]
-    // async fn test_execute_action_std_read_file() {
-    //     // Create a mock ExecutionEngine
-    //     let mut engine = ExecutionEngine::new();
+    #[tokio::test]
+    async fn test_execute_action_std_read_file() {
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
         
-    //     // Test executing the std/read-file action
-    //     let action_ref = "std/read-file:0.0.1";
+        // Test executing the std/read-file action
+        let action_ref = "tgirotto/read-file:0.0.1";
         
-    //     // Test with file path parameter
-    //     let inputs = vec![
-    //         json!("/Users/tommaso/Desktop/test.txt")
-    //     ];
+        // Test with file path parameter
+        let inputs = vec![
+            json!("/Users/tommaso/Desktop/test.txt")
+        ];
         
-    //     println!("Testing std/read-file with inputs: {:#?}", inputs);
-    //     let result = engine.execute_action(action_ref, inputs).await;
+        println!("Testing std/read-file with inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
         
-    //     println!("std/read-file test result: {:#?}", result);
-    //     // The test should succeed
-    //     assert!(result.is_ok(), "execute_action should succeed for valid std/read-file action_ref and inputs");
+        println!("std/read-file test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid std/read-file action_ref and inputs");
         
-    //     let action_tree = result.unwrap();
+        let action_tree = result.unwrap();
         
-    //     // Verify the action structure
-    //     assert_eq!(action_tree["name"], "read-file");
-    //     assert_eq!(action_tree["kind"], "wasm");
-    //     assert_eq!(action_tree["uses"], action_ref);
-    // }
+        // Verify the action structure
+        // assert_eq!(action_tree["name"], "read-file");
+        // assert_eq!(action_tree["kind"], "wasm");
+        // assert_eq!(action_tree["uses"], action_ref);
+    }
 
     #[tokio::test]
     async fn test_execute_action_sleep() {
