@@ -54,32 +54,38 @@ pub async fn run_wasm_step(
     
     // Add permissions based on the action's permissions
     if let Some(permissions) = &action.permissions {
-        // Add filesystem permissions
-        for fs_perm in &permissions.fs {
-            match fs_perm.as_str() {
-                "read" => {
-                    cmd.arg("-S").arg("cli");
-                },
-                "write" => {
-                    cmd.arg("-S").arg("cli");
-                },
-                _ => {
-                    log_info(&format!("Unknown filesystem permission: {}", fs_perm), Some(&action.id));
+        // Add filesystem permissions only if the fs vector is not empty
+        if !permissions.fs.is_empty() {
+            let mut has_cli = false;
+            for fs_perm in &permissions.fs {
+                match fs_perm.as_str() {
+                    "read" | "write" => {
+                        if !has_cli {
+                            cmd.arg("-S").arg("cli");
+                            has_cli = true; // Only add -S cli once
+                        }
+                    },
+                    _ => {
+                        log_info(&format!("Unknown filesystem permission: {}", fs_perm), Some(&action.id));
+                    }
                 }
             }
         }
         
-        // Add network permissions
-        for net_perm in &permissions.net {
-            match net_perm.as_str() {
-                "http" => {
-                    cmd.arg("-S").arg("http");
-                },
-                "https" => {
-                    cmd.arg("-S").arg("http"); // wasmtime uses 'http' for both http and https
-                },
-                _ => {
-                    log_info(&format!("Unknown network permission: {}", net_perm), Some(&action.id));
+        // Add network permissions only if the net vector is not empty
+        if !permissions.net.is_empty() {
+            let mut has_http = false;
+            for net_perm in &permissions.net {
+                match net_perm.as_str() {
+                    "http" | "https" => {
+                        if !has_http {
+                            cmd.arg("-S").arg("http");
+                            has_http = true; // Only add -S http once (wasmtime uses 'http' for both http and https)
+                        }
+                    },
+                    _ => {
+                        log_info(&format!("Unknown network permission: {}", net_perm), Some(&action.id));
+                    }
                 }
             }
         }
