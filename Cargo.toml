@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "starthub"
-version = "0.2.13"
+version = "0.2.14"
 edition = "2021"
 
 [[bin]]
