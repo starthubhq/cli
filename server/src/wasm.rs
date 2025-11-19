@@ -94,34 +94,54 @@ pub async fn run_wasm_step(
         log_info("No permissions specified, using default", Some(&action.id));
     }
     
-    // Mount the working directory for filesystem access
-    // Check if the action has filesystem permissions (read or write)
-    println!("Permissions: {:#?}", action.permissions);
+    // Mount directories for filesystem access
+    // Check inputs with type "file" and mount their parent directories
     if let Some(permissions) = &action.permissions {
         if !permissions.fs.is_empty() {
-            // If filesystem permissions are required, mount the directory based on the first input (file path)
+            let mut mounted_dirs = std::collections::HashSet::new();
+            
+            // Find all inputs with type "file" and mount their directories
             if let Some(inputs_array) = inputs.as_array() {
-                if let Some(first_input) = inputs_array.first() {
-                    if let Some(file_path) = first_input.as_str() {
-                        if file_path.starts_with('/') {
+                for (idx, input_io) in action.inputs.iter().enumerate() {
+                    // Check if this input is of type "file"
+                    if input_io.r#type == "file" {
+                        // Get the runtime value for this input
+                        if let Some(input_value) = inputs_array.get(idx) {
+                            if let Some(file_path) = input_value.as_str() {
+                                // Extract parent directory from the file path
                             let path = std::path::Path::new(file_path);
-                            let dir_to_mount = if path.is_file() {
-                                // If it's a file, use its parent directory
+                                // Always get the parent directory for file paths
+                                // If the path ends with '/', it's a directory, otherwise treat as file
+                                let dir_to_mount = if file_path.ends_with('/') {
+                                    // It's explicitly a directory
+                                    Some(file_path.to_string())
+                                } else {
+                                    // It's a file path - get parent directory
                                 path.parent()
                                     .and_then(|p| p.to_str())
-                                    .unwrap_or(file_path)
-                            } else {
-                                // If it's a directory or doesn't exist, use as-is
-                                file_path
-                            };
-                            
-                            cmd.arg("--dir").arg(dir_to_mount);
-                            cmd.current_dir(dir_to_mount);
-                            
-                            log_info(&format!("Mounting directory for filesystem access (permissions: {:?}): {}", permissions.fs, dir_to_mount), Some(&action.id));
+                                        .map(|s| s.to_string())
+                                };
+                                
+                                if let Some(dir) = dir_to_mount {
+                                    if !mounted_dirs.contains(&dir) {
+                                        cmd.arg("--dir").arg(&dir);
+                                        mounted_dirs.insert(dir.clone());
+                                        log_info(&format!("Mounting directory for input '{}' (type: file): {}", input_io.name, dir), Some(&action.id));
+                                    }
+                                }
+                            }
                         }
                     }
                 }
+            }
+            
+            // Set current directory to the first mounted directory if any
+            if let Some(first_dir) = mounted_dirs.iter().next() {
+                cmd.current_dir(first_dir);
+                log_info(&format!("Working directory set to: {}", first_dir), Some(&action.id));
+            } else if !permissions.fs.is_empty() {
+                // If filesystem permissions are requested but no file inputs found, log a warning
+                log_info("Filesystem permissions requested but no inputs with type 'file' found", Some(&action.id));
             }
         }
     }
