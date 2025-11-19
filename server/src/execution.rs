@@ -108,6 +108,7 @@ impl ExecutionEngine {
                 .map(|io| io.value.clone().unwrap_or(Value::Null))
                 .collect();
 
+            println!("input_values_to_serialise: {:#?}", input_values_to_serialise);
             let result_string = if action.kind == "wasm" {
                 wasm::run_wasm_step(
                     action, 
@@ -118,7 +119,6 @@ impl ExecutionEngine {
                     &|msg, id| self.logger.log_error(msg, id),
                 ).await?
             } else if action.kind == "docker" {
-                println!("input_values_to_serialise: {:#?}", input_values_to_serialise);
                 docker::run_docker_step(
                     action,
                     &serde_json::to_value(&input_values_to_serialise)?,
@@ -137,7 +137,7 @@ impl ExecutionEngine {
             let parsed_json = serde_json::from_str::<Value>(&result_string)
                 .expect("Docker/WASM actions always return valid JSON");
             
-            println!("result_string: {:#?}", parsed_json);
+            println!("result_json: {:#?}", parsed_json);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
             
             // Log the execution result to the frontend
@@ -6432,13 +6432,13 @@ mod tests {
         let mut engine = ExecutionEngine::new();
         
         // Test executing the install-grafana composition
-        let action_ref = "starthubhq/install-grafana:0.0.1";
+        let action_ref = "tgirotto/install-grafana:0.0.1";
         
         // Read test parameters from environment variables, with fallback to default SSH key
         let private_key = std::env::var("SSH_PRIVATE_KEY")
             .unwrap_or_else(|_| {
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                std::fs::read_to_string(format!("{}/.ssh/id_rsa", home))
+                std::fs::read_to_string(format!("{}/.ssh/starthub", home))
                     .unwrap_or_else(|_| "".to_string())
             });
         let user = std::env::var("SSH_USER").unwrap_or_default();
