@@ -404,7 +404,14 @@ impl ExecutionEngine {
                     // If it's already a string, keep it as-is
                     // If it's an object/array/number/bool, serialize it to a JSON string
                     match value {
-                        Value::String(_) => value.clone(),
+                        Value::String(s) => {
+                            // Normalize newlines: if the string contains actual newlines,
+                            // they should be escaped as \n for JSON compatibility
+                            // However, we keep them as-is since JSON serialization will handle escaping
+                            // The issue is that if newlines were lost during JSON parsing,
+                            // we can't recover them. But if they're present, we preserve them.
+                            Value::String(s.clone())
+                        },
                         _ => Value::String(serde_json::to_string(value)?),
                     }
                 },

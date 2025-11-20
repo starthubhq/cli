@@ -186,7 +186,18 @@ async fn handle_run(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|item| item.clone())  // Use values directly, they're already properly typed
+                .map(|item| {
+                    // Debug: Check if this looks like an SSH key and log its structure
+                    if let Some(s) = item.as_str() {
+                        if s.contains("BEGIN OPENSSH PRIVATE KEY") || s.contains("BEGIN RSA PRIVATE KEY") {
+                            println!("🔑 Detected SSH key input: length={}, contains \\n: {}, contains actual newlines: {}", 
+                                s.len(), 
+                                s.contains("\\n"),
+                                s.contains('\n'));
+                        }
+                    }
+                    item.clone()  // Use values directly, they're already properly typed
+                })
                 .collect::<Vec<Value>>()
         })
         .unwrap_or_default();
