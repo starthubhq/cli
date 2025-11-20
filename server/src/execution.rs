@@ -195,9 +195,16 @@ impl ExecutionEngine {
 
             // Create a new action with the updated outputs.
             let updated_action = ShAction {
-                outputs: typed_updated_outputs,
+                outputs: typed_updated_outputs.clone(),
                 ..action.clone()
             };
+            
+            // Debug: Log the outputs after execution
+            println!("✅ Step '{}' completed with {} outputs:", action.id, typed_updated_outputs.len());
+            for (idx, output) in typed_updated_outputs.iter().enumerate() {
+                println!("  output[{}]: name='{}', type='{}', value={:?}", 
+                    idx, output.name, output.r#type, output.value);
+            }
             
             return Ok(updated_action);
         }
@@ -531,16 +538,37 @@ impl ExecutionEngine {
                 let resolved_untyped_values: Result<Vec<Value>, ()> = step.inputs.iter()
                     .map(|definition| {
                         // Resolve the template to get the actual value
-                        self.interpolate_into_untyped_value(&definition.template, &values, Some(children))
-                            .map_err(|_| ()) // Convert interpolation errors to () first
-                            .and_then(|interpolated_template| {
+                        let interpolation_result = self.interpolate_into_untyped_value(&definition.template, &values, Some(children));
+                        match interpolation_result {
+                            Ok(interpolated_template) => {
                                 // Check if the resolved template still contains unresolved templates
-                                if self.contains_unresolved_templates(&interpolated_template) {
+                                let has_unresolved = self.contains_unresolved_templates(&interpolated_template);
+                                if has_unresolved {
+                                    // Debug: Check if it's a false positive (string that looks like it has templates but is actually resolved)
+                                    if let Value::String(s) = &interpolated_template {
+                                        println!("⚠️ Step '{}' input template '{}' resolved to string that contains '{{' or '}}': length={}, first 100 chars: {}", 
+                                            step_id, 
+                                            serde_json::to_string(&definition.template).unwrap_or_default(),
+                                            s.len(),
+                                            s.chars().take(100).collect::<String>());
+                                        // Check if the string actually contains template patterns
+                                        let has_template_pattern = s.contains("{{steps.") || s.contains("{{inputs[");
+                                        if !has_template_pattern {
+                                            println!("✅ This appears to be a false positive - string doesn't contain actual template patterns, treating as resolved");
+                                            return Ok(interpolated_template);
+                                        }
+                                    }
+                                    println!("⚠️ Step '{}' input template '{}' still contains unresolved templates after interpolation: {:?}", step_id, serde_json::to_string(&definition.template).unwrap_or_default(), interpolated_template);
                                     Err(()) // Cannot resolve this step yet
                                 } else {
                                     Ok(interpolated_template)
                                 }
-                            })
+                            },
+                            Err(e) => {
+                                println!("❌ Failed to interpolate template '{}' for step '{}': {}", serde_json::to_string(&definition.template).unwrap_or_default(), step_id, e);
+                                Err(())
+                            }
+                        }
                     })
                     .collect();
 
@@ -684,12 +712,22 @@ impl ExecutionEngine {
             if let Some(cap) = steps_simple_re.captures(template) {
                 if let (Some(step_name), Some(index_str)) = (cap.get(1), cap.get(2)) {
                     if let Ok(index) = index_str.as_str().parse::<usize>() {
-                        if let Some(step) = executed_steps.get(step_name.as_str()) {
+                        let step_name_str = step_name.as_str();
+                        println!("🔍 Looking for step '{}' in executed_steps (available keys: {:?})", step_name_str, executed_steps.keys().collect::<Vec<_>>());
+                        if let Some(step) = executed_steps.get(step_name_str) {
+                            println!("✅ Found step '{}', checking output at index {}", step_name_str, index);
                             if let Some(output) = step.outputs.get(index) {
                                 if let Some(output_value) = &output.value {
+                                    println!("✅ Step '{}' output[{}] has value: {:?}", step_name_str, index, output_value);
                                     return Ok(output_value.clone());
+                                } else {
+                                    println!("⚠️ Step '{}' output[{}] exists but has no value", step_name_str, index);
                                 }
+                            } else {
+                                println!("⚠️ Step '{}' has {} outputs, but index {} is out of range", step_name_str, step.outputs.len(), index);
                             }
+                        } else {
+                            println!("❌ Step '{}' not found in executed_steps", step_name_str);
                         }
                     }
                 }
@@ -1132,9 +1170,18 @@ impl ExecutionEngine {
 
     
     /// Checks if a value contains unresolved template syntax
+    /// This checks for actual template patterns like {{steps.}} or {{inputs[}}, not just any {{ or }}
     fn contains_unresolved_templates(&self, value: &Value) -> bool {
         match value {
-            Value::String(s) => s.contains("{{") || s.contains("}}"),
+            Value::String(s) => {
+                // Check for actual template patterns, not just any braces
+                // Template patterns are: {{steps.}}, {{inputs[}}, or {{outputs[}}
+                s.contains("{{steps.") || 
+                s.contains("{{inputs[") || 
+                s.contains("{{outputs[") ||
+                // Also check for incomplete patterns that might be templates
+                (s.contains("{{") && s.contains("}}") && (s.contains("steps") || s.contains("inputs") || s.contains("outputs")))
+            },
             Value::Object(obj) => {
                 for (_, v) in obj {
                     if self.contains_unresolved_templates(v) {
