@@ -5002,6 +5002,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_action_tgirotto_do_get_droplet() {
+        dotenv::dotenv().ok();
+
+        // Create a mock ExecutionEngine
+        let mut engine = ExecutionEngine::new();
+        
+        // Test executing action for droplet retrieval using the new flattened input format
+        let action_ref = "tgirotto/do-get-droplet:0.0.1";
+        
+        // Read test parameters from environment variables with defaults
+        let api_token = std::env::var("DO_API_TOKEN")
+            .unwrap_or_else(|_| "".to_string());
+        let droplet_id = std::env::var("DO_DROPLET_ID")
+            .unwrap_or_else(|_| "123456789".to_string())
+            .parse::<u64>()
+            .unwrap_or(123456789);
+        
+        // Inputs as array of values in order: api_token, droplet_id
+        let inputs = vec![
+            json!(api_token),
+            json!(droplet_id)
+        ];
+        
+        println!("inputs: {:#?}", inputs);
+        let result = engine.execute_action(action_ref, inputs).await;
+        
+        println!("tgirotto/do-get-droplet test result: {:#?}", result);
+        // The test should succeed
+        assert!(result.is_ok(), "execute_action should succeed for valid tgirotto/do-get-droplet action_ref and inputs");
+        
+        let outputs = result.unwrap();
+        println!("outputs: {:#?}", outputs);
+        // Verify that we got outputs
+        assert!(outputs.is_array(), "execute_action should return an array of outputs");
+        let outputs_array = outputs.as_array().unwrap();
+        assert!(!outputs_array.is_empty(), "do-get-droplet should produce at least one output");
+        
+        // Verify the output structure - should be a droplet object
+        let first_output = &outputs_array[0];
+        assert!(first_output.is_object(), "Output should be an object");
+        
+        // Check if it's a valid droplet structure
+        if let Some(droplet_obj) = first_output.as_object() {
+            // Droplet should have common fields like id, name, status
+            assert!(droplet_obj.contains_key("id") || droplet_obj.contains_key("name") || droplet_obj.contains_key("status"), 
+                   "Droplet object should contain id, name, or status");
+        }
+    }
+
+    #[tokio::test]
     async fn test_execute_action_get_do_lb() {
         dotenv::dotenv().ok();
 
