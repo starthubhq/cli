@@ -1,7 +1,6 @@
 use anyhow::Result;
 use jsonschema::JSONSchema;
-use serde_json::Value;
-use tracing_subscriber::filter::combinator::Or;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use dirs;
 use tokio::sync::broadcast;
@@ -133,9 +132,25 @@ impl ExecutionEngine {
             
             println!("--------------------------------");
             println!("result_string: {:#?}", result_string);
-            // Parse the string result as JSON directly
-            let parsed_json = serde_json::from_str::<Value>(&result_string)
-                .expect("Docker/WASM actions always return valid JSON");
+            
+            // Handle empty or invalid JSON responses gracefully
+            let parsed_json = if result_string.trim().is_empty() {
+                self.logger.log_error("Action returned empty response - using empty array as fallback", Some(&action.id));
+                Value::Array(vec![])
+            } else {
+                match serde_json::from_str::<Value>(&result_string) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        let error_msg = format!("Failed to parse action output as JSON: {}. Raw output: {}", e, result_string);
+                        self.logger.log_error(&error_msg, Some(&action.id));
+                        // Return an error object in the expected array format
+                        Value::Array(vec![json!({
+                            "error": format!("Invalid JSON response from action: {}", e),
+                            "raw_output": result_string
+                        })])
+                    }
+                }
+            };
             
             println!("result_json: {:#?}", parsed_json);
             self.logger.log_success(&format!("{} step completed: {}", action.kind, action.name), Some(&action.id));
@@ -377,7 +392,15 @@ impl ExecutionEngine {
             
             let converted_value = match target_type {
                 "id" => value.clone(),
-                "string" => value.clone(),
+                "string" => {
+                    // Ensure the value is always a string
+                    // If it's already a string, keep it as-is
+                    // If it's an object/array/number/bool, serialize it to a JSON string
+                    match value {
+                        Value::String(_) => value.clone(),
+                        _ => Value::String(serde_json::to_string(value)?),
+                    }
+                },
                 "number" => {
                     // Convert string to number if needed
                     match value {
