@@ -31,12 +31,14 @@ fn main() {
         }
     }
     
-    // Run npm run build
+    // Run npm run build with Supabase environment variables
     println!("cargo:warning=Running npm run build in console...");
     let build_status = Command::new("npm")
         .arg("run")
         .arg("build")
         .current_dir(&console_dir)
+        .env("VITE_SUPABASE_URL", "https://smltnjrrzkmazvbrqbkq.supabase.co")
+        .env("VITE_SUPABASE_ANON_KEY", "sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe")
         .status();
     
     match build_status {

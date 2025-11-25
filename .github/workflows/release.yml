@@ -49,6 +49,9 @@ jobs:
 
       - name: Build console UI
         working-directory: ./console
+        env:
+          VITE_SUPABASE_URL: https://smltnjrrzkmazvbrqbkq.supabase.co
+          VITE_SUPABASE_ANON_KEY: sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe
         run: |
           npm ci
           npm run build
