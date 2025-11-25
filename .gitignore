@@ -43,3 +43,6 @@ starthub.json
 test/
 artifacts/
 **/.env
+
+# Generated UI build output
+server/ui/dist

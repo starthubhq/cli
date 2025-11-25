@@ -1,10 +1,13 @@
 use anyhow::Result;
 use std::{fs, path::Path, io::Write};
 use std::process::Command as PCommand;
+use std::process::Stdio;
 use inquire::{Text, Select};
 use tokio::time::{sleep, Duration};
+use tokio::io::{AsyncBufReadExt, AsyncSeekExt, BufReader};
 use webbrowser;
 use reqwest;
+use dirs;
 
 use crate::models::{ShManifest, ShKind, ShPort, ShType};
 use crate::templates;
@@ -12,6 +15,50 @@ use crate::templates;
 // Global constants for local development server
 const LOCAL_SERVER_URL: &str = "http://127.0.0.1:3000";
 const LOCAL_SERVER_HOST: &str = "127.0.0.1:3000";
+
+/// Check if required dependencies (wasmtime and docker) are installed
+fn check_dependencies() -> Result<()> {
+    let mut missing = Vec::new();
+    
+    // Check for wasmtime
+    let wasmtime_available = PCommand::new("wasmtime")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    
+    if !wasmtime_available {
+        missing.push("wasmtime");
+    }
+    
+    // Check for docker
+    let docker_available = PCommand::new("docker")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    
+    if !docker_available {
+        missing.push("docker");
+    }
+    
+    if !missing.is_empty() {
+        let missing_list = missing.join(" and ");
+        return Err(anyhow::anyhow!(
+            "Missing required dependencies: {}\n\n\
+            Please install the missing dependencies:\n\
+            - wasmtime: https://wasmtime.dev/\n\
+            - docker: https://www.docker.com/get-started",
+            missing_list
+        ));
+    }
+    
+    Ok(())
+}
 
 
 pub async fn cmd_publish_docker_inner(m: &ShManifest, no_build: bool) -> anyhow::Result<()> {
@@ -272,7 +319,29 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub async fn cmd_reset() -> anyhow::Result<()> {
+    println!("🧹 Clearing cache...");
+    
+    // Get cache directory (same as used in execution.rs)
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join("starthub/oci");
+    
+    if cache_dir.exists() {
+        // Remove the entire cache directory
+        fs::remove_dir_all(&cache_dir)?;
+        println!("✅ Cache cleared: {:?}", cache_dir);
+    } else {
+        println!("ℹ️  Cache directory does not exist: {:?}", cache_dir);
+    }
+    
+    Ok(())
+}
+
 pub async fn cmd_start(bind: String) -> Result<()> {
+    // Check for required dependencies
+    check_dependencies()?;
+    
     println!("🚀 Starting StartHub server in detached mode...");
     
     // Start the server as a detached process
@@ -286,6 +355,7 @@ pub async fn cmd_start(bind: String) -> Result<()> {
     println!("📝 Process ID: {}", server_process.id());
     println!("🔄 Server is running in the background");
     println!("💡 Use 'starthub run <action>' to interact with the server");
+    println!("📋 Use 'starthub logs' to view server logs");
     println!("🛑 Use 'starthub stop' to stop the server");
     
     Ok(())
@@ -306,7 +376,88 @@ pub async fn cmd_stop() -> Result<()> {
     Ok(())
 }
 
+pub async fn cmd_logs(follow: bool, lines: usize) -> Result<()> {
+    // Get the log file path
+    let log_file = get_server_log_file()?;
+    
+    if !log_file.exists() {
+        println!("❌ Log file not found: {:?}", log_file);
+        println!("💡 The server may not be running. Start it with 'starthub start'");
+        return Ok(());
+    }
+    
+    if follow {
+        println!("📋 Following server logs (Press Ctrl+C to stop)...");
+        println!("---");
+        
+        // First, show the last N lines
+        let content = fs::read_to_string(&log_file)?;
+        let all_lines: Vec<&str> = content.lines().collect();
+        let start_line = all_lines.len().saturating_sub(lines);
+        for line in all_lines.iter().skip(start_line) {
+            println!("{}", line);
+        }
+        
+        // Then follow new lines by polling the file
+        let mut last_size = fs::metadata(&log_file)?.len();
+        loop {
+            sleep(Duration::from_millis(500)).await;
+            
+            let metadata = match fs::metadata(&log_file) {
+                Ok(m) => m,
+                Err(_) => continue, // File might have been deleted
+            };
+            
+            if metadata.len() > last_size {
+                // Read new content
+                let file = tokio::fs::File::open(&log_file).await?;
+                let mut reader = BufReader::new(file);
+                
+                // Seek to the last position we read
+                reader.seek(tokio::io::SeekFrom::Start(last_size)).await?;
+                
+                let mut line = String::new();
+                while reader.read_line(&mut line).await? > 0 {
+                    print!("{}", line);
+                    line.clear();
+                }
+                
+                last_size = metadata.len();
+            }
+        }
+    } else {
+        // Just show the last N lines
+        let content = fs::read_to_string(&log_file)?;
+        let all_lines: Vec<&str> = content.lines().collect();
+        let start_line = all_lines.len().saturating_sub(lines);
+        
+        println!("📋 Last {} lines of server logs:", lines);
+        println!("---");
+        for line in all_lines.iter().skip(start_line) {
+            println!("{}", line);
+        }
+    }
+    
+    Ok(())
+}
+
+fn get_server_log_file() -> Result<std::path::PathBuf> {
+    // Store log file in config directory
+    let config_dir = dirs::config_dir()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
+        .unwrap_or_else(|| std::env::temp_dir());
+    let starthub_dir = config_dir.join("starthub");
+    
+    // Create directory if it doesn't exist
+    fs::create_dir_all(&starthub_dir)?;
+    
+    Ok(starthub_dir.join("server.log"))
+}
+
 pub async fn cmd_run(action: String) -> Result<()> {
+    // Check for required dependencies
+    check_dependencies()?;
+    
     // Parse the action argument to extract namespace, slug, and version
     let (namespace, slug, version) = parse_action_arg(&action);
     
@@ -386,11 +537,26 @@ async fn start_server_process_detached(bind: &str) -> Result<std::process::Child
     
     println!("🚀 Starting server process: {:?}", server_path);
     
-    // Start the server process in detached mode
+    // Get log file path
+    let log_file = get_server_log_file()?;
+    let log_file_path = log_file.as_path();
+    
+    // Open log file for writing (append mode)
+    let log_file_handle = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file_path)?;
+    
+    // Start the server process in detached mode with stdout/stderr redirected to log file
     let child = std::process::Command::new(&server_path)
         .arg("--bind")
         .arg(bind)
+        .stdout(Stdio::from(log_file_handle.try_clone()?))
+        .stderr(Stdio::from(log_file_handle))
         .spawn()?;
+    
+    println!("📝 Server logs will be written to: {:?}", log_file_path);
+    println!("💡 Use 'starthub logs' to view logs");
     
     Ok(child)
 }
@@ -565,20 +731,104 @@ fn parse_action_arg(action: &str) -> (String, String, String) {
     (namespace, slug, version)
 }
 
-pub async fn cmd_status(id: Option<String>) -> Result<()> {
-    println!("📊 Checking deployment status...");
+pub async fn cmd_status() -> Result<()> {
+    println!("📊 Checking server status...");
     
-    if let Some(deployment_id) = id {
-        println!("🔍 Status for deployment: {}", deployment_id);
-        // TODO: Implement actual status checking
-        println!("✅ Deployment is running");
+    // Check if server process is running
+    let processes = find_starthub_server_processes().await?;
+    
+    if processes.is_empty() {
+        println!("❌ Server is not running");
+        println!("💡 Start the server with 'starthub start'");
+        return Ok(());
+    }
+    
+    println!("✅ Server is running");
+    println!("📋 Found {} server process(es):", processes.len());
+    for (pid, cmd) in processes {
+        println!("  - PID: {} | Command: {}", pid, cmd);
+    }
+    
+    // Check if server is responding to HTTP requests
+    let server_running = check_server_running().await?;
+    if server_running {
+        println!("🌐 Server is responding at {}", LOCAL_SERVER_URL);
     } else {
-        println!("📋 Recent deployments:");
-        // TODO: Implement list of recent deployments
-        println!("  - No deployments found");
+        println!("⚠️  Server process is running but not responding to HTTP requests");
+        println!("💡 The server may still be starting up, or there may be an issue");
+    }
+    
+    // Show log file location
+    let log_file = get_server_log_file()?;
+    if log_file.exists() {
+        let metadata = std::fs::metadata(&log_file)?;
+        let file_size = metadata.len();
+        println!("📝 Log file: {:?} ({} bytes)", log_file, file_size);
     }
     
     Ok(())
+}
+
+async fn find_starthub_server_processes() -> Result<Vec<(u32, String)>> {
+    let mut processes = Vec::new();
+    
+    #[cfg(unix)]
+    {
+        // Unix/Linux/macOS: Use ps command
+        let output = std::process::Command::new("ps")
+            .args(&["-ax", "-o", "pid,comm,args"])
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to list processes"));
+        }
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        for line in output_str.lines() {
+            if line.contains("starthub-server") && !line.contains("grep") {
+                let parts: Vec<&str> = line.trim().split_whitespace().collect();
+                if let Some(pid_str) = parts.first() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        // Get the full command (everything after PID and comm)
+                        let cmd_parts: Vec<&str> = parts.iter().skip(2).cloned().collect();
+                        let cmd = cmd_parts.join(" ");
+                        processes.push((pid, cmd));
+                    }
+                }
+            }
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        // Windows: Use tasklist command
+        let output = std::process::Command::new("tasklist")
+            .args(&["/FI", "IMAGENAME eq starthub-server.exe", "/FO", "CSV", "/V"])
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("Failed to list processes"));
+        }
+        
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        
+        for line in output_str.lines() {
+            if line.contains("starthub-server.exe") {
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.len() >= 2 {
+                    let pid_str = parts[1].trim_matches('"');
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        let cmd_parts: Vec<&str> = parts.iter().skip(1).cloned().collect();
+                        let cmd = cmd_parts.join(" ");
+                        processes.push((pid, cmd));
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(processes)
 }
 
 /// Gets the ID of an existing action

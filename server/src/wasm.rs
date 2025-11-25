@@ -54,32 +54,38 @@ pub async fn run_wasm_step(
     
     // Add permissions based on the action's permissions
     if let Some(permissions) = &action.permissions {
-        // Add filesystem permissions
-        for fs_perm in &permissions.fs {
-            match fs_perm.as_str() {
-                "read" => {
-                    cmd.arg("-S").arg("cli");
-                },
-                "write" => {
-                    cmd.arg("-S").arg("cli");
-                },
-                _ => {
-                    log_info(&format!("Unknown filesystem permission: {}", fs_perm), Some(&action.id));
+        // Add filesystem permissions only if the fs vector is not empty
+        if !permissions.fs.is_empty() {
+            let mut has_cli = false;
+            for fs_perm in &permissions.fs {
+                match fs_perm.as_str() {
+                    "read" | "write" => {
+                        if !has_cli {
+                            cmd.arg("-S").arg("cli");
+                            has_cli = true; // Only add -S cli once
+                        }
+                    },
+                    _ => {
+                        log_info(&format!("Unknown filesystem permission: {}", fs_perm), Some(&action.id));
+                    }
                 }
             }
         }
         
-        // Add network permissions
-        for net_perm in &permissions.net {
-            match net_perm.as_str() {
-                "http" => {
-                    cmd.arg("-S").arg("http");
-                },
-                "https" => {
-                    cmd.arg("-S").arg("http"); // wasmtime uses 'http' for both http and https
-                },
-                _ => {
-                    log_info(&format!("Unknown network permission: {}", net_perm), Some(&action.id));
+        // Add network permissions only if the net vector is not empty
+        if !permissions.net.is_empty() {
+            let mut has_http = false;
+            for net_perm in &permissions.net {
+                match net_perm.as_str() {
+                    "http" | "https" => {
+                        if !has_http {
+                            cmd.arg("-S").arg("http");
+                            has_http = true; // Only add -S http once (wasmtime uses 'http' for both http and https)
+                        }
+                    },
+                    _ => {
+                        log_info(&format!("Unknown network permission: {}", net_perm), Some(&action.id));
+                    }
                 }
             }
         }
@@ -88,31 +94,54 @@ pub async fn run_wasm_step(
         log_info("No permissions specified, using default", Some(&action.id));
     }
     
-    // Mount the working directory for filesystem access
-    // Special handling for std/read-file and std/write-file actions
-    if action.uses.starts_with("std/read-file:") || action.uses.starts_with("std/write-file:") {
-        // For read-file and write-file, use the first input as the file path and mount its parent directory
-        if let Some(inputs_array) = inputs.as_array() {
-            if let Some(first_input) = inputs_array.first() {
-                if let Some(file_path) = first_input.as_str() {
-                    if file_path.starts_with('/') {
-                        let path = std::path::Path::new(file_path);
-                        let dir_to_mount = if path.is_file() {
-                            // If it's a file, use its parent directory
-                            path.parent()
-                                .and_then(|p| p.to_str())
-                                .unwrap_or(file_path)
-                        } else {
-                            // If it's a directory or doesn't exist, use as-is
-                            file_path
-                        };
-                        
-                        cmd.arg("--dir").arg(dir_to_mount);
-                        cmd.current_dir(dir_to_mount);
-                        
-                        log_info(&format!("Mounting directory for read-file: {}", dir_to_mount), Some(&action.id));
+    // Mount directories for filesystem access
+    // Check inputs with type "file" and mount their parent directories
+    if let Some(permissions) = &action.permissions {
+        if !permissions.fs.is_empty() {
+            let mut mounted_dirs = std::collections::HashSet::new();
+            
+            // Find all inputs with type "file" and mount their directories
+            if let Some(inputs_array) = inputs.as_array() {
+                for (idx, input_io) in action.inputs.iter().enumerate() {
+                    // Check if this input is of type "file"
+                    if input_io.r#type == "file" {
+                        // Get the runtime value for this input
+                        if let Some(input_value) = inputs_array.get(idx) {
+                            if let Some(file_path) = input_value.as_str() {
+                                // Extract parent directory from the file path
+                            let path = std::path::Path::new(file_path);
+                                // Always get the parent directory for file paths
+                                // If the path ends with '/', it's a directory, otherwise treat as file
+                                let dir_to_mount = if file_path.ends_with('/') {
+                                    // It's explicitly a directory
+                                    Some(file_path.to_string())
+                                } else {
+                                    // It's a file path - get parent directory
+                                path.parent()
+                                    .and_then(|p| p.to_str())
+                                        .map(|s| s.to_string())
+                                };
+                                
+                                if let Some(dir) = dir_to_mount {
+                                    if !mounted_dirs.contains(&dir) {
+                                        cmd.arg("--dir").arg(&dir);
+                                        mounted_dirs.insert(dir.clone());
+                                        log_info(&format!("Mounting directory for input '{}' (type: file): {}", input_io.name, dir), Some(&action.id));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+            
+            // Set current directory to the first mounted directory if any
+            if let Some(first_dir) = mounted_dirs.iter().next() {
+                cmd.current_dir(first_dir);
+                log_info(&format!("Working directory set to: {}", first_dir), Some(&action.id));
+            } else if !permissions.fs.is_empty() {
+                // If filesystem permissions are requested but no file inputs found, log a warning
+                log_info("Filesystem permissions requested but no inputs with type 'file' found", Some(&action.id));
             }
         }
     }

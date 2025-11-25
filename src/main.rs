@@ -46,11 +46,17 @@ enum Commands {
     },
     /// Stop the running server
     Stop,
-    /// Show deployment status
-    Status {
-        #[arg(long)]
-        id: Option<String>,
+    /// Show server logs
+    Logs {
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines to show from the end
+        #[arg(short, long, default_value = "100")]
+        lines: usize,
     },
+    /// Show server status
+    Status,
     /// Authenticate with Starthub backend
     Login {
         /// Starthub API base URL
@@ -59,7 +65,9 @@ enum Commands {
     },
     /// Logout from Starthub backend
     Logout,
-    Auth
+    Auth,
+    /// Clear the cache
+    Reset,
 }
 
 #[tokio::main]
@@ -80,10 +88,12 @@ async fn main() -> Result<()> {
         Commands::Run { action } => commands::cmd_run(action).await?,
         Commands::Start { bind } => commands::cmd_start(bind).await?,
         Commands::Stop => commands::cmd_stop().await?,
-        Commands::Status { id } => commands::cmd_status(id).await?,
+        Commands::Logs { follow, lines } => commands::cmd_logs(follow, lines).await?,
+        Commands::Status => commands::cmd_status().await?,
         Commands::Login { api_base } => commands::cmd_login_starthub(api_base).await?,
         Commands::Logout => commands::cmd_logout_starthub().await?,
         Commands::Auth => commands::cmd_auth_status().await?,
+        Commands::Reset => commands::cmd_reset().await?,
     }
     Ok(())
 }
