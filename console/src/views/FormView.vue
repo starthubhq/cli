@@ -423,7 +423,6 @@ function addItemAfterSelected() {
       manifestError: null,
       inputMappings: {}
     })
-    selectedItemId.value = newId
     return
   }
   
@@ -445,7 +444,6 @@ function addItemAfterSelected() {
       manifestError: null,
       inputMappings: {}
     })
-    selectedItemId.value = newId
     return
   }
 
@@ -465,7 +463,6 @@ function addItemAfterSelected() {
   }
 
   items.value.splice(itemIndex + 1, 0, newItem)
-  selectedItemId.value = newId
 }
 
 // Function to add inputs item
@@ -1188,8 +1185,9 @@ watch(
 <template>
   <div class="form-view-container">
     <div class="form-content">
-      <div class="draggable-list-container">
-      <div class="list-wrapper">
+      <div class="list-and-menu-wrapper">
+        <div class="draggable-list-container">
+        <div class="list-wrapper">
         <!-- Inputs Item (outside draggable) -->
         <div class="list-item inputs-item">
               <div class="list-item-header">
@@ -1687,6 +1685,45 @@ watch(
       </div>
     </div>
     </div>
+        <!-- Floating Action Menu (next to draggable list) -->
+        <div class="floating-menu">
+          <button 
+            @click="addItemAfterSelected"
+            class="menu-button"
+            title="Add step below"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M8 2C8.55228 2 9 2.44772 9 3V7H13C13.5523 7 14 7.44772 14 8C14 8.55228 13.5523 9 13 9H9V13C9 13.5523 8.55228 14 8 14C7.44772 14 7 13.5523 7 13V9H3C2.44772 9 2 8.55228 2 8C2 7.44772 2.44772 7 3 7H7V3C7 2.44772 7.44772 2 8 2Z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button 
+            @click="duplicateSelectedItem"
+            class="menu-button"
+            :disabled="selectedItemId === null || (items.find(i => i.id === selectedItemId)?.type !== 'step')"
+            title="Duplicate selected step"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M4 2C4 0.895431 4.89543 0 6 0H10C11.1046 0 12 0.895431 12 2V4H14C15.1046 4 16 4.89543 16 6V14C16 15.1046 15.1046 16 14 16H6C4.89543 16 4 15.1046 4 14V12H2C0.895431 12 0 11.1046 0 10V2C0 0.895431 0.895431 0 2 0H4V2ZM6 2V4H10V2H6ZM2 2V10H4V6C4 4.89543 4.89543 4 6 4H10V2H2ZM6 6V14H14V6H6Z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button 
+            @click="showSchemaModal = true"
+            class="menu-button"
+            title="Add custom type schema"
+          >
+            <span class="type-icon">T</span>
+          </button>
+          <button 
+            @click="exportManifest"
+            class="menu-button menu-button-export"
+            title="Export starthub-lock.json"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M8 1C8.55228 1 9 1.44772 9 2V6.58579L11.2929 4.29289C11.6834 3.90237 12.3166 3.90237 12.7071 4.29289C13.0976 4.68342 13.0976 5.31658 12.7071 5.70711L8.70711 9.70711C8.31658 10.0976 7.68342 10.0976 7.29289 9.70711L3.29289 5.70711C2.90237 5.31658 2.90237 4.68342 3.29289 4.29289C3.68342 3.90237 4.31658 3.90237 4.70711 4.29289L7 6.58579V2C7 1.44772 7.44772 1 8 1ZM2 11C2 10.4477 2.44772 10 3 10H13C13.5523 10 14 10.4477 14 11V13C14 13.5523 13.5523 14 13 14H3C2.44772 14 2 13.5523 2 13V11Z" fill="currentColor"/>
+            </svg>
+          </button>
+        </div>
+      </div>
     <!-- Schema Editor Modal -->
     <SchemaEditorModal 
       v-if="showSchemaModal"
@@ -1694,44 +1731,6 @@ watch(
       @save="handleSchemaSave"
     />
     </div>
-    <!-- Floating Action Menu (outside scrollable area) -->
-      <div class="floating-menu">
-        <button 
-          @click="addItemAfterSelected"
-          class="menu-button"
-          title="Add step below"
-        >
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M8 2C8.55228 2 9 2.44772 9 3V7H13C13.5523 7 14 7.44772 14 8C14 8.55228 13.5523 9 13 9H9V13C9 13.5523 8.55228 14 8 14C7.44772 14 7 13.5523 7 13V9H3C2.44772 9 2 8.55228 2 8C2 7.44772 2.44772 7 3 7H7V3C7 2.44772 7.44772 2 8 2Z" fill="currentColor"/>
-          </svg>
-        </button>
-        <button 
-          @click="duplicateSelectedItem"
-          class="menu-button"
-          :disabled="selectedItemId === null || (items.find(i => i.id === selectedItemId)?.type !== 'step')"
-          title="Duplicate selected step"
-        >
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M4 2C4 0.895431 4.89543 0 6 0H10C11.1046 0 12 0.895431 12 2V4H14C15.1046 4 16 4.89543 16 6V14C16 15.1046 15.1046 16 14 16H6C4.89543 16 4 15.1046 4 14V12H2C0.895431 12 0 11.1046 0 10V2C0 0.895431 0.895431 0 2 0H4V2ZM6 2V4H10V2H6ZM2 2V10H4V6C4 4.89543 4.89543 4 6 4H10V2H2ZM6 6V14H14V6H6Z" fill="currentColor"/>
-          </svg>
-        </button>
-        <button 
-          @click="showSchemaModal = true"
-          class="menu-button"
-          title="Add custom type schema"
-        >
-          <span class="type-icon">T</span>
-        </button>
-        <button 
-          @click="exportManifest"
-          class="menu-button menu-button-export"
-          title="Export starthub-lock.json"
-        >
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M8 1C8.55228 1 9 1.44772 9 2V6.58579L11.2929 4.29289C11.6834 3.90237 12.3166 3.90237 12.7071 4.29289C13.0976 4.68342 13.0976 5.31658 12.7071 5.70711L8.70711 9.70711C8.31658 10.0976 7.68342 10.0976 7.29289 9.70711L3.29289 5.70711C2.90237 5.31658 2.90237 4.68342 3.29289 4.29289C3.68342 3.90237 4.31658 3.90237 4.70711 4.29289L7 6.58579V2C7 1.44772 7.44772 1 8 1ZM2 11C2 10.4477 2.44772 10 3 10H13C13.5523 10 14 10.4477 14 11V13C14 13.5523 13.5523 14 13 14H3C2.44772 14 2 13.5523 2 13V11Z" fill="currentColor"/>
-          </svg>
-        </button>
-      </div>
     <div class="types-sidebar">
       <div class="types-sidebar-header">
         <h2>Types</h2>
@@ -1908,10 +1907,20 @@ watch(
   flex-shrink: 0;
 }
 
-.draggable-list-container {
+.list-and-menu-wrapper {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 1rem;
   margin: 2rem auto 0;
-  max-width: 800px;
-  width: 600px;
+  max-width: 900px;
+  padding: 0 2rem;
+  padding-bottom: 2rem;
+}
+
+.draggable-list-container {
+  flex: 0 0 600px;
+  max-width: 600px;
   padding-bottom: 2rem;
   position: relative;
 }
@@ -1924,9 +1933,9 @@ watch(
 }
 
 .floating-menu {
-  position: fixed;
-  top: 60px;
-  right: 320px; /* Account for types-sidebar width (300px) + some margin */
+  position: sticky;
+  top: 80px; /* Account for navbar height (60px) + some spacing */
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
@@ -1936,6 +1945,7 @@ watch(
   border-radius: 8px;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
   z-index: 100;
+  height: fit-content;
 }
 
 .menu-button {
