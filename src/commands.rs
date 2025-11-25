@@ -11,6 +11,7 @@ use dirs;
 
 use crate::models::{ShManifest, ShKind, ShPort, ShType};
 use crate::templates;
+use crate::config::SUPABASE_ANON_KEY;
 
 // Global constants for local development server
 const LOCAL_SERVER_URL: &str = "http://127.0.0.1:3000";
@@ -265,23 +266,177 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
 }
 
 pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
+    use uuid::Uuid;
+    use std::time::{Duration, Instant};
+    
     println!("🔐 Logging in to StartHub...");
     println!("🌐 API Base: {}", api_base);
     
-    // Open browser to editor for authentication
-    let editor_url = "https://editor.starthub.so/cli-auth";
+    // Generate a unique session ID
+    let session_id = Uuid::new_v4().to_string();
+    
+    // Open browser to editor for authentication with session_id
+    let editor_url = format!("https://registry.starthub.so/login?session_id={}", session_id);
     println!("🌐 Opening browser to: {}", editor_url);
     
-    match webbrowser::open(editor_url) {
+    match webbrowser::open(&editor_url) {
         Ok(_) => println!("✅ Browser opened for authentication"),
-        Err(e) => println!("⚠️  Could not open browser: {}. Please visit {}", e, editor_url),
+        Err(e) => {
+            println!("⚠️  Could not open browser: {}. Please visit {}", e, editor_url);
+            println!("📝 Copy and paste this URL into your browser: {}", editor_url);
+        }
     }
     
-    // For now, just show success message
-    println!("✅ Authentication flow initiated");
+    println!("⏳ Waiting for authentication to complete...");
     println!("📝 Please complete authentication in your browser");
     
-    Ok(())
+    // Poll for session completion using Supabase REST API
+    let client = reqwest::Client::new();
+    let deadline = Instant::now() + Duration::from_secs(600); // 10 minutes timeout
+    let poll_interval = Duration::from_secs(2); // Poll every 2 seconds
+    let mut poll_count = 0;
+    let start_time = Instant::now();
+    
+    println!("🔍 Polling for authentication completion...");
+    println!("📡 Session ID: {}", session_id);
+    
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!("Authentication timed out after 10 minutes. Please try again.");
+        }
+        
+        poll_count += 1;
+        if poll_count % 15 == 0 {
+            // Every 30 seconds (15 polls * 2 seconds), show a status message
+            let elapsed = start_time.elapsed();
+            println!("\n⏳ Still waiting... ({} seconds elapsed)", elapsed.as_secs());
+        }
+        
+        // Poll for the session using Supabase REST API
+        // Try both the edge function endpoint and REST API endpoint
+        let poll_urls = vec![
+            format!("{}/functions/v1/cli-sessions/{}", api_base, session_id),
+            format!("{}/rest/v1/cli_sessions?session_id=eq.{}&select=access_token", api_base, session_id),
+        ];
+        for poll_url in &poll_urls {
+            let mut request = client
+                .get(poll_url)
+                .header("Accept", "application/json")
+                .timeout(Duration::from_secs(5));
+            
+            // Add Supabase anon key for REST API requests
+            if poll_url.contains("/rest/v1/") {
+                request = request.header("apikey", SUPABASE_ANON_KEY);
+                request = request.header("Authorization", format!("Bearer {}", SUPABASE_ANON_KEY));
+            }
+            
+            match request.send().await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    let response_text = response.text().await.unwrap_or_default();
+                    
+                    if status.is_success() {
+                        let data: serde_json::Value = match serde_json::from_str(&response_text) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                // Log the raw response on first error to help debug
+                                if poll_count == 1 {
+                                    eprintln!("\n⚠️  Failed to parse JSON response from {}: {}", poll_url, e);
+                                    eprintln!("   Raw response: {}", response_text);
+                                } else if poll_count % 30 == 0 {
+                                    eprintln!("\n⚠️  Failed to parse JSON response: {}", e);
+                                }
+                                continue;
+                            }
+                        };
+                        
+                        // Log the full response on first successful call for debugging
+                        if poll_count == 1 {
+                            println!("\n🔍 Debug: First successful response from {}: {}", poll_url, serde_json::to_string_pretty(&data).unwrap_or_default());
+                        }
+                        
+                        // Handle both array response (REST API) and object response (edge function)
+                        let access_token = if let Some(sessions) = data.as_array() {
+                            // REST API returns array
+                            if poll_count == 1 {
+                                println!("   Response is an array with {} items", sessions.len());
+                            }
+                            sessions.first()
+                                .and_then(|s| s.get("access_token"))
+                                .and_then(|v| v.as_str())
+                        } else if let Some(token) = data.get("access_token").and_then(|v| v.as_str()) {
+                            // Edge function returns object
+                            if poll_count == 1 {
+                                println!("   Response is an object with access_token field");
+                            }
+                            Some(token)
+                        } else {
+                            // Log what fields we do have
+                            if poll_count == 1 {
+                                if let Some(obj) = data.as_object() {
+                                    let keys: Vec<&String> = obj.keys().collect();
+                                    println!("   Response object has keys: {:?}", keys);
+                                }
+                            }
+                            None
+                        };
+                        
+                        if let Some(token) = access_token {
+                            if !token.is_empty() {
+                                // Store the token
+                                let config_dir = dirs::config_dir()
+                                    .ok_or_else(|| anyhow::anyhow!("Could not determine config directory"))?
+                                    .join("starthub");
+                                
+                                fs::create_dir_all(&config_dir)?;
+                                
+                                let token_file = config_dir.join("token");
+                                fs::write(&token_file, token)?;
+                                
+                                println!("\n✅ Authentication successful!");
+                                println!("🔑 Token saved to: {}", token_file.display());
+                                return Ok(());
+                            } else {
+                                if poll_count == 1 {
+                                    eprintln!("\n⚠️  Found access_token field but it's empty");
+                                }
+                            }
+                        } else {
+                            // Log the response structure for debugging
+                            if poll_count == 1 || poll_count % 60 == 0 {
+                                eprintln!("\n🔍 Debug: Got successful response but no access_token. Full response: {}", serde_json::to_string_pretty(&data).unwrap_or_default());
+                            }
+                        }
+                    } else if status == 404 {
+                        // Session not found yet, continue polling
+                        if poll_count == 1 {
+                            println!("\n🔍 Debug: Got 404 from {} (session not found yet, this is normal)", poll_url);
+                        }
+                    } else {
+                        // Log unexpected status codes for debugging
+                        if poll_count == 1 || poll_count % 30 == 0 {
+                            eprintln!("\n⚠️  Unexpected response status {} from {}: {}", status, poll_url, response_text);
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Log errors on first attempt and periodically
+                    if poll_count == 1 {
+                        eprintln!("\n⚠️  Polling error for {}: {}", poll_url, e);
+                    } else if poll_count % 30 == 0 {
+                        eprintln!("\n⚠️  Polling error for {} (will retry): {}", poll_url, e);
+                    }
+                }
+            }
+        }
+        
+        // Wait before next poll
+        sleep(poll_interval).await;
+        print!(".");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+    }
 }
 
 pub async fn cmd_logout_starthub() -> anyhow::Result<()> {

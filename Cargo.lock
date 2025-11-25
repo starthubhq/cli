@@ -4007,6 +4007,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "webbrowser",
  "which 6.0.3",
  "zip",

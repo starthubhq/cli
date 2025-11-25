@@ -22,7 +22,7 @@ The `login` command initiates the authentication process with Starthub. It opens
 
 ## Authentication Flow
 
-1. The command opens your browser to `https://editor.starthub.so/cli-auth`
+1. The command opens your browser to `https://registry.starthub.so/cli-auth`
 2. Complete the authentication in your browser
 3. Your authentication token will be stored locally for future CLI operations
 
