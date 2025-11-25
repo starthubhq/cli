@@ -333,7 +333,7 @@ See `server/README.md` for detailed server documentation.
 
 ## License
 
-See the main project license for details.
+See the main project license for details..
 
 ## Links
 
