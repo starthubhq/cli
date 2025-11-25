@@ -213,7 +213,7 @@ pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
     println!("🌐 API Base: {}", api_base);
     
     // Open browser to editor for authentication
-    let editor_url = "https://editor.starthub.so/cli-auth";
+    let editor_url = "https://registry.starthub.so/cli-auth";
     println!("🌐 Opening browser to: {}", editor_url);
     
     match webbrowser::open(editor_url) {
