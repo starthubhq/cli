@@ -48,11 +48,14 @@ jobs:
           node-version: 22.4
 
       - name: Build console UI
+        working-directory: ./console
         run: |
-          cd console
           npm ci
           npm run build
-          cd ..
+
+      - name: Copy console dist to server/ui
+        shell: bash
+        run: |
           mkdir -p server/ui
           cp -r console/dist server/ui/dist
 
