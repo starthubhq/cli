@@ -11,16 +11,16 @@ const navigationItems = [
   //   path: '/',
   //   icon: ''
   // },
-  {
-    name: 'New',
-    path: '/form',
-    icon: ''
-  },
-  {
-    name: 'My actions',
-    path: '/my-actions',
-    icon: ''
-  }
+  // {
+  //   name: 'New',
+  //   path: '/new',
+  //   icon: ''
+  // },
+  // {
+  //   name: 'My actions',
+  //   path: '/my-actions',
+  //   icon: ''
+  // }
 ]
 
 const isActive = (path: string) => {
@@ -84,12 +84,15 @@ const handleLogin = () => {
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   padding: 0;
   height: 60px;
+  min-height: 60px;
+  max-height: 60px;
   display: flex;
   align-items: center;
   position: sticky;
   top: 0;
   z-index: 1000;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  box-sizing: border-box;
 }
 
 .navbar-container {
@@ -100,7 +103,10 @@ const handleLogin = () => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  height: 100%;
+  height: 60px;
+  min-height: 60px;
+  max-height: 60px;
+  box-sizing: border-box;
 }
 
 .navbar-left {
