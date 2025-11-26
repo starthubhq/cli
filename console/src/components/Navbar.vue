@@ -12,8 +12,13 @@ const navigationItems = [
   //   icon: ''
   // },
   {
-    name: 'Build',
+    name: 'New',
     path: '/form',
+    icon: ''
+  },
+  {
+    name: 'My actions',
+    path: '/my-actions',
     icon: ''
   }
 ]
@@ -65,9 +70,9 @@ const handleLogin = () => {
       </div>
       
       <div class="navbar-right">
-        <button class="login-button" @click="handleLogin">
+        <!-- <button class="login-button" @click="handleLogin">
           <span class="login-text">Login</span>
-        </button>
+        </button> -->
       </div>
     </div>
   </nav>
