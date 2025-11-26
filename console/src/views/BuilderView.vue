@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import { ref, onMounted, watch, computed } from 'vue'
 import draggable from 'vuedraggable'
+import { useRoute } from 'vue-router'
 import { useSearchStore } from '@/stores/search'
 import { supabase } from '@/lib/supabase'
 import SchemaEditorModal from '@/components/SchemaEditorModal.vue'
 
+const route = useRoute()
 const searchStore = useSearchStore()
+
+// Get action identifiers from route params
+const namespace = computed(() => route.params.namespace as string)
+const slug = computed(() => route.params.slug as string)
+const version = computed(() => route.params.version as string)
+const actionId = ref<string | null>(null)
 
 interface ActionInput {
   name: string
@@ -131,6 +139,32 @@ const outputTypeErrors = ref<Record<string, string>>({})
 // Fetch actions on mount
 onMounted(async () => {
   await searchStore.fetchActions()
+  
+  // Fetch the action by namespace/slug/version
+  if (namespace.value && slug.value && version.value) {
+    try {
+      const namespaceParam = namespace.value === 'null' || namespace.value === '' ? 'null' : namespace.value
+      const response = await fetch(`http://localhost:3000/api/actions/${namespaceParam}/${slug.value}/${version.value}`)
+      if (response.ok) {
+        const actionData = await response.json()
+        actionId.value = actionData.id
+        
+        // Load manifest if it exists
+        if (actionData.version?.manifest) {
+          try {
+            const manifest = JSON.parse(actionData.version.manifest)
+            await loadManifest(manifest)
+          } catch (e) {
+            console.error('Failed to parse manifest:', e)
+          }
+        }
+      } else {
+        console.error('Failed to fetch action:', response.status, response.statusText)
+      }
+    } catch (err) {
+      console.error('Error fetching action:', err)
+    }
+  }
 })
 
 // Function to handle search for a specific item
@@ -423,7 +457,6 @@ function addItemAfterSelected() {
       manifestError: null,
       inputMappings: {}
     })
-    selectedItemId.value = newId
     return
   }
   
@@ -445,7 +478,6 @@ function addItemAfterSelected() {
       manifestError: null,
       inputMappings: {}
     })
-    selectedItemId.value = newId
     return
   }
 
@@ -465,7 +497,6 @@ function addItemAfterSelected() {
   }
 
   items.value.splice(itemIndex + 1, 0, newItem)
-  selectedItemId.value = newId
 }
 
 // Function to add inputs item
@@ -760,6 +791,374 @@ function exportManifest() {
   link.click()
   document.body.removeChild(link)
   URL.revokeObjectURL(url)
+}
+
+// Helper function to find an action by its uses string (namespace/slug:version)
+function findActionByUses(uses: string): any | null {
+  // Parse uses string: "namespace/slug:version" or "slug:version" or "namespace/slug"
+  const parts = uses.split(':')
+  const version = parts.length > 1 ? parts[1] : null
+  const namespaceSlug = parts[0]
+  const namespaceSlugParts = namespaceSlug.split('/')
+  const namespace = namespaceSlugParts.length > 1 ? namespaceSlugParts[0] : null
+  const slug = namespaceSlugParts.length > 1 ? namespaceSlugParts[1] : namespaceSlugParts[0]
+  
+  // Search in the actions list
+  return searchStore.actions.find(action => {
+    const actionNamespace = action.namespace || null
+    const actionSlug = action.slug
+    const actionVersion = action.version || null
+    
+    // Match namespace (both null or both equal)
+    const namespaceMatch = (namespace === null && actionNamespace === null) || 
+                           (namespace === actionNamespace)
+    
+    // Match slug
+    const slugMatch = slug === actionSlug
+    
+    // Match version (if version is specified in uses)
+    if (version) {
+      return namespaceMatch && slugMatch && actionVersion === version
+    } else {
+      return namespaceMatch && slugMatch
+    }
+  }) || null
+}
+
+// Helper function to parse a template string and extract mapping information
+// Returns mapping with stepName for step references (to be resolved later)
+function parseTemplateString(template: string): (InputMapping | OutputMapping) & { stepName?: string } | null {
+  if (typeof template !== 'string' || !template.startsWith('{{') || !template.endsWith('}}')) {
+    // Not a template string, treat as literal
+    return {
+      sourceType: 'literal',
+      literalValue: template
+    }
+  }
+  
+  // Remove {{ and }}
+  const content = template.slice(2, -2).trim()
+  
+  // Parse inputs[0] or inputs[0].property
+  const inputMatch = content.match(/^inputs\[(\d+)\](?:\.(.+))?$/)
+  if (inputMatch) {
+    const mapping: InputMapping = {
+      sourceType: 'input',
+      sourceIndex: parseInt(inputMatch[1], 10)
+    }
+    if (inputMatch[2]) {
+      mapping.sourceProperty = inputMatch[2]
+    }
+    return mapping
+  }
+  
+  // Parse steps.step_X.outputs[0] or steps.step_X.outputs[0].property
+  // Extract the step name (step_X) for later resolution
+  const stepMatch = content.match(/^steps\.(step_\d+)\.outputs\[(\d+)\](?:\.(.+))?$/)
+  if (stepMatch) {
+    const stepName = stepMatch[1]
+    const stepIdFromName = parseInt(stepName.replace('step_', ''), 10)
+    const mapping: (InputMapping | OutputMapping) & { stepName?: string } = {
+      sourceType: 'step',
+      sourceStepId: stepIdFromName, // Temporary, will be resolved
+      sourceOutputIndex: parseInt(stepMatch[2], 10),
+      stepName: stepName // Store the step name for resolution
+    }
+    if (stepMatch[3]) {
+      mapping.sourceProperty = stepMatch[3]
+    }
+    return mapping
+  }
+  
+  // If no match, treat as literal
+  return {
+    sourceType: 'literal',
+    literalValue: template
+  }
+}
+
+// Function to load manifest into the builder
+async function loadManifest(manifest: any) {
+  // Clear existing data
+  compositionInputs.value = []
+  compositionOutputs.value = []
+  outputMappings.value = {}
+  items.value = []
+  typesList.value = []
+  
+  // Load inputs
+  if (manifest.inputs && Array.isArray(manifest.inputs)) {
+    compositionInputs.value = manifest.inputs.map((input: any) => ({
+      name: input.name || '',
+      type: input.type || 'string',
+      description: input.description || null,
+      required: input.required,
+      default: input.default
+    }))
+  }
+  
+  // Load types (custom types)
+  if (manifest.types && typeof manifest.types === 'object') {
+    Object.entries(manifest.types).forEach(([typeName, typeDefinition]) => {
+      typesList.value.push({
+        name: typeName,
+        definition: typeDefinition,
+        source: 'custom'
+      })
+    })
+  }
+  
+  // Map to store step name -> step ID mapping (used for resolving step references in mappings)
+  const stepNameToIdMap: Record<string, number> = {}
+  
+  // Load steps
+  if (manifest.steps && typeof manifest.steps === 'object') {
+    const stepEntries = Object.entries(manifest.steps)
+    let nextItemId = 2 // Start from 2 to match initial state
+    
+    // First pass: create all step items and map step names to IDs
+    for (const [stepName, stepData] of stepEntries) {
+      const stepInfo = stepData as any
+      const uses = stepInfo.uses
+      
+      if (!uses) continue
+      
+      // Find the action by uses string
+      const action = findActionByUses(uses)
+      
+      if (!action) {
+        console.warn(`Action not found for uses: ${uses}`)
+        continue
+      }
+      
+      // Extract step ID from step name (step_1 -> 1) or use next available ID
+      const stepIdMatch = stepName.match(/^step_(\d+)$/)
+      let stepId: number
+      if (stepIdMatch) {
+        const requestedId = parseInt(stepIdMatch[1], 10)
+        // Check if this ID is already used
+        if (items.value.find(i => i.id === requestedId)) {
+          stepId = nextItemId++
+        } else {
+          stepId = requestedId
+        }
+      } else {
+        stepId = nextItemId++
+      }
+      
+      stepNameToIdMap[stepName] = stepId
+      
+      // Create the step item
+      const stepItem: ListItem = {
+        id: stepId,
+        type: 'step',
+        name: '',
+        description: '',
+        query: action.slug,
+        selectedAction: {
+          id: action.id,
+          slug: action.slug,
+          description: action.description,
+          namespace: action.namespace,
+          version: action.version
+        },
+        manifest: null,
+        isLoadingManifest: false,
+        manifestError: null,
+        inputMappings: {}
+      }
+      
+      items.value.push(stepItem)
+      
+      // Fetch the manifest for this action to get inputs/outputs
+      await fetchManifest(stepId, action)
+    }
+    
+    // Wait for all manifests to load
+    await new Promise(resolve => setTimeout(resolve, 300))
+    
+    // Helper function to resolve step ID from step name
+    const resolveStepIdFromStepName = (stepName: string): number | undefined => {
+      return stepNameToIdMap[stepName]
+    }
+    
+    // Second pass: parse input mappings (now that manifests are loaded)
+    for (const [stepName, stepData] of stepEntries) {
+      const stepInfo = stepData as any
+      const stepId = stepNameToIdMap[stepName]
+      if (!stepId) continue
+      
+      const item = items.value.find(i => i.id === stepId)
+      if (!item) continue
+      
+      const stepInputs = stepInfo.inputs
+      if (stepInputs && Array.isArray(stepInputs) && item.manifest?.inputs) {
+        // Check if it's object format (array with one object) or array format
+        const isObjectFormat = stepInputs.length === 1 && 
+                               typeof stepInputs[0] === 'object' && 
+                               stepInputs[0] !== null &&
+                               !Array.isArray(stepInputs[0])
+        
+        if (isObjectFormat) {
+          // Object format: { inputName: "{{...}}", ... }
+          const inputObj = stepInputs[0]
+          item.manifest.inputs.forEach((input: ActionInput) => {
+            const templateValue = inputObj[input.name]
+            if (templateValue !== undefined) {
+              const mapping = parseTemplateString(String(templateValue)) as InputMapping & { stepName?: string }
+              if (mapping) {
+                // Update step IDs in mappings to match loaded step IDs
+                if (mapping.sourceType === 'step' && mapping.stepName) {
+                  const resolvedId = resolveStepIdFromStepName(mapping.stepName)
+                  if (resolvedId !== undefined) {
+                    mapping.sourceStepId = resolvedId
+                  }
+                  // Remove stepName from mapping as it's no longer needed
+                  delete (mapping as any).stepName
+                }
+                item.inputMappings[input.name] = mapping
+              }
+            }
+          })
+        } else {
+          // Array format: ["{{...}}", "{{...}}", ...]
+          item.manifest.inputs.forEach((input: ActionInput, index: number) => {
+            const templateValue = stepInputs[index]
+            if (templateValue !== undefined) {
+              const mapping = parseTemplateString(String(templateValue)) as InputMapping & { stepName?: string }
+              if (mapping) {
+                // Update step IDs in mappings to match loaded step IDs
+                if (mapping.sourceType === 'step' && mapping.stepName) {
+                  const resolvedId = resolveStepIdFromStepName(mapping.stepName)
+                  if (resolvedId !== undefined) {
+                    mapping.sourceStepId = resolvedId
+                  }
+                  // Remove stepName from mapping as it's no longer needed
+                  delete (mapping as any).stepName
+                }
+                item.inputMappings[input.name] = mapping
+              }
+            }
+          })
+        }
+      }
+    }
+    
+    // Load outputs (after steps are loaded so we can resolve step IDs)
+    if (manifest.outputs && Array.isArray(manifest.outputs)) {
+      compositionOutputs.value = manifest.outputs.map((output: any) => ({
+        name: output.name || '',
+        type: output.type || 'string',
+        description: output.description || null,
+        required: output.required
+      }))
+      
+      // Parse output mappings from the value field
+      manifest.outputs.forEach((output: any) => {
+        if (output.value) {
+          const mapping = parseTemplateString(output.value) as OutputMapping & { stepName?: string }
+          if (mapping) {
+            // Update step IDs in mappings to match loaded step IDs
+            if (mapping.sourceType === 'step' && mapping.stepName) {
+              const resolvedId = resolveStepIdFromStepName(mapping.stepName)
+              if (resolvedId !== undefined) {
+                mapping.sourceStepId = resolvedId
+              }
+              // Remove stepName from mapping as it's no longer needed
+              delete (mapping as any).stepName
+            }
+            outputMappings.value[output.name] = mapping
+          }
+        }
+      })
+    }
+  } else {
+    // If no steps, still load outputs
+    if (manifest.outputs && Array.isArray(manifest.outputs)) {
+      compositionOutputs.value = manifest.outputs.map((output: any) => ({
+        name: output.name || '',
+        type: output.type || 'string',
+        description: output.description || null,
+        required: output.required
+      }))
+      
+      // Parse output mappings from the value field
+      manifest.outputs.forEach((output: any) => {
+        if (output.value) {
+          const mapping = parseTemplateString(output.value) as OutputMapping
+          if (mapping) {
+            outputMappings.value[output.name] = mapping
+          }
+        }
+      })
+    }
+  }
+}
+
+// Save state
+const isSaving = ref(false)
+const saveError = ref<string | null>(null)
+const saveSuccess = ref(false)
+
+// Function to save manifest to database
+async function saveManifest() {
+  if (!actionId.value || !namespace.value || !slug.value || !version.value) {
+    saveError.value = 'Missing action information'
+    return
+  }
+
+  isSaving.value = true
+  saveError.value = null
+  saveSuccess.value = false
+
+  try {
+    const manifest = buildManifest()
+    const manifestString = JSON.stringify(manifest, null, 2)
+
+    // Get the action and version by namespace/slug/version
+    const namespaceParam = namespace.value === 'null' || namespace.value === '' ? 'null' : namespace.value
+    const actionResponse = await fetch(`http://localhost:3000/api/actions/${namespaceParam}/${slug.value}/${version.value}`)
+    if (!actionResponse.ok) {
+      throw new Error('Failed to fetch action')
+    }
+
+    const actionData = await actionResponse.json()
+    const versionId = actionData.version?.id
+
+    if (!versionId) {
+      throw new Error('No version found for this action')
+    }
+
+    // Update the version's manifest
+    const updateResponse = await fetch(`http://localhost:3000/api/actions/${actionId.value}/versions/${versionId}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      body: JSON.stringify({
+        manifest: manifestString,
+      }),
+    })
+
+    if (!updateResponse.ok) {
+      const text = await updateResponse.text()
+      throw new Error(`Failed to save manifest: ${updateResponse.status} ${updateResponse.statusText}. ${text}`)
+    }
+
+    saveSuccess.value = true
+    setTimeout(() => {
+      saveSuccess.value = false
+    }, 3000)
+  } catch (err: any) {
+    console.error('Error saving manifest:', err)
+    saveError.value = err.message || 'Failed to save manifest'
+    setTimeout(() => {
+      saveError.value = null
+    }, 5000)
+  } finally {
+    isSaving.value = false
+  }
 }
 
 // Function to get composition inputs (for mapping)
@@ -1188,8 +1587,9 @@ watch(
 <template>
   <div class="form-view-container">
     <div class="form-content">
-      <div class="draggable-list-container">
-      <div class="list-wrapper">
+      <div class="list-and-menu-wrapper">
+        <div class="draggable-list-container">
+        <div class="list-wrapper">
         <!-- Inputs Item (outside draggable) -->
         <div class="list-item inputs-item">
               <div class="list-item-header">
@@ -1687,6 +2087,61 @@ watch(
       </div>
     </div>
     </div>
+        <!-- Floating Action Menu (next to draggable list) -->
+        <div class="floating-menu">
+          <div v-if="saveError" class="save-error-message">
+            {{ saveError }}
+          </div>
+          <div v-if="saveSuccess" class="save-success-message">
+            Manifest saved successfully!
+          </div>
+          <button 
+            @click="addItemAfterSelected"
+            class="menu-button"
+            title="Add step below"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M8 2C8.55228 2 9 2.44772 9 3V7H13C13.5523 7 14 7.44772 14 8C14 8.55228 13.5523 9 13 9H9V13C9 13.5523 8.55228 14 8 14C7.44772 14 7 13.5523 7 13V9H3C2.44772 9 2 8.55228 2 8C2 7.44772 2.44772 7 3 7H7V3C7 2.44772 7.44772 2 8 2Z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button 
+            @click="duplicateSelectedItem"
+            class="menu-button"
+            :disabled="selectedItemId === null || (items.find(i => i.id === selectedItemId)?.type !== 'step')"
+            title="Duplicate selected step"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M4 2C4 0.895431 4.89543 0 6 0H10C11.1046 0 12 0.895431 12 2V4H14C15.1046 4 16 4.89543 16 6V14C16 15.1046 15.1046 16 14 16H6C4.89543 16 4 15.1046 4 14V12H2C0.895431 12 0 11.1046 0 10V2C0 0.895431 0.895431 0 2 0H4V2ZM6 2V4H10V2H6ZM2 2V10H4V6C4 4.89543 4.89543 4 6 4H10V2H2ZM6 6V14H14V6H6Z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button 
+            @click="showSchemaModal = true"
+            class="menu-button"
+            title="Add custom type schema"
+          >
+            <span class="type-icon">T</span>
+          </button>
+          <button 
+            @click="saveManifest"
+            class="menu-button menu-button-save"
+            :disabled="isSaving"
+            title="Save manifest to database"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M2 1C1.44772 1 1 1.44772 1 2V14C1 14.5523 1.44772 15 2 15H14C14.5523 15 15 14.5523 15 14V4.41421C15 4.149 14.8946 3.89464 14.7071 3.70711L12.2929 1.29289C12.1054 1.10536 11.851 1 11.5858 1H2ZM2 2H11V5H14V14H2V2ZM3 3V13H13V6H10V3H3ZM4 3H9V5H4V3Z" fill="currentColor"/>
+            </svg>
+          </button>
+          <button 
+            @click="exportManifest"
+            class="menu-button menu-button-export"
+            title="Export starthub-lock.json"
+          >
+            <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M8 1C8.55228 1 9 1.44772 9 2V6.58579L11.2929 4.29289C11.6834 3.90237 12.3166 3.90237 12.7071 4.29289C13.0976 4.68342 13.0976 5.31658 12.7071 5.70711L8.70711 9.70711C8.31658 10.0976 7.68342 10.0976 7.29289 9.70711L3.29289 5.70711C2.90237 5.31658 2.90237 4.68342 3.29289 4.29289C3.68342 3.90237 4.31658 3.90237 4.70711 4.29289L7 6.58579V2C7 1.44772 7.44772 1 8 1ZM2 11C2 10.4477 2.44772 10 3 10H13C13.5523 10 14 10.4477 14 11V13C14 13.5523 13.5523 14 13 14H3C2.44772 14 2 13.5523 2 13V11Z" fill="currentColor"/>
+            </svg>
+          </button>
+        </div>
+      </div>
     <!-- Schema Editor Modal -->
     <SchemaEditorModal 
       v-if="showSchemaModal"
@@ -1694,44 +2149,6 @@ watch(
       @save="handleSchemaSave"
     />
     </div>
-    <!-- Floating Action Menu (outside scrollable area) -->
-      <div class="floating-menu">
-        <button 
-          @click="addItemAfterSelected"
-          class="menu-button"
-          title="Add step below"
-        >
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M8 2C8.55228 2 9 2.44772 9 3V7H13C13.5523 7 14 7.44772 14 8C14 8.55228 13.5523 9 13 9H9V13C9 13.5523 8.55228 14 8 14C7.44772 14 7 13.5523 7 13V9H3C2.44772 9 2 8.55228 2 8C2 7.44772 2.44772 7 3 7H7V3C7 2.44772 7.44772 2 8 2Z" fill="currentColor"/>
-          </svg>
-        </button>
-        <button 
-          @click="duplicateSelectedItem"
-          class="menu-button"
-          :disabled="selectedItemId === null || (items.find(i => i.id === selectedItemId)?.type !== 'step')"
-          title="Duplicate selected step"
-        >
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M4 2C4 0.895431 4.89543 0 6 0H10C11.1046 0 12 0.895431 12 2V4H14C15.1046 4 16 4.89543 16 6V14C16 15.1046 15.1046 16 14 16H6C4.89543 16 4 15.1046 4 14V12H2C0.895431 12 0 11.1046 0 10V2C0 0.895431 0.895431 0 2 0H4V2ZM6 2V4H10V2H6ZM2 2V10H4V6C4 4.89543 4.89543 4 6 4H10V2H2ZM6 6V14H14V6H6Z" fill="currentColor"/>
-          </svg>
-        </button>
-        <button 
-          @click="showSchemaModal = true"
-          class="menu-button"
-          title="Add custom type schema"
-        >
-          <span class="type-icon">T</span>
-        </button>
-        <button 
-          @click="exportManifest"
-          class="menu-button menu-button-export"
-          title="Export starthub-lock.json"
-        >
-          <svg width="20" height="20" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <path d="M8 1C8.55228 1 9 1.44772 9 2V6.58579L11.2929 4.29289C11.6834 3.90237 12.3166 3.90237 12.7071 4.29289C13.0976 4.68342 13.0976 5.31658 12.7071 5.70711L8.70711 9.70711C8.31658 10.0976 7.68342 10.0976 7.29289 9.70711L3.29289 5.70711C2.90237 5.31658 2.90237 4.68342 3.29289 4.29289C3.68342 3.90237 4.31658 3.90237 4.70711 4.29289L7 6.58579V2C7 1.44772 7.44772 1 8 1ZM2 11C2 10.4477 2.44772 10 3 10H13C13.5523 10 14 10.4477 14 11V13C14 13.5523 13.5523 14 13 14H3C2.44772 14 2 13.5523 2 13V11Z" fill="currentColor"/>
-          </svg>
-        </button>
-      </div>
     <div class="types-sidebar">
       <div class="types-sidebar-header">
         <h2>Types</h2>
@@ -1908,10 +2325,20 @@ watch(
   flex-shrink: 0;
 }
 
-.draggable-list-container {
+.list-and-menu-wrapper {
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 1rem;
   margin: 2rem auto 0;
-  max-width: 800px;
-  width: 600px;
+  max-width: 900px;
+  padding: 0 2rem;
+  padding-bottom: 2rem;
+}
+
+.draggable-list-container {
+  flex: 0 0 600px;
+  max-width: 600px;
   padding-bottom: 2rem;
   position: relative;
 }
@@ -1924,9 +2351,9 @@ watch(
 }
 
 .floating-menu {
-  position: fixed;
-  top: 60px;
-  right: 320px; /* Account for types-sidebar width (300px) + some margin */
+  position: sticky;
+  top: 80px; /* Account for navbar height (60px) + some spacing */
+  flex-shrink: 0;
   display: flex;
   flex-direction: column;
   gap: 0.5rem;
@@ -1936,6 +2363,7 @@ watch(
   border-radius: 8px;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
   z-index: 100;
+  height: fit-content;
 }
 
 .menu-button {
@@ -1974,6 +2402,38 @@ watch(
   width: 1px;
   background: #e2e8f0;
   margin: 0.5rem 0;
+}
+
+.save-error-message {
+  padding: 0.5rem 0.75rem;
+  background: #fee2e2;
+  border: 1px solid #fecaca;
+  border-radius: 6px;
+  color: #991b1b;
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+.save-success-message {
+  padding: 0.5rem 0.75rem;
+  background: #d1fae5;
+  border: 1px solid #a7f3d0;
+  border-radius: 6px;
+  color: #065f46;
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+}
+
+.menu-button-save {
+  background: #3182ce;
+  border-color: #3182ce;
+  color: white;
+}
+
+.menu-button-save:hover:not(:disabled) {
+  background: #2563eb;
+  border-color: #2563eb;
+  color: white;
 }
 
 .menu-button-export {

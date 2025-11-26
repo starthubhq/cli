@@ -48,3 +48,4 @@ uuid = { version = "1.0", features = ["v4"] }
 petgraph = "0.6"
 jsonschema = "0.18"
 dotenv = "0.15"
+rusqlite = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }

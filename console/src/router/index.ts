@@ -1,20 +1,40 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import HomeView from '../views/HomeView.vue'
-import FormView from '@/views/FormView.vue'
+import RunView from '../views/RunView.vue'
+import HomeView from '@/views/HomeView.vue'
+import MyActionsView from '@/views/MyActionsView.vue'
+import ActionNewView from '@/views/ActionNewView.vue'
+import BuilderView from '@/views/BuilderView.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
   routes: [
     {
-      path: '/:namespace/:slug/:version',
+      path: '/',
       name: 'home',
-      component: HomeView,
+      component: MyActionsView,
     },
     {
-      path: '/form',
-      name: 'form',
+      path: '/:namespace/:slug/:version/edit',
+      name: 'edit',
       meta: { requiresAuth: false },
-      component: FormView
+      component: BuilderView
+    },
+    {
+      path: '/:namespace/:slug/:version',
+      name: 'run--details',
+      component: RunView,
+    },
+    {
+      path: '/my-actions',
+      name: 'my-actions',
+      meta: { requiresAuth: false },
+      component: MyActionsView
+    },
+    {
+      path: '/new',
+      name: 'new',
+      meta: { requiresAuth: false },
+      component: ActionNewView
     }
   ],
 })

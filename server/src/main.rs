@@ -1,9 +1,9 @@
 use anyhow::Result;
 use axum::{
-    routing::{get, post},
+    routing::{get, post, patch},
     response::{Html, Json},
     Router,
-    extract::ws::{WebSocketUpgrade, Message},
+    extract::{ws::{WebSocketUpgrade, Message}, Path},
     response::IntoResponse,
 };
 use tokio::net::TcpListener;
@@ -18,8 +18,10 @@ use std::fs;
 use clap::Parser;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use starthub_server::{ execution};
+use starthub_server::{ execution, database};
 use execution::ExecutionEngine;
+use database::Database;
+use uuid::Uuid;
 
 // Global constants for local development server
 const LOCAL_SERVER_HOST: &str = "127.0.0.1:3000";
@@ -39,19 +41,25 @@ struct ServerCli {
 struct AppState {
     ws_sender: broadcast::Sender<String>,
     execution_engine: Arc<Mutex<ExecutionEngine>>,
+    database: Arc<Mutex<Database>>,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new() -> Result<Self> {
         // Initialize execution engine
         let execution_engine = ExecutionEngine::new();
         let ws_sender = execution_engine.get_ws_sender().unwrap();
         let execution_engine = Arc::new(Mutex::new(execution_engine));
         
-        Self { 
+        // Initialize database
+        let database = Database::new()?;
+        let database = Arc::new(Mutex::new(database));
+        
+        Ok(Self { 
             ws_sender,
             execution_engine,
-        }
+            database,
+        })
     }
 }
 
@@ -72,7 +80,7 @@ async fn main() -> Result<()> {
 
 async fn start_server(bind_addr: &str) -> Result<()> {
     // Create shared state
-    let state = AppState::new();
+    let state = AppState::new()?;
     
     // Get the UI directory path relative to the binary
     let ui_dir = get_ui_directory()?;
@@ -80,6 +88,10 @@ async fn start_server(bind_addr: &str) -> Result<()> {
     
     // Create router with UI routes and API endpoints
     let app = Router::new()
+        .route("/api/actions", get(handle_get_actions).post(handle_create_action))
+        .route("/api/actions/:id", get(handle_get_action))
+        .route("/api/actions/:namespace/:slug/:version", get(handle_get_action_by_ref))
+        .route("/api/actions/:id/versions/:version_id", patch(handle_update_version))
         .route("/api/run", post(handle_run))
         .route("/ws", get(ws_handler)) // WebSocket endpoint
         .nest_service("/assets", ServeDir::new(assets_dir))
@@ -310,4 +322,378 @@ async fn handle_ws(socket: axum::extract::ws::WebSocket, state: AppState) {
 
     // Clean up the forward task
     forward_task.abort();
+}
+
+#[axum::debug_handler]
+async fn handle_get_actions(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<i32>().ok())
+        .or(Some(100));
+    let namespace = params.get("namespace").map(|s| s.as_str());
+
+    let db = state.database.lock().await;
+    match db.get_actions_with_latest_version(limit, namespace) {
+        Ok(actions) => {
+            let response: Vec<Value> = actions
+                .into_iter()
+                .map(|av| {
+                    json!({
+                        "id": av.action.id,
+                        "created_at": av.action.created_at,
+                        "description": av.action.description,
+                        "slug": av.action.slug,
+                        "rls_owner_id": av.action.rls_owner_id,
+                        "git_allowed_repository_id": av.action.git_allowed_repository_id,
+                        "kind": av.action.kind,
+                        "namespace": av.action.namespace,
+                        "download_count": av.action.download_count,
+                        "is_sync": av.action.is_sync,
+                        "latest_action_version_id": av.action.latest_action_version_id,
+                        "latest_version": av.latest_version.map(|v| json!({
+                            "id": v.id,
+                            "created_at": v.created_at,
+                            "action_id": v.action_id,
+                            "version_number": v.version_number,
+                            "commit_sha": v.commit_sha,
+                            "manifest": v.manifest,
+                        })),
+                    })
+                })
+                .collect();
+
+            Ok(Json(json!(response)))
+        }
+        Err(e) => {
+            Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                .unwrap()
+                .into_response())
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn handle_create_action(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(payload): Json<Value>
+) -> Result<Json<Value>, axum::response::Response> {
+    // Extract required fields
+    let slug = payload.get("slug")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            axum::response::Response::builder()
+                .status(400)
+                .body(axum::body::Body::from("Missing required field: slug"))
+                .unwrap()
+                .into_response()
+        })?;
+    
+    let kind = payload.get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("COMPOSITION");
+    
+    let description = payload.get("description")
+        .and_then(|v| v.as_str());
+    
+    let namespace = payload.get("namespace")
+        .and_then(|v| v.as_str());
+    
+    // Generate UUIDs for action and version
+    let action_id = Uuid::new_v4().to_string();
+    let version_id = Uuid::new_v4().to_string();
+    let version_number = payload.get("version_number")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.0.1");
+    
+    let db = state.database.lock().await;
+    
+    // Create the action
+    match db.upsert_action(
+        &action_id,
+        slug,
+        description,
+        None, // rls_owner_id
+        None, // git_allowed_repository_id
+        kind,
+        namespace,
+        None, // latest_action_version_id - will be set after version creation
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Failed to create action: {}", e)))
+                .unwrap()
+                .into_response());
+        }
+    }
+    
+    // Create initial action version
+    let manifest = payload.get("manifest")
+        .and_then(|v| serde_json::to_string(v).ok());
+    
+    match db.upsert_action_version(
+        &version_id,
+        &action_id,
+        version_number,
+        None, // commit_sha
+        manifest.as_deref(),
+    ) {
+        Ok(_) => {}
+        Err(e) => {
+            return Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Failed to create action version: {}", e)))
+                .unwrap()
+                .into_response());
+        }
+    }
+    
+    // Get the created action with version
+    match db.get_action(&action_id) {
+        Ok(Some(action)) => {
+            let latest_version = db.get_latest_action_version(&action_id).ok().flatten();
+            
+            Ok(Json(json!({
+                "id": action.id,
+                "created_at": action.created_at,
+                "description": action.description,
+                "slug": action.slug,
+                "rls_owner_id": action.rls_owner_id,
+                "git_allowed_repository_id": action.git_allowed_repository_id,
+                "kind": action.kind,
+                "namespace": action.namespace,
+                "download_count": action.download_count,
+                "is_sync": action.is_sync,
+                "latest_action_version_id": action.latest_action_version_id,
+                "latest_version": latest_version.map(|v| json!({
+                    "id": v.id,
+                    "created_at": v.created_at,
+                    "action_id": v.action_id,
+                    "version_number": v.version_number,
+                    "commit_sha": v.commit_sha,
+                    "manifest": v.manifest,
+                })),
+            })))
+        }
+        Ok(None) => {
+            Err(axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Action not found after creation"))
+                .unwrap()
+                .into_response())
+        }
+        Err(e) => {
+            Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Failed to retrieve created action: {}", e)))
+                .unwrap()
+                .into_response())
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn handle_get_action(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path(action_id): Path<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let db = state.database.lock().await;
+    match db.get_action(&action_id) {
+        Ok(Some(action)) => {
+            let latest_version = db.get_latest_action_version(&action_id).ok().flatten();
+            
+            Ok(Json(json!({
+                "id": action.id,
+                "created_at": action.created_at,
+                "description": action.description,
+                "slug": action.slug,
+                "rls_owner_id": action.rls_owner_id,
+                "git_allowed_repository_id": action.git_allowed_repository_id,
+                "kind": action.kind,
+                "namespace": action.namespace,
+                "download_count": action.download_count,
+                "is_sync": action.is_sync,
+                "latest_action_version_id": action.latest_action_version_id,
+                "latest_version": latest_version.map(|v| json!({
+                    "id": v.id,
+                    "created_at": v.created_at,
+                    "action_id": v.action_id,
+                    "version_number": v.version_number,
+                    "commit_sha": v.commit_sha,
+                    "manifest": v.manifest,
+                })),
+            })))
+        }
+        Ok(None) => {
+            Err(axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Action not found"))
+                .unwrap()
+                .into_response())
+        }
+        Err(e) => {
+            Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                .unwrap()
+                .into_response())
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn handle_get_action_by_ref(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path((namespace, slug, version)): Path<(String, String, String)>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let db = state.database.lock().await;
+    
+    // Handle empty namespace (could be empty string or "null")
+    let namespace_opt = if namespace.is_empty() || namespace == "null" {
+        None
+    } else {
+        Some(namespace.as_str())
+    };
+    
+    match db.get_action_by_namespace_slug(
+        namespace_opt.unwrap_or(""),
+        &slug,
+    ) {
+        Ok(Some(action)) => {
+            // Get all versions for this action
+            let versions = db.get_action_versions(&action.id).unwrap_or_default();
+            
+            // Find the version that matches the requested version number
+            let requested_version = versions.iter()
+                .find(|v| v.version_number == version);
+            
+            if requested_version.is_none() {
+                return Err(axum::response::Response::builder()
+                    .status(404)
+                    .body(axum::body::Body::from(format!("Version '{}' not found for action", version)))
+                    .unwrap()
+                    .into_response());
+            }
+            
+            let version_record = requested_version.unwrap();
+            
+            Ok(Json(json!({
+                "id": action.id,
+                "created_at": action.created_at,
+                "description": action.description,
+                "slug": action.slug,
+                "rls_owner_id": action.rls_owner_id,
+                "git_allowed_repository_id": action.git_allowed_repository_id,
+                "kind": action.kind,
+                "namespace": action.namespace,
+                "download_count": action.download_count,
+                "is_sync": action.is_sync,
+                "latest_action_version_id": action.latest_action_version_id,
+                "version": {
+                    "id": version_record.id,
+                    "created_at": version_record.created_at,
+                    "action_id": version_record.action_id,
+                    "version_number": version_record.version_number,
+                    "commit_sha": version_record.commit_sha,
+                    "manifest": version_record.manifest,
+                },
+            })))
+        }
+        Ok(None) => {
+            Err(axum::response::Response::builder()
+                .status(404)
+                .body(axum::body::Body::from("Action not found"))
+                .unwrap()
+                .into_response())
+        }
+        Err(e) => {
+            Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                .unwrap()
+                .into_response())
+        }
+    }
+}
+
+#[axum::debug_handler]
+async fn handle_update_version(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Path((action_id, version_id)): Path<(String, String)>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    // Extract manifest from payload
+    let manifest = payload.get("manifest")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let db = state.database.lock().await;
+    
+    // Get the version to ensure it exists and belongs to the action
+    match db.get_action_versions(&action_id) {
+        Ok(versions) => {
+            let version = versions.iter().find(|v| v.id == version_id);
+            if version.is_none() {
+                return Err(axum::response::Response::builder()
+                    .status(404)
+                    .body(axum::body::Body::from("Version not found"))
+                    .unwrap()
+                    .into_response());
+            }
+            
+            let version = version.unwrap();
+            
+            // Update the version with the new manifest
+            match db.upsert_action_version(
+                &version_id,
+                &action_id,
+                &version.version_number,
+                version.commit_sha.as_deref(),
+                manifest.as_deref(),
+            ) {
+                Ok(_) => {
+                    // Get the updated version
+                    match db.get_latest_action_version(&action_id) {
+                        Ok(Some(updated_version)) => {
+                            Ok(Json(json!({
+                                "id": updated_version.id,
+                                "created_at": updated_version.created_at,
+                                "action_id": updated_version.action_id,
+                                "version_number": updated_version.version_number,
+                                "commit_sha": updated_version.commit_sha,
+                                "manifest": updated_version.manifest,
+                            })))
+                        }
+                        _ => {
+                            // Fallback: return success even if we can't fetch the updated version
+                            Ok(Json(json!({
+                                "id": version_id,
+                                "status": "updated"
+                            })))
+                        }
+                    }
+                }
+                Err(e) => {
+                    Err(axum::response::Response::builder()
+                        .status(500)
+                        .body(axum::body::Body::from(format!("Failed to update version: {}", e)))
+                        .unwrap()
+                        .into_response())
+                }
+            }
+        }
+        Err(e) => {
+            Err(axum::response::Response::builder()
+                .status(500)
+                .body(axum::body::Body::from(format!("Database error: {}", e)))
+                .unwrap()
+                .into_response())
+        }
+    }
 }

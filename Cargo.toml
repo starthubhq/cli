@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "starthub"
-version = "0.2.21"
+version = "0.2.26"
 edition = "2021"
 
 [[bin]]
@@ -38,6 +38,7 @@ lazy_static = "1.4"
 aws-config = "1.8.6"
 aws-sdk-s3 = "1.91.0"
 dotenv = "0.15"
+uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
