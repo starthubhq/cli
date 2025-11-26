@@ -1,8 +1,9 @@
 import { createRouter, createWebHistory } from 'vue-router'
-import FormView from '@/views/FormView.vue'
 import RunView from '../views/RunView.vue'
 import HomeView from '@/views/HomeView.vue'
 import MyActionsView from '@/views/MyActionsView.vue'
+import ActionNewView from '@/views/ActionNewView.vue'
+import BuilderView from '@/views/BuilderView.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -10,7 +11,13 @@ const router = createRouter({
     {
       path: '/',
       name: 'home',
-      component: HomeView,
+      component: MyActionsView,
+    },
+    {
+      path: '/:namespace/:slug/:version/edit',
+      name: 'edit',
+      meta: { requiresAuth: false },
+      component: BuilderView
     },
     {
       path: '/:namespace/:slug/:version',
@@ -18,16 +25,16 @@ const router = createRouter({
       component: RunView,
     },
     {
-      path: '/form',
-      name: 'form',
-      meta: { requiresAuth: false },
-      component: FormView
-    },
-    {
       path: '/my-actions',
       name: 'my-actions',
       meta: { requiresAuth: false },
       component: MyActionsView
+    },
+    {
+      path: '/new',
+      name: 'new',
+      meta: { requiresAuth: false },
+      component: ActionNewView
     }
   ],
 })
