@@ -5,7 +5,7 @@ import { computed } from 'vue'
 const router = useRouter()
 const route = useRoute()
 
-const navigationItems = [
+// const navigationItems = [
   // {
   //   name: 'Home',
   //   path: '/',
@@ -21,7 +21,7 @@ const navigationItems = [
   //   path: '/my-actions',
   //   icon: ''
   // }
-]
+// ]
 
 const isActive = (path: string) => {
   if (path === '/') {
@@ -56,9 +56,9 @@ const handleLogin = () => {
           </router-link>
         </div>
         
-        <div class="navbar-menu">
+        <!-- <div class="navbar-menu">
           <button
-            v-for="item in navigationItems"
+            v-for="item in "
             :key="item.path"
             :class="['nav-item', { active: isActive(item.path) }]"
             @click="navigate(item.path)"
@@ -66,7 +66,7 @@ const handleLogin = () => {
             <span class="nav-icon">{{ item.icon }}</span>
             <span class="nav-text">{{ item.name }}</span>
           </button>
-        </div>
+        </div> -->
       </div>
       
       <div class="navbar-right">
