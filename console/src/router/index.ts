@@ -4,6 +4,7 @@ import HomeView from '@/views/HomeView.vue'
 import MyActionsView from '@/views/MyActionsView.vue'
 import ActionNewView from '@/views/ActionNewView.vue'
 import BuilderView from '@/views/BuilderView.vue'
+import SearchView from '@/views/SearchView.vue'
 
 const router = createRouter({
   history: createWebHistory(import.meta.env.BASE_URL),
@@ -29,6 +30,12 @@ const router = createRouter({
       name: 'my-actions',
       meta: { requiresAuth: false },
       component: MyActionsView
+    },
+    {
+      path: '/search',
+      name: 'search',
+      meta: { requiresAuth: false },
+      component: SearchView
     },
     {
       path: '/new',
