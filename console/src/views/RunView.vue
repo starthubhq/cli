@@ -20,7 +20,8 @@ import VncComponent from '@/components/VncComponent.vue';
 
         <Pane min-size="20">
           <div class="panel">
-            <VncComponent></VncComponent>
+            <p>VNC is not available yet (coming soon)</p>
+            <!-- <VncComponent></VncComponent> -->
             <!-- <DiagramComponent></DiagramComponent> -->
           </div>
         </Pane>
