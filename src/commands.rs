@@ -179,6 +179,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     let repository = Text::new("Repository:")
         .with_default(repo_default)
         .prompt()?;
+    let repository_clone = repository.clone();
 
     // Create manifest
     let manifest = ShManifest {
@@ -187,6 +188,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         kind: Some(kind.clone()),
         description: "A StartHub package".to_string(),
         flow_control: false,
+        interactive: false,
         repository,
         manifest_version: 1,
         image: None,
@@ -196,7 +198,7 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
                 name: "input".to_string(),
                 description: "Input parameter".to_string(),
                 ty: ShType::String,
-            required: true,
+            required: true, // Will be skipped in serialization due to skip_serializing_if
             default: None,
         }
         ],
@@ -205,12 +207,12 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
                 name: "output".to_string(),
                 description: "Output result".to_string(),
                 ty: ShType::String,
-            required: true,
+            required: true, // Will be skipped in serialization due to skip_serializing_if
             default: None,
         }
         ],
         types: std::collections::HashMap::new(),
-        steps: vec![],
+        steps: std::collections::HashMap::new(),
         wires: vec![],
         export: serde_json::json!({}),
     };
@@ -221,6 +223,19 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     fs::write(&starthub_path, starthub_json)?;
 
     println!("✅ Created starthub.json in {}", starthub_path.display());
+
+    // Create README.md
+    let readme = templates::readme_tpl(&name, &kind, &repository_clone, &manifest.license);
+    let readme_path = Path::new(&path).join("README.md");
+    fs::write(&readme_path, readme)?;
+    
+    println!("✅ Created README.md in {}", readme_path.display());
+
+    // Create .gitignore
+    let gitignore_path = Path::new(&path).join(".gitignore");
+    fs::write(&gitignore_path, templates::GITIGNORE_TPL)?;
+    
+    println!("✅ Created .gitignore in {}", gitignore_path.display());
 
     // Create basic files based on type
     match kind {
@@ -248,17 +263,8 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
             println!("✅ Created Dockerfile");
         }
         ShKind::Composition => {
-            // Create composition template
-            let composition = serde_json::json!({
-                "name": name,
-                "version": version,
-                "steps": [],
-                "wires": []
-            });
-            let composition_path = Path::new(&path).join("composition.json");
-            fs::write(&composition_path, serde_json::to_string_pretty(&composition)?)?;
-            
-            println!("✅ Created composition template");
+            // Composition actions are defined in starthub.json, no additional files needed
+            println!("✅ Created composition action");
         }
     }
 

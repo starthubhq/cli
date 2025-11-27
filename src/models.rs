@@ -10,6 +10,8 @@ pub struct ShManifest {
     pub kind: Option<ShKind>,
     #[serde(default)]
     pub flow_control: bool,
+    #[serde(default)]
+    pub interactive: bool,
     pub manifest_version: u32,
     pub repository: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,8 +25,7 @@ pub struct ShManifest {
     pub types: std::collections::HashMap<String, serde_json::Value>,
     // Composite action fields
     #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub steps: Vec<ShActionStep>,
+    pub steps: std::collections::HashMap<String, ShActionStep>,
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub wires: Vec<ShWire>,
@@ -83,7 +84,7 @@ pub struct ShPort {
     pub description: String,
     #[serde(rename = "type")]
     pub ty: ShType,
-    #[serde(default = "default_required")]
+    #[serde(default = "default_required", skip_serializing_if = "is_default_required")]
     pub required: bool,
     #[serde(default)]
     pub default: Option<serde_json::Value>,
@@ -91,6 +92,10 @@ pub struct ShPort {
 
 fn default_required() -> bool {
     true
+}
+
+fn is_default_required(value: &bool) -> bool {
+    *value == default_required()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
