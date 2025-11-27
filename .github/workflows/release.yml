@@ -47,23 +47,11 @@ jobs:
         with:
           node-version: 22.4
 
-      - name: Build console UI
-        working-directory: ./console
+      - name: Build
+        run: cargo build --release --workspace --target ${{ matrix.target }}
         env:
           VITE_SUPABASE_URL: https://smltnjrrzkmazvbrqbkq.supabase.co
           VITE_SUPABASE_ANON_KEY: sb_publishable_AKGy20M54_uMOdJme3ZnZA_GX11LgHe
-        run: |
-          npm ci
-          npm run build
-
-      - name: Copy console dist to server/ui
-        shell: bash
-        run: |
-          mkdir -p server/ui
-          cp -r console/dist server/ui/dist
-
-      - name: Build
-        run: cargo build --release --workspace --target ${{ matrix.target }}
 
       - name: Package
         shell: bash

@@ -11,10 +11,46 @@ fn main() {
     println!("cargo:warning=Building console...");
     let console_dir = Path::new("console");
     
+    // Determine npm command based on platform
+    // On Windows, npm is typically npm.cmd, but npm should also work if PATH is set correctly
+    let npm_cmd = if cfg!(target_os = "windows") {
+        // Try npm.cmd first, then fall back to npm
+        let npm_cmd_check = Command::new("npm.cmd")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        
+        if npm_cmd_check.is_ok() {
+            "npm.cmd"
+        } else {
+            "npm"
+        }
+    } else {
+        "npm"
+    };
+    
+    // Check if npm is available
+    let npm_check = Command::new(npm_cmd)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    
+    if let Err(e) = npm_check {
+        panic!(
+            "npm is not available: {}\n\
+            Please ensure Node.js and npm are installed and available in PATH.\n\
+            In CI environments, make sure the 'Setup Node.js' step runs before the build step.\n\
+            On Windows, ensure npm is accessible via PATH or use npm.cmd.",
+            e
+        );
+    }
+    
     // Run npm install if node_modules doesn't exist
     if !console_dir.join("node_modules").exists() {
         println!("cargo:warning=Installing console dependencies...");
-        let install_status = Command::new("npm")
+        let install_status = Command::new(npm_cmd)
             .arg("install")
             .current_dir(&console_dir)
             .status();
@@ -26,7 +62,7 @@ fn main() {
     
     // Run npm run build with Supabase environment variables
     println!("cargo:warning=Running npm run build in console...");
-    let build_status = Command::new("npm")
+    let build_status = Command::new(npm_cmd)
         .arg("run")
         .arg("build")
         .current_dir(&console_dir)
