@@ -79,13 +79,11 @@ echo "::starthub:state::{\"do_tag_name\":\"${do_tag_name}\"}"
 
 pub const GITIGNORE_TPL: &str = r#"/target
 /dist
-/node_modules
 *.log
 *.tmp
 .DS_Store
 .env
 .env.*
-starthub.lock.json
 "#;
 
 pub const DOCKERIGNORE_TPL: &str = r#"*
@@ -170,6 +168,32 @@ pub fn readme_tpl(name: &str, kind: &crate::models::ShKind, repo: &str, license:
         crate::models::ShKind::Wasm => "wasm",
         crate::models::ShKind::Composition => "composite"
     };
+    
+    let build_instructions = match kind {
+        crate::models::ShKind::Wasm => format!(r#"## Build
+
+Build the WASM module:
+
+```bash
+cargo build --release
+```
+
+The compiled WASM file will be located at `target/release/{}.wasm`.
+"#, name),
+        crate::models::ShKind::Docker => format!(r#"## Build
+
+Build the Docker image:
+
+```bash
+docker build -t {} .
+```
+"#, name),
+        crate::models::ShKind::Composition => r#"## Build
+
+Composition actions don't require building. They are defined in `starthub.json` and can be published directly.
+"#.to_string(),
+    };
+    
     format!(r#"# {name}
 
 A Starthub **{kind_str}** action.
@@ -177,17 +201,17 @@ A Starthub **{kind_str}** action.
 - Repository: `{repo}`
 - License: `{license}`
 
+{build_instructions}
 ## Usage
 
-This action reads a JSON payload from **stdin** and prints state as:
-
-::starthub:state::{{"key":"value"}}
-
-Inputs / Outputs
-
-Document your inputs and outputs in starthub.json.
-"#
-)
+... write usage instructions here ...
+"#,
+        name = name,
+        kind_str = kind_str,
+        repo = repo,
+        license = license,
+        build_instructions = build_instructions
+    )
 }
 
 pub fn wasm_cargo_toml_tpl(name: &str, version: &str) -> String {
