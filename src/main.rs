@@ -28,6 +28,7 @@ enum Commands {
         #[arg(long, default_value = ".")]
         path: String,
     },
+    /// Publish an action to the Starthub registry
     Publish {
         /// Do not build, only push/tag (assumes image exists locally)
         #[arg(long)]
@@ -65,6 +66,7 @@ enum Commands {
     },
     /// Logout from Starthub backend
     Logout,
+    /// Show authentication status
     Auth,
     /// Clear the cache
     Reset,
