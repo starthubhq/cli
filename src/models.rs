@@ -14,8 +14,6 @@ pub struct ShManifest {
     pub interactive: bool,
     pub manifest_version: u32,
     pub repository: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image: Option<String>,
     pub license: String,
     pub inputs: Vec<ShPort>,
     pub outputs: Vec<ShPort>,
@@ -26,17 +24,6 @@ pub struct ShManifest {
     // Composite action fields
     #[serde(default)]
     pub steps: std::collections::HashMap<String, ShActionStep>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub wires: Vec<ShWire>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_default_export")]
-    pub export: serde_json::Value,
-}
-
-// Helper function to determine if export field should be skipped during serialization
-fn is_default_export(export: &serde_json::Value) -> bool {
-    export == &serde_json::json!({})
 }
 
 #[derive(Debug, Clone, PartialEq)]

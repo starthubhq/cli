@@ -26,10 +26,51 @@ async function handleSubmit() {
   success.value = false
 
   try {
+    // Build repository string from namespace and slug
+    const repository = formData.value.namespace
+      ? `github.com/${formData.value.namespace}/${formData.value.slug}`
+      : `github.com/starthubhq/${formData.value.slug}`
+
+    // Convert kind to lowercase (COMPOSITION -> composition)
+    const kindLower = formData.value.kind.toLowerCase()
+
+    // Create manifest matching ShManifest structure (matching CLI init output)
+    // Note: types is omitted when empty (matching skip_serializing_if behavior)
+    // Note: required is omitted from inputs/outputs (defaults to true and is skipped)
+    const manifest = {
+      name: formData.value.slug,
+      version: '0.0.1',
+      kind: kindLower,
+      description: formData.value.description || 'A StartHub package',
+      flow_control: false,
+      interactive: false,
+      manifest_version: 1,
+      repository: repository,
+      license: 'MIT',
+      inputs: [
+        {
+          name: 'input',
+          description: 'Input parameter',
+          type: 'string',
+          default: null
+        }
+      ],
+      outputs: [
+        {
+          name: 'output',
+          description: 'Output result',
+          type: 'string',
+          default: null
+        }
+      ],
+      steps: {}
+    }
+
     const payload: any = {
       slug: formData.value.slug,
       kind: formData.value.kind,
       version_number: '0.0.1',
+      manifest: manifest
     }
 
     if (formData.value.description) {

@@ -191,7 +191,6 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         interactive: false,
         repository,
         manifest_version: 1,
-        image: None,
         license: "MIT".to_string(),
         inputs: vec![
         ShPort {
@@ -213,8 +212,6 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
         ],
         types: std::collections::HashMap::new(),
         steps: std::collections::HashMap::new(),
-        wires: vec![],
-        export: serde_json::json!({}),
     };
 
     // Write starthub.json
