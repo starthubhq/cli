@@ -7,13 +7,6 @@ fn main() {
     println!("cargo:rerun-if-changed=console/vite.config.ts");
     println!("cargo:rerun-if-changed=console/src");
     
-    // Check if UI dist already exists (e.g., from CI build)
-    let server_ui_dist = Path::new("server/ui/dist");
-    if server_ui_dist.exists() && server_ui_dist.join("index.html").exists() {
-        println!("cargo:warning=UI dist already exists, skipping console build");
-        return;
-    }
-    
     // Build the console
     println!("cargo:warning=Building console...");
     let console_dir = Path::new("console");
