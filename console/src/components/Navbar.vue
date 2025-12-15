@@ -52,11 +52,12 @@ const handleLogin = () => {
       <div class="navbar-left">
         <div class="navbar-brand">
           <router-link to="/" class="brand-link">
+            <img src="/block.png" alt="Starthub" class="brand-logo" />
             <span class="brand-text">Starthub</span>
           </router-link>
         </div>
         
-        <div class="navbar-menu">
+        <!-- <div class="navbar-menu">
           <button
             v-for="item in navigationItems"
             :key="item.path"
@@ -66,7 +67,7 @@ const handleLogin = () => {
             <span class="nav-icon">{{ item.icon }}</span>
             <span class="nav-text">{{ item.name }}</span>
           </button>
-        </div>
+        </div> -->
       </div>
       
       <div class="navbar-right">
@@ -80,7 +81,7 @@ const handleLogin = () => {
 
 <style scoped>
 .navbar {
-  background-color: #0d0d18;
+  background-color: #0273b7;
   border-bottom: 1px solid rgba(255, 255, 255, 0.1);
   padding: 0;
   height: 60px;
@@ -141,7 +142,8 @@ const handleLogin = () => {
 }
 
 .brand-logo {
-  font-size: 1.5rem;
+  width: 32px;
+  height: 32px;
 }
 
 .brand-text {

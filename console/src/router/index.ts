@@ -1,7 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import RunView from '../views/RunView.vue'
 import HomeView from '@/views/HomeView.vue'
-import MyActionsView from '@/views/MyActionsView.vue'
 import ActionNewView from '@/views/ActionNewView.vue'
 import BuilderView from '@/views/BuilderView.vue'
 import SearchView from '@/views/SearchView.vue'
@@ -12,7 +11,7 @@ const router = createRouter({
     {
       path: '/',
       name: 'home',
-      component: MyActionsView,
+      component: HomeView,
     },
     {
       path: '/:namespace/:slug/:version/edit',
@@ -29,7 +28,7 @@ const router = createRouter({
       path: '/my-actions',
       name: 'my-actions',
       meta: { requiresAuth: false },
-      component: MyActionsView
+      component: HomeView
     },
     {
       path: '/search',

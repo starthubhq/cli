@@ -18,30 +18,31 @@ import VncComponent from '@/components/VncComponent.vue';
           </div>
         </Pane>
 
-        <Pane min-size="20">
+        <!-- <Pane min-size="20">
           <div class="panel">
             <p>VNC is not available yet (coming soon)</p>
-            <!-- <VncComponent></VncComponent> -->
-            <!-- <DiagramComponent></DiagramComponent> -->
+            <VncComponent></VncComponent>
+            <DiagramComponent></DiagramComponent>
+          </div>
+        </Pane> -->
+        <Pane min-size="20">
+          <div class="panel logs">
+            <LogsComponent></LogsComponent>
           </div>
         </Pane>
       </Splitpanes>
     </Pane>
 
-    <Pane min-size="20">
+    <!-- <Pane min-size="20">
       <Splitpanes>
         <Pane min-size="20">
           <div class="panel logs">
             <LogsComponent></LogsComponent>
           </div>
         </Pane>
-        <!-- <Pane min-size="20">
-          <div class="panel logs">
-            <TreeComponent msg="Hello"></TreeComponent>
-          </div>
-        </Pane> -->
+        
       </Splitpanes>
-    </Pane>
+    </Pane> -->
   </Splitpanes>
 </template>
 
