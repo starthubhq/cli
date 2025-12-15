@@ -23,12 +23,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Initialize a project (creates config, etc.)
+    /// Initialize a project (creates config, etc.) (coming soon)
     Init {
         #[arg(long, default_value = ".")]
         path: String,
     },
-    /// Publish an action to the Starthub registry
+    /// Publish an action to the Starthub registry (coming soon)
     Publish {
         /// Do not build, only push/tag (assumes image exists locally)
         #[arg(long)]
@@ -58,15 +58,15 @@ enum Commands {
     },
     /// Show server status
     Status,
-    /// Authenticate with Starthub backend
+    /// Authenticate with Starthub backend (coming soon)
     Login {
         /// Starthub API base URL
         #[arg(long, default_value = "https://api.starthub.so")]
         api_base: String,
     },
-    /// Logout from Starthub backend
+    /// Logout from Starthub backend (coming soon)
     Logout,
-    /// Show authentication status
+    /// Show authentication status (coming soon)
     Auth,
     /// Clear the cache
     Reset,

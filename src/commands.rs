@@ -151,7 +151,13 @@ pub async fn cmd_publish_wasm_inner(m: &ShManifest, no_build: bool) -> anyhow::R
     Ok(())
 }
 
-pub async fn cmd_init(path: String) -> anyhow::Result<()> {
+pub async fn cmd_init(_path: String) -> anyhow::Result<()> {
+    println!("🚧 This command is coming soon!");
+    println!("💡 We're focusing on a small subset of functionalities for now.");
+    return Ok(());
+    
+    // TEMPORARY: Original implementation preserved below
+    /*
     // Basic fields
     let name = Text::new("Package name:")
         .with_default("http-get-wasm")
@@ -266,9 +272,16 @@ pub async fn cmd_init(path: String) -> anyhow::Result<()> {
     }
 
     Ok(())
+    */
 }
 
-pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
+pub async fn cmd_login_starthub(_api_base: String) -> anyhow::Result<()> {
+    println!("🚧 This command is coming soon!");
+    println!("💡 We're focusing on a small subset of functionalities for now.");
+    return Ok(());
+    
+    // TEMPORARY: Original implementation preserved below
+    /*
     use uuid::Uuid;
     use std::time::{Duration, Instant};
     
@@ -440,9 +453,16 @@ pub async fn cmd_login_starthub(api_base: String) -> anyhow::Result<()> {
         use std::io::Write;
         std::io::stdout().flush().ok();
     }
+    */
 }
 
 pub async fn cmd_logout_starthub() -> anyhow::Result<()> {
+    println!("🚧 This command is coming soon!");
+    println!("💡 We're focusing on a small subset of functionalities for now.");
+    return Ok(());
+    
+    // TEMPORARY: Original implementation preserved below
+    /*
     println!("🚪 Logging out from StartHub...");
     
     // Clear stored credentials
@@ -457,9 +477,16 @@ pub async fn cmd_logout_starthub() -> anyhow::Result<()> {
     
     println!("✅ Logged out successfully");
     Ok(())
+    */
 }
 
 pub async fn cmd_auth_status() -> anyhow::Result<()> {
+    println!("🚧 This command is coming soon!");
+    println!("💡 We're focusing on a small subset of functionalities for now.");
+    return Ok(());
+    
+    // TEMPORARY: Original implementation preserved below
+    /*
     println!("🔍 Checking authentication status...");
     
     // Check for stored token
@@ -475,6 +502,7 @@ pub async fn cmd_auth_status() -> anyhow::Result<()> {
     }
     
     Ok(())
+    */
 }
 
 pub async fn cmd_reset() -> anyhow::Result<()> {
