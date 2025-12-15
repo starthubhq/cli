@@ -2,6 +2,7 @@
 
 The StartHub CLI is a command-line tool for creating, managing, and executing StartHub actions. It provides a complete workflow for developing, publishing, and running actions locally or in the cloud.
 
+
 ## What is StartHub?
 
 StartHub is a platform for building and orchestrating composable actions. Actions are reusable components that can be:
