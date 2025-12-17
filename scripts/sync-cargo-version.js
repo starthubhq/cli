@@ -28,7 +28,7 @@ cargo = cargo.replace(re, `version = "${version}"`);
 
 fs.writeFileSync(cargoPath, cargo);
 
-// Stage Cargo.toml so npm’s auto-commit (from `npm version`) includes it.
+// Stage Cargo.toml so npm auto-commit (from `npm version`) includes it.
 try {
   require('child_process').execSync('git add Cargo.toml', { stdio: 'inherit' });
 } catch (e) {
