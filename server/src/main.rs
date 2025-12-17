@@ -95,7 +95,9 @@ async fn start_server(bind_addr: &str) -> Result<()> {
         .route("/api/run", post(handle_run))
         .route("/ws", get(ws_handler)) // WebSocket endpoint
         .nest_service("/assets", ServeDir::new(assets_dir))
-        .nest_service("/favicon.ico", ServeDir::new(&ui_dir))
+        .nest_service("/block.png", ServeDir::new(ui_dir.join("block.png")))
+        .nest_service("/block-black.png", ServeDir::new(ui_dir.join("block-black.png")))
+        .nest_service("/favicon.ico", ServeDir::new(ui_dir.join("favicon.ico")))
         .route("/", get(serve_index))
         .fallback(serve_spa) // SPA fallback for Vue Router
         .layer(CorsLayer::permissive())
