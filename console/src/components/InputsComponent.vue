@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, watch, computed } from 'vue'
 import { useRoute } from 'vue-router'
+import { API_BASE_URL } from '@/lib/api'
 
 type PortType = 'string' | 'number' | 'boolean' | 'json' | 'type' | string
 
@@ -369,7 +370,7 @@ async function onSubmit() {
     errorMsg.value = null
 
     console.log('🔍 Sending to /api/run:', body)
-    const resp = await fetch('http://localhost:3000/api/run', {
+    const resp = await fetch(`${API_BASE_URL}/api/run`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

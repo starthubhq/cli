@@ -5,6 +5,7 @@ import { useRoute } from 'vue-router'
 import { useSearchStore } from '@/stores/search'
 import { supabase } from '@/lib/supabase'
 import SchemaEditorModal from '@/components/SchemaEditorModal.vue'
+import { API_BASE_URL } from '@/lib/api'
 
 const route = useRoute()
 const searchStore = useSearchStore()
@@ -144,7 +145,7 @@ onMounted(async () => {
   if (namespace.value && slug.value && version.value) {
     try {
       const namespaceParam = namespace.value === 'null' || namespace.value === '' ? 'null' : namespace.value
-      const response = await fetch(`http://localhost:3000/api/actions/${namespaceParam}/${slug.value}/${version.value}`)
+      const response = await fetch(`${API_BASE_URL}/api/actions/${namespaceParam}/${slug.value}/${version.value}`)
       if (response.ok) {
         const actionData = await response.json()
         actionId.value = actionData.id
@@ -1117,7 +1118,7 @@ async function saveManifest() {
 
     // Get the action and version by namespace/slug/version
     const namespaceParam = namespace.value === 'null' || namespace.value === '' ? 'null' : namespace.value
-    const actionResponse = await fetch(`http://localhost:3000/api/actions/${namespaceParam}/${slug.value}/${version.value}`)
+    const actionResponse = await fetch(`${API_BASE_URL}/api/actions/${namespaceParam}/${slug.value}/${version.value}`)
     if (!actionResponse.ok) {
       throw new Error('Failed to fetch action')
     }
@@ -1130,7 +1131,7 @@ async function saveManifest() {
     }
 
     // Update the version's manifest
-    const updateResponse = await fetch(`http://localhost:3000/api/actions/${actionId.value}/versions/${versionId}`, {
+    const updateResponse = await fetch(`${API_BASE_URL}/api/actions/${actionId.value}/versions/${versionId}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',

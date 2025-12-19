@@ -5,7 +5,9 @@ import Navbar from '@/components/Navbar.vue'
 <template>
   <div class="app-container">
     <Navbar />
-    <RouterView></RouterView>
+    <div class="router-view-wrapper">
+      <RouterView></RouterView>
+    </div>
   </div>
 </template>
 
@@ -14,6 +16,12 @@ import Navbar from '@/components/Navbar.vue'
   display: flex;
   flex-direction: column;
   height: 100vh;
+  overflow: hidden;
+}
+
+.router-view-wrapper {
+  flex: 1;
+  min-height: 0;
   overflow: hidden;
 }
 </style>

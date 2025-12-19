@@ -46,6 +46,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { WS_URL } from '@/lib/api'
 
 interface LogEntry {
   type: 'info' | 'error' | 'warning' | 'success' | 'connection' | 'echo'
@@ -76,7 +77,7 @@ const filteredLogs = computed(() => {
 // WebSocket methods
 const connect = () => {
   try {
-    ws.value = new WebSocket('ws://127.0.0.1:3000/ws')
+    ws.value = new WebSocket(WS_URL)
     
     ws.value.onopen = () => {
       isConnected.value = true

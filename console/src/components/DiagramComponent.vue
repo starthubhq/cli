@@ -36,6 +36,7 @@ import { VueFlow, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import '@vue-flow/core/dist/style.css'
 import '@vue-flow/core/dist/theme-default.css'
+import { WS_URL } from '@/lib/api'
 
 // Define types for execution plan
 interface ExecutionPlan {
@@ -170,7 +171,7 @@ const generateDiagram = (plan: ExecutionPlan) => {
 // WebSocket connection
 const connectWebSocket = () => {
   // Use the same host as the current page but ensure we connect to /ws
-  const wsUrl = `ws://127.0.0.1:3000/ws`
+  const wsUrl = WS_URL
   
   console.log('Attempting to connect to WebSocket:', wsUrl)
   console.log('Current location:', window.location.href)
