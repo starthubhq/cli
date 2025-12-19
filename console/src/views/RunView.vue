@@ -9,54 +9,56 @@ import VncComponent from '@/components/VncComponent.vue';
 </script>
 
 <template>
-  <Splitpanes class="main-body" horizontal>
-    <Pane min-size="20">
-      <Splitpanes>
-        <Pane min-size="20">
-          <div class="panel inputs">
-            <InputsComponent></InputsComponent>
-          </div>
-        </Pane>
+  <div class="run-view-container">
+    <Splitpanes class="main-body" horizontal>
+      <Pane min-size="20">
+        <Splitpanes>
+          <Pane min-size="20">
+            <div class="panel inputs">
+              <InputsComponent></InputsComponent>
+            </div>
+          </Pane>
 
-        <!-- <Pane min-size="20">
-          <div class="panel">
-            <p>VNC is not available yet (coming soon)</p>
-            <VncComponent></VncComponent>
-            <DiagramComponent></DiagramComponent>
-          </div>
-        </Pane> -->
-        <Pane min-size="20">
-          <div class="panel logs">
-            <LogsComponent></LogsComponent>
-          </div>
-        </Pane>
-      </Splitpanes>
-    </Pane>
+          <!-- <Pane min-size="20">
+            <div class="panel">
+              <p>VNC is not available yet (coming soon)</p>
+              <VncComponent></VncComponent>
+              <DiagramComponent></DiagramComponent>
+            </div>
+          </Pane> -->
+          <Pane min-size="20">
+            <div class="panel logs">
+              <LogsComponent></LogsComponent>
+            </div>
+          </Pane>
+        </Splitpanes>
+      </Pane>
 
-    <!-- <Pane min-size="20">
-      <Splitpanes>
-        <Pane min-size="20">
-          <div class="panel logs">
-            <LogsComponent></LogsComponent>
-          </div>
-        </Pane>
-        
-      </Splitpanes>
-    </Pane> -->
-  </Splitpanes>
+      <!-- <Pane min-size="20">
+        <Splitpanes>
+          <Pane min-size="20">
+            <div class="panel logs">
+              <LogsComponent></LogsComponent>
+            </div>
+          </Pane>
+          
+        </Splitpanes>
+      </Pane> -->
+    </Splitpanes>
+  </div>
 </template>
 
 <style scoped>
-.app-container {
-  display: flex;
-  flex-direction: column;
-  height: 100vh;
+.run-view-container {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
 }
 
 /* This fills remaining space below the navbar */
 .main-body {
-  flex: 1;
   height: 100%;
+  width: 100%;
 }
 
 /* Optional panel styling */
